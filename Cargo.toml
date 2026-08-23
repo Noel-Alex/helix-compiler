@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/helix-syntax",
+    "crates/helix-sema",
+    "crates/helix-ir",
+    "crates/helix-analysis",
+    "crates/helix-backend",
+    "crates/helix-runtime",
+    "crates/helix-engine",
+    "crates/helix-bench",
+    "crates/helix-observe",
+    "crates/helix-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+helix-syntax   = { path = "crates/helix-syntax" }
+helix-sema     = { path = "crates/helix-sema" }
+helix-ir       = { path = "crates/helix-ir" }
+helix-analysis = { path = "crates/helix-analysis" }
+helix-backend  = { path = "crates/helix-backend" }
+helix-runtime  = { path = "crates/helix-runtime" }
+helix-engine   = { path = "crates/helix-engine" }
+helix-bench    = { path = "crates/helix-bench" }
+helix-observe  = { path = "crates/helix-observe" }
+
+# Cranelift — pin ALL members of the family to one identical minor.
+# They share ir::* types; mixed minors fail to compile with confusing errors.
+cranelift          = "=0.135.0"
+cranelift-codegen  = "=0.135.0"
+cranelift-frontend = "=0.135.0"
+cranelift-module   = "=0.135.0"
+cranelift-jit      = "=0.135.0"
+cranelift-native   = "=0.135.0"
+
+# Serialization / tooling
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo    = "0.37"
+webbrowser = "1"
+
+# Observatory server
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+
+[profile.release]
+lto = "thin"

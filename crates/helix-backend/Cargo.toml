@@ -1,0 +1,13 @@
+[package]
+name = "helix-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cranelift = { workspace = true }
+cranelift-codegen = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-module = { workspace = true }
+cranelift-jit = { workspace = true }
+cranelift-native = { workspace = true }

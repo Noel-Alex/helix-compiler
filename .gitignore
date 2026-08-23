@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.obj
+*.exe.tmp
+.claude/launch.local.json
+docs/benchmarks/data/*.local.json
