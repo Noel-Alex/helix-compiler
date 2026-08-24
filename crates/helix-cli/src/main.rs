@@ -1,157 +1,112 @@
-//! `helix` — the HELIX Lite compiler driver.
+//! The `helix` command-line driver.
 //!
 //! Subcommands:
-//! - `run    <file.hx> [--backend interp|jit] [--unchecked]` — compile & execute
-//! - `check  <file.hx>` — parse + semantic check only
-//! - `dump   <stage> <file.hx>` — tokens | ast | ir | ssa | loops | all
-//! - `bench  [--quick|--full] [--out dir]` — benchmark campaign
-//! - `observe [--port N] [--no-open]` — the Observatory web UI
-//! - `selftest` — differential gauntlet: interpreter vs JIT on every example
-
-mod diag;
+//! - `run <file.hx>`          — parse → check → interpret (reference backend)
+//! - `check <file.hx>`        — frontend only; prints diagnostics with carets
+//! - `dump <stage> <file.hx>` — print a pipeline stage (tokens|ast|ir|ssa) for
+//!                              eyeballing and golden tests
+//!
+//! The JIT backend (`--backend jit`) and the Observatory server live in later
+//! milestones; the argument surface already reserves them.
 
 use std::path::PathBuf;
 
-use helix_ir as hir;
-use helix_syntax::parse_str;
+use helix_ir::print::print_ir;
+use helix_sema::{SemDiag, TypedProgram};
+use helix_syntax::Span;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let code = run(args);
+    let code = dispatch(&args);
     std::process::exit(code);
 }
 
-fn run(args: Vec<String>) -> i32 {
-    let Some(cmd) = args.first() else {
-        print_usage();
-        return 2;
-    };
-    let rest = &args[1..];
-    match cmd.as_str() {
-        "run" => cmd_run(rest),
-        "check" => cmd_check(rest),
-        "dump" => cmd_dump(rest),
-        "bench" => cmd_bench(rest),
-        "observe" => cmd_observe(rest),
-        "selftest" => cmd_selftest(rest),
-        "--help" | "-h" | "help" => {
-            print_usage();
+fn dispatch(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("run") => cmd_run(args.get(1)),
+        Some("check") => cmd_check(args.get(1)),
+        Some("dump") => match (args.get(1), args.get(2)) {
+            (Some(stage), Some(file)) => cmd_dump(stage, file),
+            _ => usage("dump requires <stage> <file>"),
+        },
+        Some("--help" | "-h" | "help") | None => {
+            print_help();
             0
         }
-        other => {
-            eprintln!("unknown command '{other}'");
-            print_usage();
-            2
-        }
+        Some(other) => usage(&format!("unknown subcommand '{other}'")),
     }
 }
 
-fn print_usage() {
+fn usage(msg: &str) -> i32 {
+    eprintln!("error: {msg}");
+    print_help();
+    1
+}
+
+fn print_help() {
     println!(
-        "HELIX Lite — automatic parallelizing compiler\n\
-         \n\
-         USAGE:\n  \
-         helix run     <file.hx> [--backend interp|jit] [--unchecked]\n  \
-         helix check   <file.hx>\n  \
-         helix dump    <tokens|ast|ir|ssa|loops|all> <file.hx>\n  \
-         helix bench   [--quick|--full] [--out DIR]\n  \
-         helix observe [--port N] [--no-open]\n  \
-         helix selftest"
+        "HELIX Lite — automatic parallelizing compiler
+
+USAGE:
+    helix run <file.hx>              run via the reference interpreter
+    helix check <file.hx>            type-check only, print diagnostics
+    helix dump <stage> <file.hx>     print a pipeline stage
+                                     stages: tokens | ast | ir | ssa
+    helix help                       this message"
     );
 }
 
-struct Frontend {
-    source: String,
-    program: helix_sema::TypedProgram,
-}
-
-fn frontend(path: &str) -> Result<Frontend, i32> {
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
+/// Shared frontend: source string → checked program, printing diags on failure.
+fn frontend(path: &str) -> Result<TypedProgram, i32> {
+    let src = std::fs::read_to_string(PathBuf::from(path))
+        .map_err(|e| {
             eprintln!("error: cannot read {path}: {e}");
-            return Err(1);
-        }
-    };
-    let parsed = match parse_str(&source) {
+            1
+        })?;
+    let program = match helix_syntax::parse_str(&src) {
         Ok(p) => p,
         Err(e) => {
-            let (span, msg) = match &e {
-                helix_syntax::SyntaxError::Lex(l) => (l.span, l.msg.clone()),
-                helix_syntax::SyntaxError::Parse(p) => (p.span, p.msg.clone()),
+            let span = match &e {
+                helix_syntax::SyntaxError::Lex(x) => x.span,
+                helix_syntax::SyntaxError::Parse(x) => x.span,
             };
-            eprint!("{}", diag::render(&source, path, span, &msg));
+            print_diag(&src, span, &e.to_string());
             return Err(1);
         }
     };
-    match helix_sema::check(&parsed) {
-        Ok(tp) => Ok(Frontend { source, program: tp }),
-        Err(diags) => {
-            for d in &diags {
-                eprint!("{}", diag::render(&source, path, d.span, &d.msg));
-            }
-            eprintln!("{} error(s)", diags.len());
-            Err(1)
+    helix_sema::check(&program).map_err(|diags| {
+        for d in &diags {
+            print_diag(&src, d.span, &d.msg);
         }
-    }
+        eprintln!("{} error(s)", diags.len());
+        1
+    })
 }
 
-fn lower_all(program: &helix_sema::TypedProgram) -> Vec<hir::FuncIr> {
-    let mut fns = hir::build(program);
-    for f in &mut fns {
-        hir::to_ssa(f);
-    }
-    fns
-}
-
-fn cmd_run(args: &[String]) -> i32 {
-    let mut backend = "interp";
-    let mut unchecked = false;
-    let mut file = None;
-    for a in args {
-        match a.as_str() {
-            "--backend" | "-b" => {}
-            "interp" | "jit" => backend = a,
-            "--unchecked" => unchecked = true,
-            other if file.is_none() => file = Some(other.to_string()),
-            _ => {}
-        }
-    }
-    let Some(file) = file else {
-        eprintln!("usage: helix run <file.hx> [--backend interp|jit]");
-        return 2;
+fn cmd_run(path: Option<&String>) -> i32 {
+    let Some(path) = path else { return usage("run requires <file>") };
+    let src = std::fs::read_to_string(PathBuf::from(path)).unwrap_or_default();
+    let program = match frontend(path) {
+        Ok(p) => p,
+        Err(code) => return code,
     };
-    let Ok(fe) = frontend(&file) else { return 1 };
-
-    match backend {
-        "interp" => match helix_engine::run_with_source(&fe.source, &fe.program) {
-            Ok(out) => {
-                for line in out.printed {
-                    println!("{line}");
-                }
-                0
+    match helix_engine::run_with_source(&src, &program) {
+        Ok(out) => {
+            for line in &out.printed {
+                println!("{line}");
             }
-            Err(e) => {
-                eprintln!("{}", e.render(&fe.source));
-                1
-            }
-        },
-        "jit" => {
-            // Backend integration lands with Wave 3; keep the surface stable.
-            eprintln!("error: jit backend not wired yet (pending helix-backend build)");
-            let _ = (unchecked, lower_all(&fe.program));
-            3
+            0
         }
-        _ => unreachable!(),
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
     }
 }
 
-fn cmd_check(args: &[String]) -> i32 {
-    let Some(file) = args.first() else {
-        eprintln!("usage: helix check <file.hx>");
-        return 2;
-    };
-    match frontend(file) {
+fn cmd_check(path: Option<&String>) -> i32 {
+    let Some(path) = path else { return usage("check requires <file>") };
+    match frontend(path) {
         Ok(_) => {
             println!("ok");
             0
@@ -160,121 +115,82 @@ fn cmd_check(args: &[String]) -> i32 {
     }
 }
 
-fn cmd_dump(args: &[String]) -> i32 {
-    if args.len() < 2 {
-        eprintln!("usage: helix dump <tokens|ast|ir|ssa|loops|all> <file.hx>");
-        return 2;
-    }
-    let stage = args[0].as_str();
-    let file = &args[1];
-    let fe = match frontend_stage(file, stage) {
-        Ok(fe) => fe,
-        Err(code) => return code,
+fn cmd_dump(stage: &str, path: &str) -> i32 {
+    let src = std::fs::read_to_string(PathBuf::from(path)).unwrap_or_default();
+    let tokens = match helix_syntax::lex(&src) {
+        Ok(t) => t,
+        Err(e) => {
+            print_diag(&src, e.span, &e.msg);
+            return 1;
+        }
     };
 
     match stage {
         "tokens" => {
-            let toks = helix_syntax::lex(&fe.source).expect("checked above");
-            for t in &toks {
-                let text = &fe.source[t.span.start as usize..t.span.end as usize];
-                println!("{:>4}..{:<4} {:?} {text:?}", t.span.start, t.span.end, t.kind);
+            for tok in &tokens {
+                let text = &src[tok.span.start as usize..tok.span.end as usize];
+                println!("{:>4}..{:<4} {:?} {text:?}", tok.span.start, tok.span.end, tok.kind);
             }
+            0
         }
         "ast" => {
-            let p = helix_syntax::parse_str(&fe.source).expect("checked above");
-            println!("{}", p.print_tree());
+            match helix_syntax::parse_str(&src) {
+                Ok(p) => {
+                    println!("{}", p.print_tree());
+                    0
+                }
+                Err(e) => {
+                    let span = match &e {
+                        helix_syntax::SyntaxError::Lex(x) => x.span,
+                        helix_syntax::SyntaxError::Parse(x) => x.span,
+                    };
+                    print_diag(&src, span, &e.to_string());
+                    1
+                }
+            }
         }
-        "ir" | "ssa" | "loops" | "all" => {
-            let fns = lower_all(&fe.program);
-            if matches!(stage, "ir" | "all") {
-                for f in &fns {
-                    println!("==== {} (pre-SSA) ====", f.name);
-                    println!("{}", hir::print_ir(f, false));
-                }
-            }
-            if matches!(stage, "ssa" | "all") {
-                for f in &fns {
-                    println!("==== {} (SSA) ====", f.name);
-                    println!("{}", hir::print_ir(f, true));
-                }
-            }
-            if matches!(stage, "loops" | "all") {
-                for f in &fns {
-                    let li = helix_analysis::loops::find_loops(f);
-                    let reports = helix_analysis::analyze(f, &li);
-                    if reports.is_empty() {
-                        continue;
-                    }
-                    println!("==== {} loop analysis ====", f.name);
-                    for r in &reports {
-                        println!("{}", r.summary_line());
-                        for line in &r.accesses {
-                            println!("    {line}");
-                        }
-                        for d in r.raw_deps.iter().chain(&r.war_deps).chain(&r.waw_deps) {
-                            println!("    {}", d.explain);
-                        }
+        "ir" | "ssa" => {
+            let want_ssa = stage == "ssa";
+            let program = match frontend(path) {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
+            let mut funcs = helix_ir::build(&program);
+            if want_ssa {
+                for f in &mut funcs {
+                    helix_ir::to_ssa(f);
+                    if let Err(e) = helix_ir::verify_ssa(f) {
+                        eprintln!("ssa verification failed for '{}': {e}", f.name);
+                        return 1;
                     }
                 }
             }
-        }
-        other => {
-            eprintln!("unknown stage '{other}'");
-            return 2;
-        }
-    }
-    0
-}
-
-/// Like frontend() but tolerates later-stage failures when dumping early stages.
-fn frontend_stage(file: &str, stage: &str) -> Result<Frontend, i32> {
-    let needs_full =
-        matches!(stage, "ir" | "ssa" | "loops" | "all");
-    let source = std::fs::read_to_string(file).map_err(|e| {
-        eprintln!("error: cannot read {file}: {e}");
-        1
-    })?;
-    let parsed = parse_str(&source).map_err(|e| {
-        let (span, msg) = match &e {
-            helix_syntax::SyntaxError::Lex(l) => (l.span, l.msg.clone()),
-            helix_syntax::SyntaxError::Parse(p) => (p.span, p.msg.clone()),
-        };
-        eprint!("{}", diag::render(&source, file, span, &msg));
-        1
-    })?;
-    if !needs_full && matches!(stage, "tokens" | "ast") {
-        // A syntactic dump doesn't need sema.
-        return Ok(Frontend { source, program: empty_program() });
-    }
-    match helix_sema::check(&parsed) {
-        Ok(tp) => Ok(Frontend { source, program: tp }),
-        Err(diags) => {
-            for d in &diags {
-                eprint!("{}", diag::render(&source, file, d.span, &d.msg));
+            for f in &funcs {
+                println!("=== {} ===", f.name);
+                println!("{}", print_ir(f, want_ssa));
             }
-            Err(1)
+            0
         }
+        other => usage(&format!("unknown stage '{other}' (tokens|ast|ir|ssa)")),
     }
 }
 
-fn empty_program() -> helix_sema::TypedProgram {
-    helix_sema::TypedProgram { funcs: Vec::new(), consts: Vec::new() }
-}
+/// Print one diagnostic with a caret line under the offending span.
+fn print_diag(src: &str, span: Span, msg: &str) {
+    let line_no = src[..span.start as usize].matches('\n').count() + 1;
+    let line_start = src[..span.start as usize].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = src[span.start as usize..]
+        .find('\n')
+        .map_or(src.len(), |i| span.start as usize + i);
+    let line = &src[line_start..line_end];
+    let caret_col = span.start.saturating_sub(line_start as u32);
+    let caret_len = (span.end.saturating_sub(span.start)).max(1);
 
-fn cmd_bench(_args: &[String]) -> i32 {
-    eprintln!("bench campaign lands with Wave 3 (helix-bench)");
-    3
+    eprintln!("--> line {line_no}: {msg}");
+    eprintln!("{line}");
+    eprintln!(
+        "{}{}",
+        " ".repeat(caret_col as usize),
+        "^".repeat(caret_len as usize)
+    );
 }
-
-fn cmd_observe(_args: &[String]) -> i32 {
-    eprintln!("observatory server lands with Wave 3 (helix-observe)");
-    3
-}
-
-fn cmd_selftest(_args: &[String]) -> i32 {
-    eprintln!("selftest lands after jit wiring");
-    3
-}
-
-#[allow(dead_code)]
-fn unused_path_guard(_: PathBuf) {}

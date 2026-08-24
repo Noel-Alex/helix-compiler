@@ -20,11 +20,10 @@ pub fn render(source: &str, filename: &str, span: Span, msg: &str) -> String {
     out.push_str(&format!("  --> {filename}:{line_no}:{col}\n"));
     out.push_str("   |\n");
     out.push_str(&format!("{prefix}{line_text}\n"));
-    out.push_str(&format!(
-        "   | {}{}\n",
-        " ".repeat(col - 1),
-        "^".repeat(caret_len.min(line_text.len().saturating_sub(col - 1) + 1).max(1))
-    ));
+    let visible = (caret_len as usize)
+        .min(line_text.len().saturating_sub(col - 1) + 1)
+        .max(1);
+    out.push_str(&format!("   | {}{}\n", " ".repeat(col - 1), "^".repeat(visible)));
     out
 }
 
