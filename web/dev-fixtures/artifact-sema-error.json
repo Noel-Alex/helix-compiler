@@ -1,0 +1,391 @@
+{
+ "schema": 1,
+ "example": "type_errors",
+ "source": "// deliberate semantic errors for the diagnostics demo\nfn main() {\n    let n = 10;\n    let a: [f64] = zeros(n);\n    a[0] = 1.5;\n    a[1] = n as bool;\n    let b: [i64] = a;\n    print(b[true]);\n}\n",
+ "tokens": [
+  {
+   "kind": "Comment",
+   "text": "// deliberate semantic errors for the diagnostics demo",
+   "start": 0,
+   "end": 54
+  },
+  {
+   "kind": "Kw",
+   "text": "fn",
+   "start": 55,
+   "end": 57
+  },
+  {
+   "kind": "Ident",
+   "text": "main",
+   "start": 58,
+   "end": 62
+  },
+  {
+   "kind": "LParen",
+   "text": "(",
+   "start": 62,
+   "end": 63
+  },
+  {
+   "kind": "RParen",
+   "text": ")",
+   "start": 63,
+   "end": 64
+  },
+  {
+   "kind": "LBrace",
+   "text": "{",
+   "start": 65,
+   "end": 66
+  },
+  {
+   "kind": "Kw",
+   "text": "let",
+   "start": 71,
+   "end": 74
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 75,
+   "end": 76
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 77,
+   "end": 78
+  },
+  {
+   "kind": "Int",
+   "text": "10",
+   "start": 79,
+   "end": 81
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 81,
+   "end": 82
+  },
+  {
+   "kind": "Kw",
+   "text": "let",
+   "start": 87,
+   "end": 90
+  },
+  {
+   "kind": "Ident",
+   "text": "a",
+   "start": 91,
+   "end": 92
+  },
+  {
+   "kind": "Colon",
+   "text": ":",
+   "start": 92,
+   "end": 93
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 94,
+   "end": 95
+  },
+  {
+   "kind": "Ident",
+   "text": "f64",
+   "start": 95,
+   "end": 98
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 98,
+   "end": 99
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 100,
+   "end": 101
+  },
+  {
+   "kind": "Ident",
+   "text": "zeros",
+   "start": 102,
+   "end": 107
+  },
+  {
+   "kind": "LParen",
+   "text": "(",
+   "start": 107,
+   "end": 108
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 108,
+   "end": 109
+  },
+  {
+   "kind": "RParen",
+   "text": ")",
+   "start": 109,
+   "end": 110
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 110,
+   "end": 111
+  },
+  {
+   "kind": "Ident",
+   "text": "a",
+   "start": 116,
+   "end": 117
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 117,
+   "end": 118
+  },
+  {
+   "kind": "Int",
+   "text": "0",
+   "start": 118,
+   "end": 119
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 119,
+   "end": 120
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 121,
+   "end": 122
+  },
+  {
+   "kind": "Float",
+   "text": "1.5",
+   "start": 123,
+   "end": 126
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 126,
+   "end": 127
+  },
+  {
+   "kind": "Ident",
+   "text": "a",
+   "start": 132,
+   "end": 133
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 133,
+   "end": 134
+  },
+  {
+   "kind": "Int",
+   "text": "1",
+   "start": 134,
+   "end": 135
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 135,
+   "end": 136
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 137,
+   "end": 138
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 139,
+   "end": 140
+  },
+  {
+   "kind": "Kw",
+   "text": "as",
+   "start": 141,
+   "end": 143
+  },
+  {
+   "kind": "Ident",
+   "text": "bool",
+   "start": 144,
+   "end": 148
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 148,
+   "end": 149
+  },
+  {
+   "kind": "Kw",
+   "text": "let",
+   "start": 154,
+   "end": 157
+  },
+  {
+   "kind": "Ident",
+   "text": "b",
+   "start": 158,
+   "end": 159
+  },
+  {
+   "kind": "Colon",
+   "text": ":",
+   "start": 159,
+   "end": 160
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 161,
+   "end": 162
+  },
+  {
+   "kind": "Ident",
+   "text": "i64",
+   "start": 162,
+   "end": 165
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 165,
+   "end": 166
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 167,
+   "end": 168
+  },
+  {
+   "kind": "Ident",
+   "text": "a",
+   "start": 169,
+   "end": 170
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 170,
+   "end": 171
+  },
+  {
+   "kind": "Ident",
+   "text": "print",
+   "start": 176,
+   "end": 181
+  },
+  {
+   "kind": "LParen",
+   "text": "(",
+   "start": 181,
+   "end": 182
+  },
+  {
+   "kind": "Ident",
+   "text": "b",
+   "start": 182,
+   "end": 183
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 183,
+   "end": 184
+  },
+  {
+   "kind": "Kw",
+   "text": "true",
+   "start": 184,
+   "end": 188
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 188,
+   "end": 189
+  },
+  {
+   "kind": "RParen",
+   "text": ")",
+   "start": 189,
+   "end": 190
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 190,
+   "end": 191
+  },
+  {
+   "kind": "RBrace",
+   "text": "}",
+   "start": 192,
+   "end": 193
+  },
+  {
+   "kind": "Eof",
+   "text": "",
+   "start": 194,
+   "end": 194
+  }
+ ],
+ "ast": {
+  "Program": {
+   "items": []
+  }
+ },
+ "diags_sem": [
+  {
+   "span": {
+    "start": 139,
+    "end": 148
+   },
+   "msg": "invalid cast: `as bool` is not a permitted cast target (numeric scalar types only)"
+  },
+  {
+   "span": {
+    "start": 167,
+    "end": 171
+   },
+   "msg": "mismatched types: expected `[i64]`, found `[f64]`"
+  },
+  {
+   "span": {
+    "start": 184,
+    "end": 188
+   },
+   "msg": "array index must be an integer, found `bool`"
+  }
+ ],
+ "ir_pre_ssa": null,
+ "ir_ssa": null,
+ "passes": null,
+ "cfg": null,
+ "domtree": null,
+ "loops": null,
+ "exec": null,
+ "bench": null
+}

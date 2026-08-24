@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>HELIX Observatory — automatic parallelizing compiler</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1117'/%3E%3Cpath d='M10 6v20M22 6v20M10 16h12' stroke='%2300c896' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wordmark" title="HELIX Lite — automatic parallelizing compiler">
+    <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 4v24M23 4v24M9 16h14" /></svg>
+    <span class="wm-helix">HELIX</span><span class="wm-lite">LITE</span>
+  </div>
+  <div class="topbar-sep"></div>
+  <h1 class="crumb">Observatory<span id="top-example" class="crumb-example"></span></h1>
+  <div class="topbar-spacer"></div>
+  <div id="chip-backend" class="chip chip-mono hidden" title="execution backend chosen by the planner"></div>
+  <div id="chip-checksum" class="chip chip-mono hidden" title="checksum of program output"></div>
+  <button id="btn-recompile" class="btn hidden" title="re-run the compile pipeline on this example">&#x21bb; recompile</button>
+</header>
+
+<div class="shell">
+
+  <!-- ======================= left rail ======================= -->
+  <aside class="rail">
+    <section class="rail-sec">
+      <h2 class="rail-title">Examples</h2>
+      <ul id="example-list" class="example-list"><li class="rail-note">loading&hellip;</li></ul>
+    </section>
+    <section class="rail-sec rail-grow">
+      <h2 class="rail-title">Custom source</h2>
+      <textarea id="custom-src" class="custom-src" spellcheck="false"
+        placeholder="// HELIX source &#10;// fn main() { ... }&#10;&#10;for i in 0..n {&#10;    y[i] = s * x[i] + y[i];&#10;}"></textarea>
+      <button id="btn-compile" class="btn btn-primary">Compile &amp; Run &#x25b6;</button>
+      <p class="rail-note">POSTs the buffer to <code>/api/run</code> and renders the returned artifact.</p>
+    </section>
+  </aside>
+
+  <!-- ======================= main column ======================= -->
+  <main class="maincol">
+
+    <nav class="stepper-wrap">
+      <ol id="stepper" class="stepper" role="tablist" aria-label="pipeline phases"></ol>
+    </nav>
+
+    <div id="diag-banner" class="diag-banner hidden"></div>
+
+    <section id="stage" class="stage" tabindex="-1">
+
+      <!-- SOURCE -->
+      <div class="phase" data-phase="source">
+        <div class="panel panel-fill">
+          <div class="panel-head">
+            <span class="panel-title">Source</span><span class="panel-sub" id="src-sub"></span>
+            <span class="panel-spacer"></span>
+            <label class="toggle"><input type="checkbox" id="src-show-diag" checked> mark diagnostics</label>
+          </div>
+          <div class="codewrap">
+            <table class="codeview" id="source-view"><tbody></tbody></table>
+          </div>
+        </div>
+      </div>
+
+      <!-- TOKENS -->
+      <div class="phase" data-phase="tokens">
+        <div class="panel panel-fill">
+          <div class="panel-head">
+            <span class="panel-title">Token stream</span><span class="panel-sub" id="tok-count"></span>
+            <span class="panel-spacer"></span>
+            <span class="legend"><i class="sw tok-kw">&nbsp;</i>keyword<i class="sw tok-num">&nbsp;</i>number<i class="sw tok-op">&nbsp;</i>punct/op<i class="sw tok-id">&nbsp;</i>ident</span>
+          </div>
+          <div class="scrollfill">
+            <table class="tok-table" id="token-table">
+              <thead><tr><th>#</th><th>kind</th><th>text</th><th>start&ndash;end</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- AST -->
+      <div class="phase" data-phase="ast">
+        <div class="panel panel-fill panel-viewport">
+          <div class="panel-head">
+            <span class="panel-title">Abstract syntax tree</span><span class="panel-sub" id="ast-sub"></span>
+            <span class="panel-spacer"></span>
+            <span class="hint">drag to pan &middot; scroll to zoom &middot; double-click to reset</span>
+          </div>
+          <div class="graphhost" id="ast-host"></div>
+        </div>
+      </div>
+
+      <!-- CFG -->
+      <div class="phase" data-phase="cfg">
+        <div class="panel panel-fill panel-viewport">
+          <div class="panel-head">
+            <span class="panel-title">Control-flow graph</span><span class="panel-sub">layout precomputed server-side</span>
+            <span class="panel-spacer"></span>
+            <span id="cfg-fn-tabs" class="fntabs"></span>
+          </div>
+          <div class="graphhost" id="cfg-host">
+            <svg id="cfg-svg">
+              <defs>
+                <marker id="arrow-ft" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arr arr-ft"/></marker>
+                <marker id="arrow-br" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arr arr-br"/></marker>
+                <marker id="arrow-be" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arr arr-be"/></marker>
+                <marker id="arrow-hi" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arr arr-hi"/></marker>
+              </defs>
+              <g id="cfg-zoom"><g id="cfg-edges-layer"></g><g id="cfg-nodes-layer"></g></g>
+            </svg>
+            <div id="cfg-empty" class="empty hidden"></div>
+          </div>
+          <div class="cfg-legend">
+            <span><i class="dot dot-entry"></i>entry</span>
+            <span><i class="dot dot-exit"></i>exit</span>
+            <span><i class="dot dot-loop"></i>loop header &mdash; hover for its loop body</span>
+            <span><i class="dot dot-join"></i>join</span>
+            <span><i class="dot dot-straight"></i>straight-line</span>
+            <span class="lg-edge"><i class="line line-br"></i>branch</span>
+            <span class="lg-edge"><i class="line line-ft"></i>fallthrough</span>
+            <span class="lg-edge"><i class="line line-be"></i>backedge</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- SSA -->
+      <div class="phase" data-phase="ssa">
+        <div class="panel panel-fill">
+          <div class="panel-head">
+            <span class="panel-title">SSA form</span><span class="panel-sub" id="ssa-fn-name"></span>
+            <span class="panel-spacer"></span>
+            <label class="toggle"><input type="checkbox" id="ssa-side-by-side"> side-by-side vs pre-SSA</label>
+            <span id="ssa-fn-tabs" class="fntabs"></span>
+          </div>
+          <div id="ssa-body" class="ssabody single">
+            <figure class="irpane irpane-pre">
+              <figcaption>pre-SSA <em id="ssa-pre-note"></em></figcaption>
+              <pre class="ir" id="ir-pre"></pre>
+            </figure>
+            <figure class="irpane irpane-ssa">
+              <figcaption>after SSA construction <em>&phi;-nodes highlighted</em></figcaption>
+              <pre class="ir" id="ir-ssa"></pre>
+            </figure>
+          </div>
+          <div id="ssa-empty" class="empty hidden"></div>
+        </div>
+      </div>
+
+      <!-- OPT -->
+      <div class="phase" data-phase="opt">
+        <div class="panel panel-fill">
+          <div class="panel-head">
+            <span class="panel-title">Optimization passes</span>
+            <span class="panel-sub" id="opt-summary"></span>
+            <span class="panel-spacer"></span>
+            <span class="hint">click a pass to unfold the full IR after that pass</span>
+          </div>
+          <div class="scrollfill"><div id="pass-list" class="passlist"></div></div>
+          <div id="opt-empty" class="empty hidden"></div>
+        </div>
+      </div>
+
+      <!-- LOOP ANALYSIS -->
+      <div class="phase" data-phase="loops">
+        <div class="panel panel-fill">
+          <div class="panel-head">
+            <span class="panel-title">Loop analysis</span>
+            <span class="panel-sub">dependence testing &amp; parallelization verdicts</span>
+          </div>
+          <div class="scrollfill"><div id="loop-list" class="looplist"></div></div>
+          <div id="loops-empty" class="empty hidden"></div>
+        </div>
+      </div>
+
+      <!-- BENCH -->
+      <div class="phase" data-phase="bench">
+        <div class="panel panel-fill">
+          <div class="panel-head">
+            <span class="panel-title">Benchmark</span><span class="panel-sub" id="bench-kernel"></span>
+            <span class="panel-spacer"></span>
+            <label class="toggle"><input type="checkbox" id="bench-logscale"> log scale</label>
+          </div>
+          <div class="scrollfill benchwrap">
+            <div id="bench-chart" class="bench-chart"></div>
+            <div id="bench-eff" class="effwrap"></div>
+          </div>
+          <div id="bench-empty" class="empty hidden"></div>
+        </div>
+      </div>
+
+    </section>
+
+    <footer class="footer">HELIX Lite — automatic parallelizing compiler</footer>
+  </main>
+</div>
+
+<script src="/vendor/d3.v7.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

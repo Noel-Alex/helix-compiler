@@ -158,3 +158,28 @@ Semantics identical to spec incl. checked ops & saturating casts.
 - No panics across FFI/JIT boundaries: host wraps JIT calls in catch_unwind.
 - Naming: snake_case modules, CamelCase types, SCREAMING_SNAKE consts.
 - Every crate: `#![forbid(unsafe_code)]` EXCEPT backend+runtime (document each unsafe block).
+
+## Addendum (2026-08-24): helix-ir helpers required by helix-analysis
+
+helix-analysis (already drafted) consumes these FuncIr/Inst conveniences beyond the base
+contract. helix-ir must provide:
+
+```rust
+impl FuncIr {
+    pub fn def_block(&self, v: ValueId) -> BlockId;          // block defining value
+    pub fn const_of(&self, v: ValueId) -> Option<i64>;       // i64 view of Const defs
+    pub fn inst_defining(&self, v: ValueId) -> Option<&Inst>;
+    pub fn local_of_value(&self, v: ValueId) -> Option<LocalId>; // value that IS a local slot
+    pub fn local_name(&self, l: LocalId) -> &str;            // from sema symbol arena
+    pub fn loop_has_print(&self, lp: &LoopLike) -> bool;     // any print call inside blocks
+}
+impl Inst {
+    pub fn local_reads(&self) -> Vec<LocalId>;
+    pub fn local_write(&self) -> Option<LocalId>;
+}
+pub mod testutil { pub fn counting_loop() -> FuncIr; pub fn nested_loops() -> FuncIr; }
+pub mod dom { pub struct Dominators { pub reachable: Vec<bool>, /* + idoms */ }
+              impl Dominators { pub fn compute(f:&FuncIr)->Self; pub fn dominates(&self,a:BlockId,b:BlockId)->bool; } }
+// Inst::StoreScalar{dst: LocalId, val: ValueId} — scalar variable store (pre-SSA model keeps
+// locals as memory-like slots until SSA renames them).
+```

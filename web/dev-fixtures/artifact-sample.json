@@ -1,0 +1,2761 @@
+{
+ "schema": 1,
+ "example": "saxpy_trio",
+ "source": "// saxpy trio: streaming update, reversed gather, dot-product reduction.\n// plus a branch-heavy helper so the CFG view shows two functions.\nfn clampidx(i: i64, n: i64) -> i64 {\n    if i < 0 {\n        return 0;\n    }\n    if i >= n {\n        return n - 1;\n    }\n    return i;\n}\n\nfn main() {\n    let n = 33554432;\n    let x: [f64] = zeros(n);\n    let y: [f64] = zeros(n);\n\n    // loop #0 - elementwise stream: iterations are independent\n    for i in 0..n {\n        y[i] = 2.5 * x[i] + y[i];\n    }\n\n    // loop #1 - reversed gather: carries a RAW dependence\n    let h = n / 2;\n    for j in 0..h {\n        y[j] = y[n - j - 1];\n    }\n\n    // loop #2 - dot product: floating-point +-reduction\n    let dot = 0.0;\n    for k in 0..n {\n        dot = dot + x[k] * y[k];\n    }\n    print(dot);\n}\n",
+ "tokens": [
+  {
+   "kind": "Comment",
+   "text": "// saxpy trio: streaming update, reversed gather, dot-product reduction.",
+   "start": 0,
+   "end": 72
+  },
+  {
+   "kind": "Comment",
+   "text": "// plus a branch-heavy helper so the CFG view shows two functions.",
+   "start": 73,
+   "end": 139
+  },
+  {
+   "kind": "Kw",
+   "text": "fn",
+   "start": 140,
+   "end": 142
+  },
+  {
+   "kind": "Ident",
+   "text": "clampidx",
+   "start": 143,
+   "end": 151
+  },
+  {
+   "kind": "LParen",
+   "text": "(",
+   "start": 151,
+   "end": 152
+  },
+  {
+   "kind": "Ident",
+   "text": "i",
+   "start": 152,
+   "end": 153
+  },
+  {
+   "kind": "Colon",
+   "text": ":",
+   "start": 153,
+   "end": 154
+  },
+  {
+   "kind": "Ident",
+   "text": "i64",
+   "start": 155,
+   "end": 158
+  },
+  {
+   "kind": "Comma",
+   "text": ",",
+   "start": 158,
+   "end": 159
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 160,
+   "end": 161
+  },
+  {
+   "kind": "Colon",
+   "text": ":",
+   "start": 161,
+   "end": 162
+  },
+  {
+   "kind": "Ident",
+   "text": "i64",
+   "start": 163,
+   "end": 166
+  },
+  {
+   "kind": "RParen",
+   "text": ")",
+   "start": 166,
+   "end": 167
+  },
+  {
+   "kind": "Arrow",
+   "text": "->",
+   "start": 168,
+   "end": 170
+  },
+  {
+   "kind": "Ident",
+   "text": "i64",
+   "start": 171,
+   "end": 174
+  },
+  {
+   "kind": "LBrace",
+   "text": "{",
+   "start": 175,
+   "end": 176
+  },
+  {
+   "kind": "Kw",
+   "text": "if",
+   "start": 181,
+   "end": 183
+  },
+  {
+   "kind": "Ident",
+   "text": "i",
+   "start": 184,
+   "end": 185
+  },
+  {
+   "kind": "Lt",
+   "text": "<",
+   "start": 186,
+   "end": 187
+  },
+  {
+   "kind": "Int",
+   "text": "0",
+   "start": 188,
+   "end": 189
+  },
+  {
+   "kind": "LBrace",
+   "text": "{",
+   "start": 190,
+   "end": 191
+  },
+  {
+   "kind": "Kw",
+   "text": "return",
+   "start": 200,
+   "end": 206
+  },
+  {
+   "kind": "Int",
+   "text": "0",
+   "start": 207,
+   "end": 208
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 208,
+   "end": 209
+  },
+  {
+   "kind": "RBrace",
+   "text": "}",
+   "start": 214,
+   "end": 215
+  },
+  {
+   "kind": "Kw",
+   "text": "if",
+   "start": 220,
+   "end": 222
+  },
+  {
+   "kind": "Ident",
+   "text": "i",
+   "start": 223,
+   "end": 224
+  },
+  {
+   "kind": "Ge",
+   "text": ">=",
+   "start": 225,
+   "end": 227
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 228,
+   "end": 229
+  },
+  {
+   "kind": "LBrace",
+   "text": "{",
+   "start": 230,
+   "end": 231
+  },
+  {
+   "kind": "Kw",
+   "text": "return",
+   "start": 240,
+   "end": 246
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 247,
+   "end": 248
+  },
+  {
+   "kind": "Minus",
+   "text": "-",
+   "start": 249,
+   "end": 250
+  },
+  {
+   "kind": "Int",
+   "text": "1",
+   "start": 251,
+   "end": 252
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 252,
+   "end": 253
+  },
+  {
+   "kind": "RBrace",
+   "text": "}",
+   "start": 258,
+   "end": 259
+  },
+  {
+   "kind": "Kw",
+   "text": "return",
+   "start": 264,
+   "end": 270
+  },
+  {
+   "kind": "Ident",
+   "text": "i",
+   "start": 271,
+   "end": 272
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 272,
+   "end": 273
+  },
+  {
+   "kind": "RBrace",
+   "text": "}",
+   "start": 274,
+   "end": 275
+  },
+  {
+   "kind": "Kw",
+   "text": "fn",
+   "start": 277,
+   "end": 279
+  },
+  {
+   "kind": "Ident",
+   "text": "main",
+   "start": 280,
+   "end": 284
+  },
+  {
+   "kind": "LParen",
+   "text": "(",
+   "start": 284,
+   "end": 285
+  },
+  {
+   "kind": "RParen",
+   "text": ")",
+   "start": 285,
+   "end": 286
+  },
+  {
+   "kind": "LBrace",
+   "text": "{",
+   "start": 287,
+   "end": 288
+  },
+  {
+   "kind": "Kw",
+   "text": "let",
+   "start": 293,
+   "end": 296
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 297,
+   "end": 298
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 299,
+   "end": 300
+  },
+  {
+   "kind": "Int",
+   "text": "33554432",
+   "start": 301,
+   "end": 309
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 309,
+   "end": 310
+  },
+  {
+   "kind": "Kw",
+   "text": "let",
+   "start": 315,
+   "end": 318
+  },
+  {
+   "kind": "Ident",
+   "text": "x",
+   "start": 319,
+   "end": 320
+  },
+  {
+   "kind": "Colon",
+   "text": ":",
+   "start": 320,
+   "end": 321
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 322,
+   "end": 323
+  },
+  {
+   "kind": "Ident",
+   "text": "f64",
+   "start": 323,
+   "end": 326
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 326,
+   "end": 327
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 328,
+   "end": 329
+  },
+  {
+   "kind": "Ident",
+   "text": "zeros",
+   "start": 330,
+   "end": 335
+  },
+  {
+   "kind": "LParen",
+   "text": "(",
+   "start": 335,
+   "end": 336
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 336,
+   "end": 337
+  },
+  {
+   "kind": "RParen",
+   "text": ")",
+   "start": 337,
+   "end": 338
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 338,
+   "end": 339
+  },
+  {
+   "kind": "Kw",
+   "text": "let",
+   "start": 344,
+   "end": 347
+  },
+  {
+   "kind": "Ident",
+   "text": "y",
+   "start": 348,
+   "end": 349
+  },
+  {
+   "kind": "Colon",
+   "text": ":",
+   "start": 349,
+   "end": 350
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 351,
+   "end": 352
+  },
+  {
+   "kind": "Ident",
+   "text": "f64",
+   "start": 352,
+   "end": 355
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 355,
+   "end": 356
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 357,
+   "end": 358
+  },
+  {
+   "kind": "Ident",
+   "text": "zeros",
+   "start": 359,
+   "end": 364
+  },
+  {
+   "kind": "LParen",
+   "text": "(",
+   "start": 364,
+   "end": 365
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 365,
+   "end": 366
+  },
+  {
+   "kind": "RParen",
+   "text": ")",
+   "start": 366,
+   "end": 367
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 367,
+   "end": 368
+  },
+  {
+   "kind": "Comment",
+   "text": "// loop #0 - elementwise stream: iterations are independent",
+   "start": 374,
+   "end": 433
+  },
+  {
+   "kind": "Kw",
+   "text": "for",
+   "start": 438,
+   "end": 441
+  },
+  {
+   "kind": "Ident",
+   "text": "i",
+   "start": 442,
+   "end": 443
+  },
+  {
+   "kind": "Kw",
+   "text": "in",
+   "start": 444,
+   "end": 446
+  },
+  {
+   "kind": "Int",
+   "text": "0",
+   "start": 447,
+   "end": 448
+  },
+  {
+   "kind": "DotDot",
+   "text": "..",
+   "start": 448,
+   "end": 450
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 450,
+   "end": 451
+  },
+  {
+   "kind": "LBrace",
+   "text": "{",
+   "start": 452,
+   "end": 453
+  },
+  {
+   "kind": "Ident",
+   "text": "y",
+   "start": 462,
+   "end": 463
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 463,
+   "end": 464
+  },
+  {
+   "kind": "Ident",
+   "text": "i",
+   "start": 464,
+   "end": 465
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 465,
+   "end": 466
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 467,
+   "end": 468
+  },
+  {
+   "kind": "Float",
+   "text": "2.5",
+   "start": 469,
+   "end": 472
+  },
+  {
+   "kind": "Star",
+   "text": "*",
+   "start": 473,
+   "end": 474
+  },
+  {
+   "kind": "Ident",
+   "text": "x",
+   "start": 475,
+   "end": 476
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 476,
+   "end": 477
+  },
+  {
+   "kind": "Ident",
+   "text": "i",
+   "start": 477,
+   "end": 478
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 478,
+   "end": 479
+  },
+  {
+   "kind": "Plus",
+   "text": "+",
+   "start": 480,
+   "end": 481
+  },
+  {
+   "kind": "Ident",
+   "text": "y",
+   "start": 482,
+   "end": 483
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 483,
+   "end": 484
+  },
+  {
+   "kind": "Ident",
+   "text": "i",
+   "start": 484,
+   "end": 485
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 485,
+   "end": 486
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 486,
+   "end": 487
+  },
+  {
+   "kind": "RBrace",
+   "text": "}",
+   "start": 492,
+   "end": 493
+  },
+  {
+   "kind": "Comment",
+   "text": "// loop #1 - reversed gather: carries a RAW dependence",
+   "start": 499,
+   "end": 553
+  },
+  {
+   "kind": "Kw",
+   "text": "let",
+   "start": 558,
+   "end": 561
+  },
+  {
+   "kind": "Ident",
+   "text": "h",
+   "start": 562,
+   "end": 563
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 564,
+   "end": 565
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 566,
+   "end": 567
+  },
+  {
+   "kind": "Slash",
+   "text": "/",
+   "start": 568,
+   "end": 569
+  },
+  {
+   "kind": "Int",
+   "text": "2",
+   "start": 570,
+   "end": 571
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 571,
+   "end": 572
+  },
+  {
+   "kind": "Kw",
+   "text": "for",
+   "start": 577,
+   "end": 580
+  },
+  {
+   "kind": "Ident",
+   "text": "j",
+   "start": 581,
+   "end": 582
+  },
+  {
+   "kind": "Kw",
+   "text": "in",
+   "start": 583,
+   "end": 585
+  },
+  {
+   "kind": "Int",
+   "text": "0",
+   "start": 586,
+   "end": 587
+  },
+  {
+   "kind": "DotDot",
+   "text": "..",
+   "start": 587,
+   "end": 589
+  },
+  {
+   "kind": "Ident",
+   "text": "h",
+   "start": 589,
+   "end": 590
+  },
+  {
+   "kind": "LBrace",
+   "text": "{",
+   "start": 591,
+   "end": 592
+  },
+  {
+   "kind": "Ident",
+   "text": "y",
+   "start": 601,
+   "end": 602
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 602,
+   "end": 603
+  },
+  {
+   "kind": "Ident",
+   "text": "j",
+   "start": 603,
+   "end": 604
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 604,
+   "end": 605
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 606,
+   "end": 607
+  },
+  {
+   "kind": "Ident",
+   "text": "y",
+   "start": 608,
+   "end": 609
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 609,
+   "end": 610
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 610,
+   "end": 611
+  },
+  {
+   "kind": "Minus",
+   "text": "-",
+   "start": 612,
+   "end": 613
+  },
+  {
+   "kind": "Ident",
+   "text": "j",
+   "start": 614,
+   "end": 615
+  },
+  {
+   "kind": "Minus",
+   "text": "-",
+   "start": 616,
+   "end": 617
+  },
+  {
+   "kind": "Int",
+   "text": "1",
+   "start": 618,
+   "end": 619
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 619,
+   "end": 620
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 620,
+   "end": 621
+  },
+  {
+   "kind": "RBrace",
+   "text": "}",
+   "start": 626,
+   "end": 627
+  },
+  {
+   "kind": "Comment",
+   "text": "// loop #2 - dot product: floating-point +-reduction",
+   "start": 633,
+   "end": 685
+  },
+  {
+   "kind": "Kw",
+   "text": "let",
+   "start": 690,
+   "end": 693
+  },
+  {
+   "kind": "Ident",
+   "text": "dot",
+   "start": 694,
+   "end": 697
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 698,
+   "end": 699
+  },
+  {
+   "kind": "Float",
+   "text": "0.0",
+   "start": 700,
+   "end": 703
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 703,
+   "end": 704
+  },
+  {
+   "kind": "Kw",
+   "text": "for",
+   "start": 709,
+   "end": 712
+  },
+  {
+   "kind": "Ident",
+   "text": "k",
+   "start": 713,
+   "end": 714
+  },
+  {
+   "kind": "Kw",
+   "text": "in",
+   "start": 715,
+   "end": 717
+  },
+  {
+   "kind": "Int",
+   "text": "0",
+   "start": 718,
+   "end": 719
+  },
+  {
+   "kind": "DotDot",
+   "text": "..",
+   "start": 719,
+   "end": 721
+  },
+  {
+   "kind": "Ident",
+   "text": "n",
+   "start": 721,
+   "end": 722
+  },
+  {
+   "kind": "LBrace",
+   "text": "{",
+   "start": 723,
+   "end": 724
+  },
+  {
+   "kind": "Ident",
+   "text": "dot",
+   "start": 733,
+   "end": 736
+  },
+  {
+   "kind": "Assign",
+   "text": "=",
+   "start": 737,
+   "end": 738
+  },
+  {
+   "kind": "Ident",
+   "text": "dot",
+   "start": 739,
+   "end": 742
+  },
+  {
+   "kind": "Plus",
+   "text": "+",
+   "start": 743,
+   "end": 744
+  },
+  {
+   "kind": "Ident",
+   "text": "x",
+   "start": 745,
+   "end": 746
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 746,
+   "end": 747
+  },
+  {
+   "kind": "Ident",
+   "text": "k",
+   "start": 747,
+   "end": 748
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 748,
+   "end": 749
+  },
+  {
+   "kind": "Star",
+   "text": "*",
+   "start": 750,
+   "end": 751
+  },
+  {
+   "kind": "Ident",
+   "text": "y",
+   "start": 752,
+   "end": 753
+  },
+  {
+   "kind": "LBracket",
+   "text": "[",
+   "start": 753,
+   "end": 754
+  },
+  {
+   "kind": "Ident",
+   "text": "k",
+   "start": 754,
+   "end": 755
+  },
+  {
+   "kind": "RBracket",
+   "text": "]",
+   "start": 755,
+   "end": 756
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 756,
+   "end": 757
+  },
+  {
+   "kind": "RBrace",
+   "text": "}",
+   "start": 762,
+   "end": 763
+  },
+  {
+   "kind": "Ident",
+   "text": "print",
+   "start": 768,
+   "end": 773
+  },
+  {
+   "kind": "LParen",
+   "text": "(",
+   "start": 773,
+   "end": 774
+  },
+  {
+   "kind": "Ident",
+   "text": "dot",
+   "start": 774,
+   "end": 777
+  },
+  {
+   "kind": "RParen",
+   "text": ")",
+   "start": 777,
+   "end": 778
+  },
+  {
+   "kind": "Semi",
+   "text": ";",
+   "start": 778,
+   "end": 779
+  },
+  {
+   "kind": "RBrace",
+   "text": "}",
+   "start": 780,
+   "end": 781
+  },
+  {
+   "kind": "Eof",
+   "text": "",
+   "start": 782,
+   "end": 782
+  }
+ ],
+ "ast": {
+  "Program": {
+   "items": [
+    {
+     "Fn": {
+      "name": {
+       "name": "clampidx",
+       "span": {
+        "start": 143,
+        "end": 151
+       }
+      },
+      "params": [
+       {
+        "name": {
+         "name": "i",
+         "span": {
+          "start": 11,
+          "end": 12
+         }
+        },
+        "ty": {
+         "Scalar": "I64"
+        }
+       },
+       {
+        "name": {
+         "name": "n",
+         "span": {
+          "start": 22,
+          "end": 23
+         }
+        },
+        "ty": {
+         "Scalar": "I64"
+        }
+       }
+      ],
+      "ret": {
+       "Scalar": "I64"
+      },
+      "body": {
+       "stmts": [
+        {
+         "If": {
+          "cond": {
+           "Bin": [
+            "Lt",
+            {
+             "Var": {
+              "name": "i",
+              "span": {
+               "start": 11,
+               "end": 12
+              }
+             }
+            },
+            {
+             "IntLit": [
+              0,
+              {
+               "start": 188,
+               "end": 189
+              }
+             ]
+            },
+            {
+             "start": 184,
+             "end": 189
+            }
+           ]
+          },
+          "then_blk": {
+           "stmts": [
+            {
+             "Return": {
+              "value": {
+               "IntLit": [
+                0,
+                {
+                 "start": 188,
+                 "end": 189
+                }
+               ]
+              },
+              "span": {
+               "start": 200,
+               "end": 209
+              }
+             }
+            }
+           ],
+           "span": {
+            "start": 200,
+            "end": 209
+           }
+          },
+          "else_part": null,
+          "span": {
+           "start": 181,
+           "end": 189
+          }
+         }
+        },
+        {
+         "If": {
+          "cond": {
+           "Bin": [
+            "Ge",
+            {
+             "Var": {
+              "name": "i",
+              "span": {
+               "start": 11,
+               "end": 12
+              }
+             }
+            },
+            {
+             "Var": {
+              "name": "n",
+              "span": {
+               "start": 22,
+               "end": 23
+              }
+             }
+            },
+            {
+             "start": 223,
+             "end": 229
+            }
+           ]
+          },
+          "then_blk": {
+           "stmts": [
+            {
+             "Return": {
+              "value": {
+               "Bin": [
+                "Sub",
+                {
+                 "Var": {
+                  "name": "n",
+                  "span": {
+                   "start": 22,
+                   "end": 23
+                  }
+                 }
+                },
+                {
+                 "IntLit": [
+                  1,
+                  {
+                   "start": 251,
+                   "end": 252
+                  }
+                 ]
+                },
+                {
+                 "start": 247,
+                 "end": 252
+                }
+               ]
+              },
+              "span": {
+               "start": 240,
+               "end": 253
+              }
+             }
+            }
+           ],
+           "span": {
+            "start": 240,
+            "end": 253
+           }
+          },
+          "else_part": null,
+          "span": {
+           "start": 220,
+           "end": 229
+          }
+         }
+        },
+        {
+         "Return": {
+          "value": {
+           "Var": {
+            "name": "i",
+            "span": {
+             "start": 11,
+             "end": 12
+            }
+           }
+          },
+          "span": {
+           "start": 264,
+           "end": 273
+          }
+         }
+        }
+       ],
+       "span": {
+        "start": 181,
+        "end": 189
+       }
+      },
+      "span": {
+       "start": 140,
+       "end": 151
+      }
+     }
+    },
+    {
+     "Fn": {
+      "name": {
+       "name": "main",
+       "span": {
+        "start": 280,
+        "end": 284
+       }
+      },
+      "params": [],
+      "ret": null,
+      "body": {
+       "stmts": [
+        {
+         "Let": {
+          "name": {
+           "name": "n",
+           "span": {
+            "start": 22,
+            "end": 23
+           }
+          },
+          "ty": null,
+          "init": {
+           "IntLit": [
+            33554432,
+            {
+             "start": 301,
+             "end": 309
+            }
+           ]
+          },
+          "span": {
+           "start": 293,
+           "end": 310
+          }
+         }
+        },
+        {
+         "Let": {
+          "name": {
+           "name": "x",
+           "span": {
+            "start": 5,
+            "end": 6
+           }
+          },
+          "ty": {
+           "Array": "F64"
+          },
+          "init": {
+           "Call": {
+            "callee": {
+             "name": "zeros",
+             "span": {
+              "start": 330,
+              "end": 335
+             }
+            },
+            "args": [
+             {
+              "Var": {
+               "name": "n",
+               "span": {
+                "start": 22,
+                "end": 23
+               }
+              }
+             }
+            ],
+            "span": {
+             "start": 330,
+             "end": 335
+            }
+           }
+          },
+          "span": {
+           "start": 315,
+           "end": 339
+          }
+         }
+        },
+        {
+         "Let": {
+          "name": {
+           "name": "y",
+           "span": {
+            "start": 7,
+            "end": 8
+           }
+          },
+          "ty": {
+           "Array": "F64"
+          },
+          "init": {
+           "Call": {
+            "callee": {
+             "name": "zeros",
+             "span": {
+              "start": 330,
+              "end": 335
+             }
+            },
+            "args": [
+             {
+              "Var": {
+               "name": "n",
+               "span": {
+                "start": 22,
+                "end": 23
+               }
+              }
+             }
+            ],
+            "span": {
+             "start": 330,
+             "end": 335
+            }
+           }
+          },
+          "span": {
+           "start": 344,
+           "end": 368
+          }
+         }
+        },
+        {
+         "For": {
+          "iv": {
+           "name": "i",
+           "span": {
+            "start": 11,
+            "end": 12
+           }
+          },
+          "start": {
+           "IntLit": [
+            0,
+            {
+             "start": 188,
+             "end": 189
+            }
+           ]
+          },
+          "end": {
+           "Var": {
+            "name": "n",
+            "span": {
+             "start": 22,
+             "end": 23
+            }
+           }
+          },
+          "body": {
+           "stmts": [
+            {
+             "Assign": {
+              "target": {
+               "base": {
+                "name": "y",
+                "span": {
+                 "start": 7,
+                 "end": 8
+                }
+               },
+               "index": {
+                "Var": {
+                 "name": "i",
+                 "span": {
+                  "start": 11,
+                  "end": 12
+                 }
+                }
+               },
+               "span": {
+                "start": 7,
+                "end": 8
+               }
+              },
+              "value": {
+               "Bin": [
+                "Add",
+                {
+                 "Bin": [
+                  "Mul",
+                  {
+                   "FloatLit": [
+                    2.5,
+                    {
+                     "start": 469,
+                     "end": 472
+                    }
+                   ]
+                  },
+                  {
+                   "Index": [
+                    {
+                     "name": "x",
+                     "span": {
+                      "start": 5,
+                      "end": 6
+                     }
+                    },
+                    {
+                     "Var": {
+                      "name": "i",
+                      "span": {
+                       "start": 11,
+                       "end": 12
+                      }
+                     }
+                    },
+                    {
+                     "start": 5,
+                     "end": 6
+                    }
+                   ]
+                  },
+                  {
+                   "start": 469,
+                   "end": 479
+                  }
+                 ]
+                },
+                {
+                 "Index": [
+                  {
+                   "name": "y",
+                   "span": {
+                    "start": 7,
+                    "end": 8
+                   }
+                  },
+                  {
+                   "Var": {
+                    "name": "i",
+                    "span": {
+                     "start": 11,
+                     "end": 12
+                    }
+                   }
+                  },
+                  {
+                   "start": 7,
+                   "end": 8
+                  }
+                 ]
+                },
+                {
+                 "start": 469,
+                 "end": 486
+                }
+               ]
+              },
+              "span": {
+               "start": 462,
+               "end": 487
+              }
+             }
+            }
+           ],
+           "span": {
+            "start": 462,
+            "end": 487
+           }
+          },
+          "span": {
+           "start": 438,
+           "end": 451
+          }
+         }
+        },
+        {
+         "Let": {
+          "name": {
+           "name": "h",
+           "span": {
+            "start": 45,
+            "end": 46
+           }
+          },
+          "ty": null,
+          "init": {
+           "Bin": [
+            "Div",
+            {
+             "Var": {
+              "name": "n",
+              "span": {
+               "start": 22,
+               "end": 23
+              }
+             }
+            },
+            {
+             "IntLit": [
+              2,
+              {
+               "start": 308,
+               "end": 309
+              }
+             ]
+            },
+            {
+             "start": 566,
+             "end": 571
+            }
+           ]
+          },
+          "span": {
+           "start": 558,
+           "end": 572
+          }
+         }
+        },
+        {
+         "For": {
+          "iv": {
+           "name": "j",
+           "span": {
+            "start": 581,
+            "end": 582
+           }
+          },
+          "start": {
+           "IntLit": [
+            0,
+            {
+             "start": 188,
+             "end": 189
+            }
+           ]
+          },
+          "end": {
+           "Var": {
+            "name": "h",
+            "span": {
+             "start": 45,
+             "end": 46
+            }
+           }
+          },
+          "body": {
+           "stmts": [
+            {
+             "Assign": {
+              "target": {
+               "base": {
+                "name": "y",
+                "span": {
+                 "start": 7,
+                 "end": 8
+                }
+               },
+               "index": {
+                "Var": {
+                 "name": "j",
+                 "span": {
+                  "start": 581,
+                  "end": 582
+                 }
+                }
+               },
+               "span": {
+                "start": 7,
+                "end": 8
+               }
+              },
+              "value": {
+               "Index": [
+                {
+                 "name": "y",
+                 "span": {
+                  "start": 7,
+                  "end": 8
+                 }
+                },
+                {
+                 "Bin": [
+                  "Sub",
+                  {
+                   "Bin": [
+                    "Sub",
+                    {
+                     "Var": {
+                      "name": "n",
+                      "span": {
+                       "start": 22,
+                       "end": 23
+                      }
+                     }
+                    },
+                    {
+                     "Var": {
+                      "name": "j",
+                      "span": {
+                       "start": 581,
+                       "end": 582
+                      }
+                     }
+                    },
+                    {
+                     "start": 610,
+                     "end": 615
+                    }
+                   ]
+                  },
+                  {
+                   "IntLit": [
+                    1,
+                    {
+                     "start": 251,
+                     "end": 252
+                    }
+                   ]
+                  },
+                  {
+                   "start": 610,
+                   "end": 619
+                  }
+                 ]
+                },
+                {
+                 "start": 7,
+                 "end": 8
+                }
+               ]
+              },
+              "span": {
+               "start": 601,
+               "end": 621
+              }
+             }
+            }
+           ],
+           "span": {
+            "start": 601,
+            "end": 621
+           }
+          },
+          "span": {
+           "start": 577,
+           "end": 590
+          }
+         }
+        },
+        {
+         "Let": {
+          "name": {
+           "name": "dot",
+           "span": {
+            "start": 50,
+            "end": 53
+           }
+          },
+          "ty": null,
+          "init": {
+           "FloatLit": [
+            0,
+            {
+             "start": 188,
+             "end": 189
+            }
+           ]
+          },
+          "span": {
+           "start": 690,
+           "end": 704
+          }
+         }
+        },
+        {
+         "For": {
+          "iv": {
+           "name": "k",
+           "span": {
+            "start": 713,
+            "end": 714
+           }
+          },
+          "start": {
+           "IntLit": [
+            0,
+            {
+             "start": 188,
+             "end": 189
+            }
+           ]
+          },
+          "end": {
+           "Var": {
+            "name": "n",
+            "span": {
+             "start": 22,
+             "end": 23
+            }
+           }
+          },
+          "body": {
+           "stmts": [
+            {
+             "Assign": {
+              "target": {
+               "base": {
+                "name": "dot",
+                "span": {
+                 "start": 50,
+                 "end": 53
+                }
+               },
+               "index": null,
+               "span": {
+                "start": 50,
+                "end": 53
+               }
+              },
+              "value": {
+               "Bin": [
+                "Add",
+                {
+                 "Var": {
+                  "name": "dot",
+                  "span": {
+                   "start": 50,
+                   "end": 53
+                  }
+                 }
+                },
+                {
+                 "Bin": [
+                  "Mul",
+                  {
+                   "Index": [
+                    {
+                     "name": "x",
+                     "span": {
+                      "start": 5,
+                      "end": 6
+                     }
+                    },
+                    {
+                     "Var": {
+                      "name": "k",
+                      "span": {
+                       "start": 713,
+                       "end": 714
+                      }
+                     }
+                    },
+                    {
+                     "start": 5,
+                     "end": 6
+                    }
+                   ]
+                  },
+                  {
+                   "Index": [
+                    {
+                     "name": "y",
+                     "span": {
+                      "start": 7,
+                      "end": 8
+                     }
+                    },
+                    {
+                     "Var": {
+                      "name": "k",
+                      "span": {
+                       "start": 713,
+                       "end": 714
+                      }
+                     }
+                    },
+                    {
+                     "start": 7,
+                     "end": 8
+                    }
+                   ]
+                  },
+                  {
+                   "start": 745,
+                   "end": 756
+                  }
+                 ]
+                },
+                {
+                 "start": 739,
+                 "end": 756
+                }
+               ]
+              },
+              "span": {
+               "start": 733,
+               "end": 757
+              }
+             }
+            }
+           ],
+           "span": {
+            "start": 733,
+            "end": 757
+           }
+          },
+          "span": {
+           "start": 709,
+           "end": 722
+          }
+         }
+        },
+        {
+         "Expr": {
+          "Call": {
+           "callee": {
+            "name": "print",
+            "span": {
+             "start": 768,
+             "end": 773
+            }
+           },
+           "args": [
+            {
+             "Var": {
+              "name": "dot",
+              "span": {
+               "start": 50,
+               "end": 53
+              }
+             }
+            }
+           ],
+           "span": {
+            "start": 768,
+            "end": 773
+           }
+          }
+         }
+        }
+       ],
+       "span": {
+        "start": 293,
+        "end": 310
+       }
+      },
+      "span": {
+       "start": 277,
+       "end": 284
+      }
+     }
+    }
+   ]
+  }
+ },
+ "diags_sem": [],
+ "ir_pre_ssa": {
+  "functions": [
+   {
+    "name": "main",
+    "text": ";; helix IR - pre-SSA (print_ir ssa=false)\nfn main() -> () {\nbb0:                                            ; preds: []\n    n   = const 33554432         ; i64\n    x   = alloc_array [f64] n\n    y   = alloc_array [f64] n\n    h   = sdiv n, 2              ; i64\n    dot = const 0.0              ; f64\n    i   = const 0                ; i64\n    jump bb1\n\nbb1:                                            ; preds: bb0 bb3 | loop#0 header (depth 1)\n    c0 = icmp ult i, n\n    br c0, bb2, bb4\n\nbb2:                                            ; loop#0 body\n    t0 = fmul 2.5, load x[i]\n    t1 = load y[i]\n    t2 = fadd t0, t1\n    store y[i], t2\n    jump bb3\n\nbb3:                                            ; loop#0 latch\n    i = add i, 1\n    jump bb1\n\nbb4:                                            ; preds: bb1 | loop#1 preheader\n    j = const 0\n    jump bb5\n\nbb5:                                            ; preds: bb4 bb7 | loop#1 header (depth 1)\n    c1 = icmp ult j, h\n    br c1, bb6, bb8\n\nbb6:                                            ; loop#1 body\n    t3 = sub n, j\n    t4 = sub t3, 1\n    t5 = load y[t4]\n    store y[j], t5\n    jump bb7\n\nbb7:                                            ; loop#1 latch\n    j = add j, 1\n    jump bb5\n\nbb8:                                            ; preds: bb5 | loop#2 preheader\n    dot = const 0.0\n    k   = const 0\n    jump bb9\n\nbb9:                                            ; preds: bb8 bb11 | loop#2 header (depth 1)\n    c2 = icmp ult k, n\n    br c2, bb10, bb12\n\nbb10:                                           ; loop#2 body\n    t6  = load x[k]\n    t7  = load y[k]\n    t8  = fmul t6, t7\n    t9  = fadd dot, t8\n    dot = t9\n    jump bb11\n\nbb11:                                           ; loop#2 latch\n    k = add k, 1\n    jump bb9\n\nbb12:                                           ; preds: bb9 | exit\n    call print(dot)\n    ret ()}"
+   },
+   {
+    "name": "clampidx",
+    "text": ";; helix IR - pre-SSA (print_ir ssa=false)\nfn clampidx(i: i64, n: i64) -> i64 {\nbb0:                                            ; preds: []\n    c0 = icmp slt i, 0\n    br c0, bb1, bb2\n\nbb1:                                            ; preds: bb0\n    ret 0\n\nbb2:                                            ; preds: bb0\n    c1 = icmp sge i, n\n    br c1, bb3, bb4\n\nbb3:                                            ; preds: bb2\n    t0 = sub n, 1\n    ret t0\n\nbb4:                                            ; preds: bb2\n    ret i\n}"
+   }
+  ]
+ },
+ "ir_ssa": {
+  "functions": [
+   {
+    "name": "main",
+    "text": ";; helix IR - after SSA construction (print_ir ssa=true)\nfn main() -> () {\nbb0:                                            ; preds: []\n    n.0   = const 33554432       ; i64\n    x.0   = alloc_array [f64] n.0\n    y.0   = alloc_array [f64] n.0\n    h.0   = sdiv n.0, 2          ; i64\n    dot.0 = const 0.0            ; f64\n    i.0   = const 0              ; i64\n    jump bb1(i.0)\n\nbb1:                                            ; preds: bb0 bb3 | loop#0 header (depth 1)\n    i.1 = phi(i.0 [bb0], i.2 [bb3])          ; iv: i in [0, n.0)\n    c0  = icmp ult i.1, n.0\n    br c0, bb2, bb4\n\nbb2:                                            ; loop#0 body\n    t0.1 = fmul 2.5, load x.0[i.1]\n    t1.1 = load y.0[i.1]\n    t2.1 = fadd t0.1, t1.1\n    store y.0[i.1], t2.1\n    jump bb3\n\nbb3:                                            ; loop#0 latch\n    i.2 = add i.1, 1\n    jump bb1\n\nbb4:                                            ; preds: bb1 | loop#1 preheader\n    j.0 = const 0\n    jump bb5\n\nbb5:                                            ; preds: bb4 bb7 | loop#1 header (depth 1)\n    j.1 = phi(j.0 [bb4], j.2 [bb7])          ; iv: j in [0, h.0)\n    c1  = icmp ult j.1, h.0\n    br c1, bb6, bb8\n\nbb6:                                            ; loop#1 body\n    t3.1 = sub n.0, j.1\n    t4.1 = sub t3.1, 1\n    t5.1 = load y.0[t4.1]\n    store y.0[j.1], t5.1\n    jump bb7\n\nbb7:                                            ; loop#1 latch\n    j.2 = add j.1, 1\n    jump bb5\n\nbb8:                                            ; preds: bb5 | loop#2 preheader\n    dot.1 = const 0.0\n    k.0   = const 0\n    jump bb9\n\nbb9:                                            ; preds: bb8 bb11 | loop#2 header (depth 1)\n    k.1   = phi(k.0 [bb8], k.2 [bb11])       ; iv: k in [0, n.0)\n    dot.3 = phi(dot.1 [bb8], dot.2 [bb11])   ; reduction cell: dot\n    c2    = icmp ult k.1, n.0\n    br c2, bb10, bb12\n\nbb10:                                           ; loop#2 body\n    t6.1  = load x.0[k.1]\n    t7.1  = load y.0[k.1]\n    t8.1  = fmul t6.1, t7.1\n    dot.2 = fadd dot.3, t8.1\n    jump bb11\n\nbb11:                                           ; loop#2 latch\n    k.2 = add k.1, 1\n    jump bb9\n\nbb12:                                           ; preds: bb9 | exit\n    call print(dot.3)\n    ret ()}"
+   },
+   {
+    "name": "clampidx",
+    "text": ";; helix IR - after SSA construction (print_ir ssa=true)\nfn clampidx(i.0: i64, n.0: i64) -> i64 {\nbb0:                                            ; preds: []\n    c0 = icmp slt i.0, 0\n    br c0, bb1, bb2\n\nbb1:                                            ; preds: bb0\n    ret 0\n\nbb2:                                            ; preds: bb0\n    c1 = icmp sge i.0, n.0\n    br c1, bb3, bb4\n\nbb3:                                            ; preds: bb2\n    t0.1 = sub n.0, 1\n    ret t0.1\n\nbb4:                                            ; preds: bb2\n    ret i.0\n}"
+   }
+  ]
+ },
+ "passes": [
+  {
+   "name": "simplify-cfg",
+   "changed": false,
+   "after": ";; after simplify-cfg: 13 basic blocks, 0 folded\nbb0:                                            ; preds: []\n    n.0   = const 33554432       ; i64\n    x.0   = alloc_array [f64] n.0\n    y.0   = alloc_array [f64] n.0\n    h.0   = sdiv n.0, 2          ; i64\n    dot.0 = const 0.0            ; f64\n    i.0   = const 0              ; i64\n    jump bb1(i.0)\n\nbb1:                                            ; preds: bb0 bb3 | loop#0 header (depth 1)\n    i.1 = phi(i.0 [bb0], i.2 [bb3])          ; iv: i in [0, n.0)\n    c0  = icmp ult i.1, n.0\n    br c0, bb2, bb4\n\nbb2:                                            ; loop#0 body\n    t0.1 = fmul 2.5, load x.0[i.1]\n    t1.1 = load y.0[i.1]\n    t2.1 = fadd t0.1, t1.1\n    store y.0[i.1], t2.1\n    jump bb3\n\nbb3:                                            ; loop#0 latch\n    i.2 = add i.1, 1\n    jump bb1",
+   "diff_stats": {
+    "insts_before": 41,
+    "insts_after": 41
+   }
+  },
+  {
+   "name": "const_fold",
+   "changed": true,
+   "after": ";; after const_fold: folded h = n/2 with n = 33554432\nbb4:\n    h.0 = const 16777216        ; was sdiv n.0, 2\n    i.0   = const 0              ; i64\n    jump bb1(i.0)\n\nbb1:                                            ; preds: bb0 bb3 | loop#0 header (depth 1)\n    i.1 = phi(i.0 [bb0], i.2 [bb3])          ; iv: i in [0, n.0)\n    c0  = icmp ult i.1, n.0\n    br c0, bb2, bb4\n\nbb2:                                            ; loop#0 body\n    t0.1 = fmul 2.5, load x.0[i.1]\n    t1.1 = load y.0[i.1]\n    t2.1 = fadd t0.1, t1.1\n    store y.0[i.1], t2.1\n    jump bb3\n\nbb3:                                            ; loop#0 latch\n    i.2 = add i.1, 1\n    jump bb1",
+   "diff_stats": {
+    "insts_before": 41,
+    "insts_after": 40
+   }
+  },
+  {
+   "name": "inst_combine",
+   "changed": true,
+   "after": ";; after inst_combine: fmul+fadd fused into fma for vectorization\nbb10:\n    t6.1  = load x.0[k.1]\n    t7.1  = load y.0[k.1]\n    dot.2 = fma t6.1, t7.1, dot.3   ; fmul+fadd fused\nbb9:                                            ; loop#2 header\n    k.1   = phi(k.0 [bb8], k.2 [bb11])\n    dot.3 = phi(dot.1 [bb8], dot.2 [bb11])\n    br (k.1 < n.0), bb10, bb12",
+   "diff_stats": {
+    "insts_before": 40,
+    "insts_after": 38
+   }
+  },
+  {
+   "name": "dce",
+   "changed": false,
+   "after": ";; after dce: no dead instructions remain (all defs used)\nbb9:                                            ; loop#2 header\n    k.1   = phi(k.0 [bb8], k.2 [bb11])\n    dot.3 = phi(dot.1 [bb8], dot.2 [bb11])\n    br (k.1 < n.0), bb10, bb12",
+   "diff_stats": {
+    "insts_before": 38,
+    "insts_after": 38
+   }
+  }
+ ],
+ "cfg": {
+  "functions": [
+   {
+    "name": "main",
+    "nodes": [
+     {
+      "id": "bb0",
+      "x": 40,
+      "y": 24,
+      "w": 240,
+      "h": 76,
+      "role": "entry",
+      "lines": [
+       "n = const 33554432",
+       "x = zeros(n)",
+       "y = zeros(n)",
+       "i = const 0",
+       "jump bb1"
+      ],
+      "loop_id": null
+     },
+     {
+      "id": "bb1",
+      "x": 320,
+      "y": 24,
+      "w": 240,
+      "h": 76,
+      "role": "loop_header",
+      "lines": [
+       "i = phi(i.0, i.2)",
+       "c0 = i < n",
+       "br c0, bb2, bb4"
+      ],
+      "loop_id": 0
+     },
+     {
+      "id": "bb2",
+      "x": 600,
+      "y": 24,
+      "w": 240,
+      "h": 76,
+      "role": "straight",
+      "lines": [
+       "t0 = 2.5 * x[i]",
+       "t1 = y[i]",
+       "y[i] = t0 + t1",
+       "jump bb3"
+      ],
+      "loop_id": 0
+     },
+     {
+      "id": "bb3",
+      "x": 880,
+      "y": 24,
+      "w": 240,
+      "h": 76,
+      "role": "straight",
+      "lines": [
+       "i = i + 1",
+       "jump bb1"
+      ],
+      "loop_id": 0
+     },
+     {
+      "id": "bb4",
+      "x": 1160,
+      "y": 24,
+      "w": 240,
+      "h": 76,
+      "role": "join",
+      "lines": [
+       "h = n / 2",
+       "j = const 0",
+       "jump bb5"
+      ],
+      "loop_id": null
+     },
+     {
+      "id": "bb5",
+      "x": 1160,
+      "y": 170,
+      "w": 240,
+      "h": 76,
+      "role": "loop_header",
+      "lines": [
+       "j = phi(j.0, j.2)",
+       "c1 = j < h",
+       "br c1, bb6, bb8"
+      ],
+      "loop_id": 1
+     },
+     {
+      "id": "bb6",
+      "x": 880,
+      "y": 170,
+      "w": 240,
+      "h": 76,
+      "role": "straight",
+      "lines": [
+       "t3 = y[n - j - 1]",
+       "y[j] = t3",
+       "jump bb7"
+      ],
+      "loop_id": 1
+     },
+     {
+      "id": "bb7",
+      "x": 600,
+      "y": 170,
+      "w": 240,
+      "h": 76,
+      "role": "straight",
+      "lines": [
+       "j = j + 1",
+       "jump bb5"
+      ],
+      "loop_id": 1
+     },
+     {
+      "id": "bb8",
+      "x": 320,
+      "y": 170,
+      "w": 240,
+      "h": 76,
+      "role": "join",
+      "lines": [
+       "dot = const 0.0",
+       "k = const 0",
+       "jump bb9"
+      ],
+      "loop_id": null
+     },
+     {
+      "id": "bb9",
+      "x": 600,
+      "y": 316,
+      "w": 240,
+      "h": 76,
+      "role": "loop_header",
+      "lines": [
+       "k = phi(k.0, k.2)",
+       "c2 = k < n",
+       "br c2, bb10, bb12"
+      ],
+      "loop_id": 2
+     },
+     {
+      "id": "bb10",
+      "x": 880,
+      "y": 316,
+      "w": 240,
+      "h": 76,
+      "role": "straight",
+      "lines": [
+       "t6 = x[k] * y[k]",
+       "dot = dot + t6",
+       "jump bb11"
+      ],
+      "loop_id": 2
+     },
+     {
+      "id": "bb11",
+      "x": 1160,
+      "y": 316,
+      "w": 240,
+      "h": 76,
+      "role": "straight",
+      "lines": [
+       "k = k + 1",
+       "jump bb9"
+      ],
+      "loop_id": 2
+     },
+     {
+      "id": "bb12",
+      "x": 1440,
+      "y": 316,
+      "w": 240,
+      "h": 76,
+      "role": "exit",
+      "lines": [
+       "call print(dot)",
+       "ret ()"
+      ],
+      "loop_id": null
+     }
+    ],
+    "edges": [
+     {
+      "from": "bb0",
+      "to": "bb1",
+      "kind": "fallthrough",
+      "points": [
+       [
+        280,
+        62
+       ],
+       [
+        320,
+        62
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb1",
+      "to": "bb2",
+      "kind": "branch",
+      "points": [
+       [
+        560,
+        62
+       ],
+       [
+        600,
+        62
+       ]
+      ],
+      "label": "i < n"
+     },
+     {
+      "from": "bb2",
+      "to": "bb3",
+      "kind": "fallthrough",
+      "points": [
+       [
+        840,
+        62
+       ],
+       [
+        880,
+        62
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb3",
+      "to": "bb1",
+      "kind": "backedge",
+      "points": [
+       [
+        1000,
+        100
+       ],
+       [
+        720,
+        146
+       ],
+       [
+        440,
+        100
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb1",
+      "to": "bb4",
+      "kind": "fallthrough",
+      "points": [
+       [
+        440,
+        100
+       ],
+       [
+        440,
+        6
+       ],
+       [
+        1280,
+        6
+       ],
+       [
+        1280,
+        62
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb4",
+      "to": "bb5",
+      "kind": "fallthrough",
+      "points": [
+       [
+        1280,
+        100
+       ],
+       [
+        1280,
+        170
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb5",
+      "to": "bb6",
+      "kind": "branch",
+      "points": [
+       [
+        1160,
+        208
+       ],
+       [
+        1120,
+        208
+       ]
+      ],
+      "label": "j < h"
+     },
+     {
+      "from": "bb6",
+      "to": "bb7",
+      "kind": "fallthrough",
+      "points": [
+       [
+        880,
+        208
+       ],
+       [
+        840,
+        208
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb7",
+      "to": "bb5",
+      "kind": "backedge",
+      "points": [
+       [
+        720,
+        208
+       ],
+       [
+        1000,
+        120
+       ],
+       [
+        1280,
+        208
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb5",
+      "to": "bb8",
+      "kind": "fallthrough",
+      "points": [
+       [
+        1280,
+        246
+       ],
+       [
+        1280,
+        262
+       ],
+       [
+        440,
+        262
+       ],
+       [
+        440,
+        208
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb8",
+      "to": "bb9",
+      "kind": "fallthrough",
+      "points": [
+       [
+        440,
+        246
+       ],
+       [
+        520,
+        316
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb9",
+      "to": "bb10",
+      "kind": "branch",
+      "points": [
+       [
+        840,
+        354
+       ],
+       [
+        880,
+        354
+       ]
+      ],
+      "label": "k < n"
+     },
+     {
+      "from": "bb10",
+      "to": "bb11",
+      "kind": "fallthrough",
+      "points": [
+       [
+        1120,
+        354
+       ],
+       [
+        1160,
+        354
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb11",
+      "to": "bb9",
+      "kind": "backedge",
+      "points": [
+       [
+        1280,
+        392
+       ],
+       [
+        1000,
+        442
+       ],
+       [
+        720,
+        392
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb9",
+      "to": "bb12",
+      "kind": "fallthrough",
+      "points": [
+       [
+        720,
+        316
+       ],
+       [
+        720,
+        282
+       ],
+       [
+        1560,
+        282
+       ],
+       [
+        1560,
+        316
+       ]
+      ],
+      "label": ""
+     }
+    ]
+   },
+   {
+    "name": "clampidx",
+    "nodes": [
+     {
+      "id": "bb0",
+      "x": 40,
+      "y": 92,
+      "w": 220,
+      "h": 64,
+      "role": "entry",
+      "lines": [
+       "c0 = i < 0",
+       "br c0, bb1, bb2"
+      ],
+      "loop_id": null
+     },
+     {
+      "id": "bb1",
+      "x": 380,
+      "y": 24,
+      "w": 220,
+      "h": 64,
+      "role": "straight",
+      "lines": [
+       "ret 0"
+      ],
+      "loop_id": null
+     },
+     {
+      "id": "bb2",
+      "x": 380,
+      "y": 160,
+      "w": 220,
+      "h": 64,
+      "role": "straight",
+      "lines": [
+       "c1 = i >= n",
+       "br c1, bb3, bb4"
+      ],
+      "loop_id": null
+     },
+     {
+      "id": "bb3",
+      "x": 720,
+      "y": 160,
+      "w": 220,
+      "h": 64,
+      "role": "straight",
+      "lines": [
+       "ret n - 1"
+      ],
+      "loop_id": null
+     },
+     {
+      "id": "bb4",
+      "x": 720,
+      "y": 24,
+      "w": 220,
+      "h": 64,
+      "role": "exit",
+      "lines": [
+       "ret i"
+      ],
+      "loop_id": null
+     }
+    ],
+    "edges": [
+     {
+      "from": "bb0",
+      "to": "bb1",
+      "kind": "branch",
+      "points": [
+       [
+        260,
+        124
+       ],
+       [
+        380,
+        56
+       ]
+      ],
+      "label": "i < 0"
+     },
+     {
+      "from": "bb0",
+      "to": "bb2",
+      "kind": "fallthrough",
+      "points": [
+       [
+        150,
+        156
+       ],
+       [
+        150,
+        192
+       ],
+       [
+        380,
+        192
+       ]
+      ],
+      "label": ""
+     },
+     {
+      "from": "bb2",
+      "to": "bb3",
+      "kind": "branch",
+      "points": [
+       [
+        600,
+        192
+       ],
+       [
+        720,
+        192
+       ]
+      ],
+      "label": "i >= n"
+     },
+     {
+      "from": "bb2",
+      "to": "bb4",
+      "kind": "fallthrough",
+      "points": [
+       [
+        490,
+        160
+       ],
+       [
+        490,
+        120
+       ],
+       [
+        830,
+        120
+       ],
+       [
+        830,
+        88
+       ]
+      ],
+      "label": ""
+     }
+    ]
+   }
+  ]
+ },
+ "domtree": {
+  "main": {
+   "bb0": [
+    "bb1"
+   ],
+   "bb1": [
+    "bb2",
+    "bb4"
+   ],
+   "bb2": [
+    "bb3"
+   ],
+   "bb4": [
+    "bb5",
+    "bb8"
+   ],
+   "bb5": [
+    "bb6"
+   ],
+   "bb6": [
+    "bb7"
+   ],
+   "bb8": [
+    "bb9"
+   ],
+   "bb9": [
+    "bb10",
+    "bb12"
+   ],
+   "bb10": [
+    "bb11"
+   ]
+  },
+  "clampidx": {
+   "bb0": [
+    "bb1",
+    "bb2"
+   ],
+   "bb2": [
+    "bb3",
+    "bb4"
+   ]
+  }
+ },
+ "loops": [
+  {
+   "id": 0,
+   "depth": 1,
+   "header": "bb1",
+   "blocks": [
+    "bb1",
+    "bb2",
+    "bb3"
+   ],
+   "iv": "i",
+   "bounds": {
+    "start": "0",
+    "end": "n"
+   },
+   "accesses": [
+    "READ x[i]",
+    "READ y[i]",
+    "WRITE y[i]"
+   ],
+   "raw": [],
+   "war": [],
+   "waw": [],
+   "reduction": null,
+   "verdict": "SAFE",
+   "reason": "no loop-carried dependences: each iteration touches a distinct y[i]",
+   "plan": {
+    "threads": 16,
+    "tile": "none"
+   },
+   "explain": "Every store targets y[i] and every load reads x[i] or y[i] at the same subscript i. The dependence graph has no cycles, so iterations may execute in any order - the runtime strips the loop across 16 threads."
+  },
+  {
+   "id": 1,
+   "depth": 1,
+   "header": "bb5",
+   "blocks": [
+    "bb5",
+    "bb6",
+    "bb7"
+   ],
+   "iv": "j",
+   "bounds": {
+    "start": "0",
+    "end": "h"
+   },
+   "accesses": [
+    "READ y[n - j - 1]",
+    "WRITE y[j]"
+   ],
+   "raw": [
+    {
+     "kind_label": "RAW",
+     "distance": 1,
+     "sink": "y[j]",
+     "source": "y[j-1]",
+     "explain": "iteration j reads y[n-j-1], written by iteration j-1 when n-j-1 equals j-1 at the crossing point; dependence distance is 1, so no reordering is legal."
+    }
+   ],
+   "war": [],
+   "waw": [],
+   "reduction": null,
+   "verdict": "SEQUENTIAL",
+   "reason": "loop-carried RAW dependence at distance 1 on y: y[j] reads y[n - j - 1] written one iteration earlier",
+   "plan": null,
+   "explain": "The reversed gather walks the same array forwards and backwards. Near the midpoint the read subscript aliases the previous iteration's write, producing a distance-1 RAW chain that forces fully sequential execution."
+  },
+  {
+   "id": 2,
+   "depth": 1,
+   "header": "bb9",
+   "blocks": [
+    "bb9",
+    "bb10",
+    "bb11"
+   ],
+   "iv": "k",
+   "bounds": {
+    "start": "0",
+    "end": "n"
+   },
+   "accesses": [
+    "READ x[k]",
+    "READ y[k]",
+    "WRITE dot"
+   ],
+   "raw": [],
+   "war": [],
+   "waw": [],
+   "reduction": {
+    "op": "+",
+    "var": "dot"
+   },
+   "verdict": "REDUCTION",
+   "reason": "+-reduction into dot: sum is re-associated under the f64 fast-math contract",
+   "plan": {
+    "threads": 16,
+    "tile": "none"
+   },
+   "explain": "dot accumulates a sum of products. Each thread keeps a private accumulator and the partial sums are combined at the loop exit; results are deterministic up to f64 addition re-association."
+  }
+ ],
+ "exec": {
+  "backend_used": "jit_par",
+  "printed": [
+   "8388608"
+  ],
+  "checksum": "0x9e3779b97f4a7c15",
+  "timings_ms": null
+ },
+ "bench": {
+  "kernel": "saxpy",
+  "n": 33554432,
+  "variants": [
+   {
+    "name": "interpreter",
+    "median_ms": 5812.6,
+    "samples": [
+     5931.2,
+     5790.4,
+     5866,
+     5712.9,
+     5880.3,
+     5755.1,
+     5910.7
+    ]
+   },
+   {
+    "name": "cranelift-seq",
+    "median_ms": 731.9,
+    "samples": [
+     748.2,
+     719.6,
+     740.1,
+     705.3,
+     733.8,
+     761,
+     715.2
+    ]
+   },
+   {
+    "name": "helix-par-8t",
+    "median_ms": 102.4,
+    "samples": [
+     108.9,
+     99.7,
+     101.2,
+     104.6,
+     98.4,
+     106.1,
+     100.3
+    ]
+   },
+   {
+    "name": "helix-par-16t",
+    "median_ms": 63.7,
+    "samples": [
+     66.2,
+     61.9,
+     64.8,
+     62.5,
+     67.1,
+     63,
+     65.6
+    ]
+   }
+  ],
+  "efficiency": [
+   {
+    "threads": 8,
+    "speedup": 7.15,
+    "efficiency": 0.89
+   },
+   {
+    "threads": 16,
+    "speedup": 11.49,
+    "efficiency": 0.72
+   }
+  ]
+ }
+}
