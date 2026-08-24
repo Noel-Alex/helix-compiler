@@ -19,3 +19,5 @@ helix-engine = { workspace = true }
 helix-bench = { workspace = true }
 helix-observe = { workspace = true }
 serde_json = { workspace = true }
+webbrowser = { workspace = true }
+windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
