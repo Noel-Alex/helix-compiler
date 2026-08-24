@@ -46,16 +46,19 @@
 pub mod build;
 pub mod dom;
 pub mod ir;
-pub mod passmod;
 pub mod passes;
+pub mod passmod;
 pub mod print;
 pub mod ssa;
+#[cfg(test)]
+pub mod testutil;
 pub mod verify;
 
 // -- Contract surface --------------------------------------------------------
 
 pub use build::build;
 pub use dom::{Doms, dominance_frontiers, dominators, natural_loops, reachability};
+pub use helix_syntax::ast::{BinOp, UnOp};
 pub use ir::{
     BlockData, BlockId, Call, Constant, FuncIr, Inst, Load, LocalId, Phi, SideTable, Term, ValueId,
 };

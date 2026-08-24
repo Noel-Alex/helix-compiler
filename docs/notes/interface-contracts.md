@@ -183,3 +183,24 @@ pub mod dom { pub struct Dominators { pub reachable: Vec<bool>, /* + idoms */ }
 // Inst::StoreScalar{dst: LocalId, val: ValueId} — scalar variable store (pre-SSA model keeps
 // locals as memory-like slots until SSA renames them).
 ```
+
+## Addendum 2 (2026-08-24): ParallelPlan ownership + sema CallTarget change
+
+1. `ParallelPlan` lives in **helix-analysis** (module `plan`):
+```rust
+pub struct ParallelPlan { pub regions: Vec<RegionDesc> }
+pub struct RegionDesc {
+    pub func_idx: usize,          // index into Vec<FuncIr>
+    pub header: BlockId,
+    pub kind: RegionKind,         // DoAll | Reduction(ReductionOp)
+    pub body_fn_name: String,     // e.g. "main.loop0.body"
+    pub start_val: Option<u32>, pub end_val: Option<u32>, // SSA ids of bounds (None=const in ctx)
+}
+pub fn build_plan(funcs:&[FuncIr], loops:&[LoopInfo], reports:&[Vec<LoopReport>]) -> ParallelPlan;
+```
+2. **sema change (breaking, done)**: `CallTarget::Builtin{which,args}` and
+   `CallTarget::User{fn_idx,name,args}` now carry typed argument subtrees.
+   - helix-ir build.rs must lower Inst::Call operands from these args (zeros(n) →
+     Call{callee:"zeros", args:[n], arr_refs:[dst-slot]}).
+   - helix-engine adapter should consume typed args directly instead of re-parsing source;
+     keep run_with_source signature (LineMap still needs text).

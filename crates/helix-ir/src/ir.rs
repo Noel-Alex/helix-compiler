@@ -47,50 +47,17 @@ use helix_syntax::ast::{BinOp, UnOp};
 /// `self.0`; the set of live ids is always `0..blocks.len()` right after
 /// [`FuncIr::compact`] (passes may transiently leave holes until they
 /// renumber).
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Serialize,
-    Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
 
 /// Identifier of a single definition (an SSA *name* once `to_ssa` has run).
 /// Ids below `FuncIr::n_source_locals` double as variable cells before SSA;
 /// the builder allocates fresh temporaries from `n_source_locals` upwards.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Serialize,
-    Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ValueId(pub u32);
 
 /// Source-level variable slot (see the module docs for the id-space layout).
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Serialize,
-    Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LocalId(pub u32);
 
 // ---------------------------------------------------------------------------
@@ -336,8 +303,13 @@ impl Inst {
     /// Such instructions are never speculated out of loops.
     #[must_use]
     pub fn can_trap(&self) -> bool {
-        matches!(self, Inst::Bin { op: BinOp::Div | BinOp::Rem, .. })
-            || matches!(self, Inst::Load(_) | Inst::Call(_))
+        matches!(
+            self,
+            Inst::Bin {
+                op: BinOp::Div | BinOp::Rem,
+                ..
+            }
+        ) || matches!(self, Inst::Load(_) | Inst::Call(_))
     }
 }
 
@@ -599,7 +571,9 @@ impl FuncIr {
         let first = LocalId(self.n_locals as u32);
         for _ in 0..k {
             self.types.local_tys.push(ty);
-            self.types.local_names.push(format!("$tmp{}", self.n_locals));
+            self.types
+                .local_names
+                .push(format!("$tmp{}", self.n_locals));
             self.n_locals += 1;
         }
         first
@@ -803,17 +777,71 @@ impl FuncIr {
             }
             // Phi arguments from deleted predecessors are stale edges; drop
             // them here and let normalize_phis/recompute_edges realign.
+            // Surviving arguments must be RENUMBERED like every other block
+            // reference — the terminator remap above shifts all ids, so a φ
+            // arg left un-remapped names a *different* block afterwards and
+            // the 1:1 phi-args/preds alignment breaks silently.
             let preds_before: Vec<BlockId> = b.preds.clone();
             for p in &mut b.phis {
                 p.args.retain(|(from, _)| {
                     let fi = from.0 as usize;
                     keep[fi] && preds_before.contains(from)
                 });
+                for (from, _) in p.args.iter_mut() {
+                    *from = remap(*from);
+                }
+                p.args.sort_unstable_by_key(|(f, _)| f.0);
             }
             self.blocks.push(b);
         }
         self.recompute_edges();
         map
+    }
+
+    /// Block containing the (first) definition of `v`, or the entry block
+    /// when `v` is a cell spelling with no explicit def site. Dependence
+    /// analysis uses this for loop-invariance queries: a value whose def
+    /// block sits outside the loop body is invariant there.
+    #[must_use]
+    pub fn def_block(&self, v: ValueId) -> BlockId {
+        for (bi, b) in self.blocks.iter().enumerate() {
+            if b.phis.iter().any(|p| p.dst == v) || b.insts.iter().any(|i| i.dst() == Some(v)) {
+                return BlockId(bi as u32);
+            }
+        }
+        self.entry
+    }
+
+    /// Constant payload of `v` if its unique definition is an `Inst::Const`
+    /// carrying an integer; `None` otherwise (non-const defs, floats, bools).
+    #[must_use]
+    pub fn const_of(&self, v: ValueId) -> Option<i64> {
+        for b in &self.blocks {
+            for inst in &b.insts {
+                if let Inst::Const { dst, c } = inst
+                    && *dst == v
+                    && let Constant::I64(x) = c
+                {
+                    return Some(*x);
+                }
+            }
+        }
+        None
+    }
+
+    /// The instruction defining `v`, if it is defined by an instruction
+    /// (rather than a φ). First match wins; unique post-SSA.
+    #[must_use]
+    pub fn inst_defining(&self, v: ValueId) -> Option<&Inst> {
+        for b in &self.blocks {
+            if b.phis.iter().any(|p| p.dst == v) {
+                return None; // phi-defined: not a plain instruction
+            }
+            if let Some(i) = b.insts.iter().find(|i| i.dst() == Some(v)) {
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// Highest `ValueId` mentioned anywhere (defs and uses), for allocating a

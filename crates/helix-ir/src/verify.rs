@@ -172,7 +172,10 @@ pub fn verify(ir: &FuncIr) -> Result<(), String> {
         if let Term::Jump(t, args) = &b.term {
             for (k, v) in args.iter().enumerate() {
                 let phi = &ir.block(*t).phis[k];
-                let ok = phi.args.iter().any(|(from, pv)| *from == BlockId(bi as u32) && pv == v);
+                let ok = phi
+                    .args
+                    .iter()
+                    .any(|(from, pv)| *from == BlockId(bi as u32) && pv == v);
                 if !ok {
                     return Err(format!(
                         "{name}: bb{bi} jump passes value {} but target bb{} phi #{} does not accept it from this edge",
@@ -186,12 +189,26 @@ pub fn verify(ir: &FuncIr) -> Result<(), String> {
     // ---- type consistency + void-use checks ----------------------------------
     for (bi, b) in ir.blocks.iter().enumerate() {
         for p in &b.phis {
-            check_val_ty(ir, &def_block, p.dst, name, bi, &format!("phi v{}", p.var.0))?;
+            check_val_ty(
+                ir,
+                &def_block,
+                p.dst,
+                name,
+                bi,
+                &format!("phi v{}", p.var.0),
+            )?;
         }
         for (ii, inst) in b.insts.iter().enumerate() {
             for u in inst.uses() {
                 check_use_not_void(ir, u, name, bi, ii)?;
-                check_val_ty(ir, &def_block, u, name, bi, &format!("bb{bi}#{ii} operand {}", u.0))?;
+                check_val_ty(
+                    ir,
+                    &def_block,
+                    u,
+                    name,
+                    bi,
+                    &format!("bb{bi}#{ii} operand {}", u.0),
+                )?;
                 // Operand type must equal the declared operand type of the op.
                 check_operand_types(ir, &def_block, inst, u, name, bi, ii)?;
             }
@@ -199,7 +216,15 @@ pub fn verify(ir: &FuncIr) -> Result<(), String> {
         match &b.term {
             Term::Branch { cond, .. } => {
                 check_use_not_void(ir, *cond, name, bi, usize::MAX)?;
-                expect_ty(ir, &def_block, *cond, Ty::Bool, name, bi, "branch condition")?;
+                expect_ty(
+                    ir,
+                    &def_block,
+                    *cond,
+                    Ty::Bool,
+                    name,
+                    bi,
+                    "branch condition",
+                )?;
             }
             Term::Return(v) => {
                 if let Some(x) = v {
@@ -220,43 +245,37 @@ pub fn verify(ir: &FuncIr) -> Result<(), String> {
     // ---- dominance (SSA-shaped functions only) -------------------------------
     if is_ssa_shaped(ir) {
         let doms = dominators(ir);
+        let cx = DomCx {
+            ir,
+            doms: &doms,
+            def_block: &def_block,
+        };
         for (bi, b) in ir.blocks.iter().enumerate() {
             if !live[bi] {
                 continue;
             }
-            let bid = BlockId(bi as u32);
             for p in &b.phis {
                 for (from, v) in &p.args {
                     let fi = from.0 as usize;
                     if !live[fi] {
                         continue;
                     }
-                    check_dominance(ir, &doms, &def_block, *v, fi, name, bi, &format!("phi arg from bb{}", from.0))?;
+                    check_dominance(&cx, *v, fi, name, bi, &format!("phi arg from bb{}", from.0))?;
                 }
-                check_dominance(ir, &doms, &def_block, p.dst, bi, name, bi, "phi dst")?;
-                let _ = bid;
+                check_dominance(&cx, p.dst, bi, name, bi, "phi dst")?;
             }
             for (ii, inst) in b.insts.iter().enumerate() {
                 for u in inst.uses() {
-                    check_dominance_ordered(
-                        ir,
-                        &doms,
-                        &def_block,
-                        &def_order,
-                        u,
-                        bi,
-                        ii,
-                        name,
-                    )?;
+                    check_dominance_ordered(&cx, &def_order, u, bi, ii, name)?;
                 }
             }
             match &b.term {
                 Term::Branch { cond, .. } | Term::Return(Some(cond)) => {
-                    check_dominance(ir, &doms, &def_block, *cond, bi, name, bi, "terminator operand")?;
+                    check_dominance(&cx, *cond, bi, name, bi, "terminator operand")?;
                 }
                 Term::Jump(_, args) => {
                     for a in args {
-                        check_dominance(ir, &doms, &def_block, *a, bi, name, bi, "jump argument")?;
+                        check_dominance(&cx, *a, bi, name, bi, "jump argument")?;
                     }
                 }
                 Term::Return(None) => {}
@@ -296,7 +315,13 @@ fn insert_def(
     Ok(())
 }
 
-fn check_use_not_void(ir: &FuncIr, v: ValueId, name: &str, bi: usize, ii: usize) -> Result<(), String> {
+fn check_use_not_void(
+    ir: &FuncIr,
+    v: ValueId,
+    name: &str,
+    bi: usize,
+    ii: usize,
+) -> Result<(), String> {
     // A use of a void-producing instruction would have no defining site at
     // all (Store/unit calls never mint ids), so this catches dangling uses.
     let defined = ir.blocks.iter().any(|b| {
@@ -334,7 +359,10 @@ fn check_val_ty(
     ctx: &str,
 ) -> Result<(), String> {
     if ir_val_ty(_ir, v).is_none() {
-        return Err(format!("{name}: {ctx} in bb{bi}: no recorded type for value {}", v.0));
+        return Err(format!(
+            "{name}: {ctx} in bb{bi}: no recorded type for value {}",
+            v.0
+        ));
     }
     Ok(())
 }
@@ -403,28 +431,37 @@ fn check_operand_types(
     Ok(())
 }
 
+/// Dominance context threaded through the checks below (keeps argument
+/// counts down for one verifier function family).
+struct DomCx<'a> {
+    ir: &'a FuncIr,
+    doms: &'a crate::dom::Doms,
+    def_block: &'a HashMap<u32, usize>,
+}
+
 fn check_dominance(
-    ir: &FuncIr,
-    doms: &crate::dom::Doms,
-    def_block: &HashMap<u32, usize>,
+    cx: &DomCx<'_>,
     v: ValueId,
     use_block: usize,
     name: &str,
     use_bi: usize,
     ctx: &str,
 ) -> Result<(), String> {
-    if ir.is_slot_value(v) {
+    if cx.ir.is_slot_value(v) {
         // Cell spellings are exempt pre-renaming; SSA renaming gives them
         // unique entry defs, handled by the caller's shape gate.
         return Ok(());
     }
-    let Some(db) = def_block.get(&v.0) else {
+    let Some(db) = cx.def_block.get(&v.0) else {
         return Err(format!(
             "{name}: {ctx} uses value {} with no reaching def",
             v.0
         ));
     };
-    if !doms.dominates(BlockId(*db as u32), BlockId(use_block as u32)) {
+    if !cx
+        .doms
+        .dominates(BlockId(*db as u32), BlockId(use_block as u32))
+    {
         return Err(format!(
             "{name}: {ctx} in bb{use_bi} uses value {} defined in bb{db}, which does not dominate it",
             v.0
@@ -434,20 +471,18 @@ fn check_dominance(
 }
 
 fn check_dominance_ordered(
-    ir: &FuncIr,
-    doms: &crate::dom::Doms,
-    def_block: &HashMap<u32, usize>,
+    cx: &DomCx<'_>,
     def_order: &HashMap<u32, usize>,
     v: ValueId,
     bi: usize,
     ii: usize,
     name: &str,
 ) -> Result<(), String> {
-    if ir.is_slot_value(v) {
+    if cx.ir.is_slot_value(v) {
         return Ok(());
     }
-    check_dominance(ir, doms, def_block, v, bi, name, bi, &format!("inst #{ii}"))?;
-    if def_block.get(&v.0) == Some(&bi)
+    check_dominance(cx, v, bi, name, bi, &format!("inst #{ii}"))?;
+    if cx.def_block.get(&v.0) == Some(&bi)
         && let Some(dord) = def_order.get(&v.0)
     {
         // Def must come strictly before the use within the same block.

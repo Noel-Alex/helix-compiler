@@ -34,8 +34,7 @@ pub fn const_fold(ir: &mut FuncIr) -> ChangeFlag {
     // per-block loop below takes instruction lists out of the function while
     // it works, so lookups must not depend on live block contents. Unique
     // defs post-SSA make one id -> payload entry unambiguous.
-    let mut konsts: std::collections::HashMap<u32, Constant> =
-        std::collections::HashMap::new();
+    let mut konsts: std::collections::HashMap<u32, Constant> = std::collections::HashMap::new();
     for b in &ir.blocks {
         for inst in &b.insts {
             if let Inst::Const { dst, c } = inst {
@@ -185,7 +184,7 @@ fn fold_bin_f32(op: BinOp, a: f32, b: f32) -> Option<Constant> {
             BinOp::Ne => Some(Constant::Bool(a != b)),
             _ => None,
         },
-        other => other.map(|c| c),
+        other => other,
     }
 }
 

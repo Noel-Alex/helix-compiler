@@ -249,8 +249,7 @@ pub fn dominance_frontiers(ir: &FuncIr, doms: &Doms) -> Vec<Vec<BlockId>> {
         if !live[b] {
             continue;
         }
-        let preds: Vec<BlockId> = ir
-            .blocks[b]
+        let preds: Vec<BlockId> = ir.blocks[b]
             .preds
             .iter()
             .copied()

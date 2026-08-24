@@ -81,13 +81,25 @@ fn shortcircuit_rhs_on_one_path_only() {
                 .insts
                 .iter()
                 .chain(f.blocks[ff.0 as usize].insts.iter())
-                .any(|i| matches!(i, helix_ir::Inst::Bin { op: helix_syntax::BinOp::Lt, .. }));
+                .any(|i| {
+                    matches!(
+                        i,
+                        helix_ir::Inst::Bin {
+                            op: helix_syntax::BinOp::Lt,
+                            ..
+                        }
+                    )
+                });
             if (t_preds >= 2 || f_preds >= 2) && t_has_cmp {
                 found_sc = true;
             }
         }
     }
-    assert!(found_sc, "no short-circuit diamond found:\n{}", print_ir(&f, true));
+    assert!(
+        found_sc,
+        "no short-circuit diamond found:\n{}",
+        print_ir(&f, true)
+    );
 }
 
 #[test]
@@ -143,15 +155,22 @@ fn for_loop_canonical_iv_add_cmp() {
     //   * `bin < iv end` comparison,
     //   * latch increment by one feeding the back edge.
     let has_iv_phi = f.blocks.iter().any(|b| {
-        b.phis.iter().any(|p| {
-            p.args.len() == 2 && p.args[0].0 == helix_ir::BlockId(0)
-        })
+        b.phis
+            .iter()
+            .any(|p| p.args.len() == 2 && p.args[0].0 == helix_ir::BlockId(0))
     });
     assert!(has_iv_phi, "iv phi merging entry+backedge:\n{ssa}");
 
     let cmp_lt = f.blocks.iter().any(|b| {
-        b.insts.iter()
-            .any(|i| matches!(i, helix_ir::Inst::Bin { op: helix_syntax::BinOp::Lt, .. }))
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                helix_ir::Inst::Bin {
+                    op: helix_syntax::BinOp::Lt,
+                    ..
+                }
+            )
+        })
     });
     assert!(cmp_lt, "header comparison missing");
 
@@ -199,9 +218,10 @@ fn arrays_stay_out_of_ssa() {
     }
     // A store survives somewhere.
     assert!(
-        f.blocks.iter().any(|b| b.insts.iter().any(
-            |i| matches!(i, helix_ir::Inst::Store { .. })
-        )),
+        f.blocks.iter().any(|b| b
+            .insts
+            .iter()
+            .any(|i| matches!(i, helix_ir::Inst::Store { .. }))),
         "store must remain explicit"
     );
 }

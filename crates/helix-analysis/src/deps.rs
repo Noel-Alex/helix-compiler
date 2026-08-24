@@ -249,17 +249,6 @@ fn box_has_solution(range: IterRange, i0: i128, j0: i128, si: i128, sj: i128) ->
     // Need t with lo <= i0 + si*t <= hi and lo <= j0 + sj*t <= hi.
     let lo = range.lo;
     let hi = range.hi;
-    let t_interval = |c: i128, step: i128| -> Option<(i128, i128)> {
-        // lo <= c + step*t <= hi  =>  (lo-c)/step <= t <= (hi-c)/step  (careful with sign)
-        if step == 0 {
-            return if c >= lo && c <= hi { Some(i128::MIN / 4, i128::MAX / 4) } else { None };
-        }
-        let (t1, t2) = ((lo - c).div_euclid(step), (hi - c).div_euclid(step));
-        let (t1b, t2b) = ((lo - c).div_ceil(step), (hi - c).div_ceil(step));
-        let _ = t2;
-        let _ = t2b;
-        Some((t1.min(t1b), t1.max(t1b)))
-    };
     // Simpler robust approach: iterate interval intersection numerically.
     let iv = |step: i128, c: i128| -> Option<(i128, i128)> {
         if step == 0 {

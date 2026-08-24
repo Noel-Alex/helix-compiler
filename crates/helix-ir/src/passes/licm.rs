@@ -185,16 +185,17 @@ fn ensure_preheader(
     // happened pre-renaming, which our pipeline never does post-SSA).
     let phis = ir.block(header).phis.clone();
     let mut new_args = Vec::with_capacity(phis.len());
-    for k in 0..phis.len() {
+    for phi in &phis {
+        let k = phis.iter().position(|p| p.dst == phi.dst).unwrap_or(0);
         let v = forwarded
             .iter()
             .filter_map(|(_, args)| args.get(k).copied())
             .next()
-            .unwrap_or(ValueId(phis[k].var.0));
+            .unwrap_or(ValueId(phi.var.0));
         new_args.push(v);
         for (from, args) in &forwarded {
             if let Some(old_v) = args.get(k) {
-                register_phi(ir, header, phis[k].dst, *from, *old_v);
+                register_phi(ir, header, phi.dst, *from, *old_v);
             }
         }
     }

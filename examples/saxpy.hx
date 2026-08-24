@@ -1,6 +1,6 @@
 // saxpy: y = s*x + y — memory-bound streaming kernel
 fn main() {
-    let n = 33_554_432;
+    let n = 33554432;
     let x: [f64] = zeros(n);
     let y: [f64] = zeros(n);
     let s = 2.5;

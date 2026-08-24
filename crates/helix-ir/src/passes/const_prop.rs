@@ -26,21 +26,24 @@ pub fn const_prop(ir: &mut FuncIr) -> ChangeFlag {
         return flag; // unsafe pre-SSA by design; documented above
     }
 
-    // 1. Canonicalize duplicated constant defs: identical payloads collapse to
-    //    their first definition.
+    // 1. Canonicalize duplicated constant defs — but only leaders in the
+    //    ENTRY block. The entry dominates everything, so replacing any use
+    //    with an entry-block def is dominance-safe; a leader deeper in the
+    //    CFG might not dominate a duplicate's uses (e.g. two `const 1` in
+    //    sibling loop latches), which would fabricate values.
     let mut canonical: std::collections::HashMap<String, ValueId> =
         std::collections::HashMap::new();
     let mut replacements: Vec<(ValueId, ValueId)> = Vec::new();
-    for b in &ir.blocks {
+    for (bi, b) in ir.blocks.iter().enumerate() {
         for inst in &b.insts {
             if let Inst::Const { dst, c } = inst {
                 let key = format!("{c:?}");
-                match canonical.get(&key) {
-                    Some(leader) if leader != dst => replacements.push((*dst, *leader)),
-                    Some(_) => {}
-                    None => {
-                        canonical.insert(key, *dst);
-                    }
+                if bi == 0 {
+                    canonical.entry(key).or_insert(*dst);
+                } else if let Some(leader) = canonical.get(&key)
+                    && leader != dst
+                {
+                    replacements.push((*dst, *leader));
                 }
             }
         }

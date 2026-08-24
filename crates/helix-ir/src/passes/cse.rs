@@ -17,31 +17,17 @@ use crate::ir::{BlockId, FuncIr, Inst, ValueId};
 use crate::passmod::ChangeFlag;
 
 /// Eliminate dominated duplicate computations.
+///
+/// Constants are handled by the same dominator-scoped walk as everything
+/// else (a `Const` has a signature), which keeps the transform sound: a
+/// duplicate is only replaced when the dominator-tree preorder guarantees
+/// its leader dominates it. A naive "first def wins globally" pass would be
+/// WRONG — two identical constants in sibling subtrees have no dominance
+/// relation, and rewriting one to the other fabricates a value.
 pub fn cse(ir: &mut FuncIr) -> ChangeFlag {
     let mut flag = ChangeFlag::new();
 
-    // ---- 1. Constant deduplication: identical payloads share one def. -------
-    let mut const_map: HashMap<String, ValueId> = HashMap::new();
-    let mut dead_consts: Vec<(u32, usize)> = Vec::new(); // (block idx, inst idx)
-    for bi in 0..ir.blocks.len() {
-        for (ii, inst) in ir.blocks[bi].insts.iter().enumerate() {
-            if let Inst::Const { dst, c } = inst {
-                let key = format!("{c:?}");
-                match const_map.get(&key) {
-                    Some(leader) if leader != dst => {
-                        dead_consts.push((bi as u32, ii));
-                    }
-                    Some(_) => {}
-                    None => {
-                        const_map.insert(key, *dst);
-                    }
-                }
-            }
-        }
-    }
-    delete_with_leaders(ir, dead_consts, &mut flag);
-
-    // ---- 2. Dominator-scoped value numbering over Bin/Unary/Cast. ----------
+    // ---- Dominator-scoped value numbering over Const/Bin/Unary/Cast --------
     let doms = dominators(ir);
     type Table = HashMap<String, ValueId>;
 
@@ -118,65 +104,6 @@ pub fn cse(ir: &mut FuncIr) -> ChangeFlag {
     }
 
     flag
-}
-
-/// Deduplicate constants using precomputed leaders.
-fn delete_with_leaders(
-    ir: &mut FuncIr,
-    dead: Vec<(u32, usize)>,
-    flag: &mut ChangeFlag,
-) {
-    if dead.is_empty() {
-        return;
-    }
-    // Compute leader for each dead const: first same-payload Const anywhere.
-    let mut leaders: Vec<(ValueId, ValueId)> = Vec::new();
-    {
-        let mut first_of_payload: HashMap<String, ValueId> = HashMap::new();
-        for b in &ir.blocks {
-            for inst in &b.insts {
-                if let Inst::Const { dst, c } = inst {
-                    let key = format!("{c:?}");
-                    first_of_payload.entry(key).or_insert(*dst);
-                }
-            }
-        }
-        for (bi, ii) in &dead {
-            if let Inst::Const { dst, .. } = &ir.blocks[*bi as usize].insts[*ii] {
-                let key = format!(
-                    "{:?}",
-                    match &ir.blocks[*bi as usize].insts[*ii] {
-                        Inst::Const { c, .. } => c,
-                        _ => continue,
-                    }
-                );
-                if let Some(l) = first_of_payload.get(&key)
-                    && l != dst
-                {
-                    leaders.push((*dst, *l));
-                }
-            }
-        }
-    }
-    for (dead_v, lead) in leaders {
-        if dead_v != lead {
-            ir.replace_all_uses(dead_v, lead);
-            flag.changed = true;
-        }
-    }
-    let mut per_block: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (bi, ii) in dead {
-        per_block.entry(bi).or_default().push(ii);
-    }
-    for (bi, idxs) in per_block {
-        let old = std::mem::take(&mut ir.blocks[bi as usize].insts);
-        ir.blocks[bi as usize].insts = old
-            .into_iter()
-            .enumerate()
-            .filter(|(k, _)| !idxs.contains(k))
-            .map(|(_, i)| i)
-            .collect();
-    }
 }
 
 /// Operation signature of a pure instruction: stable string + defining value.

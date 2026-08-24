@@ -51,8 +51,8 @@
 use std::collections::HashSet;
 
 use helix_sema::{
-    Builtin, CallTarget, ConstLit, ElseArm, TypedBlock, TypedExpr, TypedExprKind, TypedFnDef,
-    TypedLValue, TypedProgram, TypedStmt, Ty,
+    Builtin, CallTarget, ConstLit, ElseArm, Ty, TypedBlock, TypedExpr, TypedExprKind, TypedFnDef,
+    TypedLValue, TypedProgram, TypedStmt,
 };
 use helix_syntax::ast::{BinOp, UnOp};
 
@@ -79,9 +79,7 @@ struct Reservations {
 }
 
 fn reserve_scan(f: &TypedFnDef) -> Reservations {
-    let mut r = Reservations {
-        short_circuits: 0,
-    };
+    let mut r = Reservations { short_circuits: 0 };
     scan_stmts(&f.body.stmts, &mut r);
     r
 }
@@ -187,7 +185,9 @@ fn build_fn(program: &TypedProgram, fidx: usize) -> FuncIr {
             (ConstLit::Float(v), _) => Constant::F64(*v),
             (ConstLit::Bool(b), _) => Constant::Bool(*b),
         };
-        ir.block_mut(ir.entry).insts.push(Inst::Const { dst: v, c: k });
+        ir.block_mut(ir.entry)
+            .insts
+            .push(Inst::Const { dst: v, c: k });
         const_defs.insert(c.sym, v);
     }
 
@@ -221,12 +221,15 @@ fn build_fn(program: &TypedProgram, fidx: usize) -> FuncIr {
             b.finish_return(v);
         } else {
             let zero = b.val(f.ret);
-            b.emit(Inst::Const { dst: zero, c: match f.ret {
-                Ty::I32 => Constant::I32(0),
-                Ty::F32 => Constant::F32(0.0),
-                Ty::F64 => Constant::F64(0.0),
-                _ => Constant::I64(0),
-            } });
+            b.emit(Inst::Const {
+                dst: zero,
+                c: match f.ret {
+                    Ty::I32 => Constant::I32(0),
+                    Ty::F32 => Constant::F32(0.0),
+                    Ty::F64 => Constant::F64(0.0),
+                    _ => Constant::I64(0),
+                },
+            });
             b.finish_return(Some(zero));
         }
     }
@@ -360,11 +363,7 @@ impl Builder {
             }
             TypedExprKind::Unary(op, o) => {
                 let a = self.expr(o);
-                self.emit(Inst::Unary {
-                    op: *op,
-                    dst,
-                    a,
-                });
+                self.emit(Inst::Unary { op: *op, dst, a });
             }
             TypedExprKind::Bin(op, l, r) => {
                 if matches!(op, BinOp::And | BinOp::Or) {
@@ -372,12 +371,7 @@ impl Builder {
                 } else {
                     let a = self.expr(l);
                     let b = self.expr(r);
-                    self.emit(Inst::Bin {
-                        op: *op,
-                        dst,
-                        a,
-                        b,
-                    });
+                    self.emit(Inst::Bin { op: *op, dst, a, b });
                 }
             }
             TypedExprKind::Index(arr, idx) => {
@@ -402,7 +396,10 @@ impl Builder {
             TypedExprKind::Error => {
                 // Poison from failed sema recovery; well-typed inputs never
                 // reach the builder. Zero keeps downstream typing total.
-                self.emit(Inst::Const { dst, c: Constant::I64(0) });
+                self.emit(Inst::Const {
+                    dst,
+                    c: Constant::I64(0),
+                });
             }
         }
     }
@@ -513,13 +510,12 @@ impl Builder {
     /// Calls. See the module-level note about the missing argument list.
     fn call_expr(&mut self, target: &CallTarget, ret: Ty, dst: Option<ValueId>) {
         match target {
-            CallTarget::Builtin(Builtin::Zeros) => {
+            CallTarget::Builtin { which: Builtin::Zeros, .. } => {
                 // The array lands in the destination cell directly (arrays are
                 // referenced by local slot, never moved as values).
-                let out_local = dst.map(|d| LocalId(d.0)).unwrap_or_else(|| {
-                    let l = alloc_temp(&mut self.ir, "$arr", ret);
-                    l
-                });
+                let out_local = dst
+                    .map(|d| LocalId(d.0))
+                    .unwrap_or_else(|| alloc_temp(&mut self.ir, "$arr", ret));
                 self.emit(Inst::Call(Call {
                     dst: None,
                     callee: "zeros".into(),
@@ -527,7 +523,7 @@ impl Builder {
                     arr_refs: vec![out_local],
                 }));
             }
-            CallTarget::Builtin(b) => {
+            CallTarget::Builtin { which: b, args } => {
                 self.emit(Inst::Call(Call {
                     dst,
                     callee: b.name().into(),
@@ -569,7 +565,10 @@ impl Builder {
                 if init_is_zeros(init) {
                     // Arrays bind by reference: the call writes the cell.
                     self.call_expr(
-                        &CallTarget::Builtin(Builtin::Zeros),
+                        &CallTarget::Builtin {
+                            which: Builtin::Zeros,
+                            args: Vec::new(),
+                        },
                         *ty,
                         Some(cell),
                     );
@@ -682,9 +681,6 @@ impl Builder {
         self.closed.insert(self.cur);
     }
 
-    /// Copy `v` into cell `cell` via an identity computation.
-    fn expr_copy_to(&mut self, _cell: ValueId, _v: ValueId) {}
-
     /// Terminate the shared exit block after all edges are known: its single
     /// φ argument list mirrors the return sites, and `Return` yields the
     /// merged value (or nothing for unit functions).
@@ -788,7 +784,10 @@ impl Builder {
         // Latch: iv = iv + 1 (defines the cell so the back edge carries it).
         self.cur = latch;
         let one = self.val(Ty::I64);
-        self.emit(Inst::Const { dst: one, c: Constant::I64(1) });
+        self.emit(Inst::Const {
+            dst: one,
+            c: Constant::I64(1),
+        });
         self.emit(Inst::Bin {
             op: BinOp::Add,
             dst: iv_cell,
@@ -805,7 +804,10 @@ impl Builder {
 fn init_is_zeros(e: &TypedExpr) -> bool {
     matches!(
         &e.kind,
-        TypedExprKind::Call(CallTarget::Builtin(Builtin::Zeros))
+        TypedExprKind::Call(CallTarget::Builtin {
+            which: Builtin::Zeros,
+            ..
+        })
     )
 }
 

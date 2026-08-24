@@ -7,19 +7,42 @@ use helix_ir::{build, print_ir, run_passes_to_fixpoint, to_ssa, verify};
 
 const EXAMPLES: &[(&str, &str)] = &[
     ("ssa_demo", include_str!("../../../examples/ssa_demo.hx")),
-    ("shortcircuit", include_str!("../../../examples/shortcircuit.hx")),
-    
+    (
+        "shortcircuit",
+        include_str!("../../../examples/shortcircuit.hx"),
+    ),
     ("matmul", include_str!("../../../examples/matmul.hx")),
-    ("dot_reduction", include_str!("../../../examples/dot_reduction.hx")),
-    ("fib_recursion", include_str!("../../../examples/fib_recursion.hx")),
-    ("gcd_box_test", include_str!("../../../examples/gcd_box_test.hx")),
+    (
+        "dot_reduction",
+        include_str!("../../../examples/dot_reduction.hx"),
+    ),
+    (
+        "fib_recursion",
+        include_str!("../../../examples/fib_recursion.hx"),
+    ),
+    (
+        "gcd_box_test",
+        include_str!("../../../examples/gcd_box_test.hx"),
+    ),
     ("jacobi_2d", include_str!("../../../examples/jacobi_2d.hx")),
-    ("count_primes_sieve", include_str!("../../../examples/count_primes_sieve.hx")),
-    ("minmax_reduction", include_str!("../../../examples/minmax_reduction.hx")),
+    (
+        "count_primes_sieve",
+        include_str!("../../../examples/count_primes_sieve.hx"),
+    ),
+    (
+        "minmax_reduction",
+        include_str!("../../../examples/minmax_reduction.hx"),
+    ),
     ("scale", include_str!("../../../examples/scale.hx")),
     ("div_guard", include_str!("../../../examples/div_guard.hx")),
-    ("casts_demo", include_str!("../../../examples/casts_demo.hx")),
-    ("const_globals", include_str!("../../../examples/const_globals.hx")),
+    (
+        "casts_demo",
+        include_str!("../../../examples/casts_demo.hx"),
+    ),
+    (
+        "const_globals",
+        include_str!("../../../examples/const_globals.hx"),
+    ),
     ("small_n", include_str!("../../../examples/small_n.hx")),
 ];
 
@@ -54,7 +77,10 @@ fn all_examples_survive_the_whole_pipeline() {
             }
             to_ssa(&mut f);
             if let Err(e) = verify(&f) {
-                failures.push(format!("{name}/{fname}: SSA verify: {e}\n{}", print_ir(&f, true)));
+                failures.push(format!(
+                    "{name}/{fname}: SSA verify: {e}\n{}",
+                    print_ir(&f, true)
+                ));
                 continue;
             }
             // Full pass pipeline with verification inside the driver.
@@ -65,14 +91,17 @@ fn all_examples_survive_the_whole_pipeline() {
             if let Err(e) = verify(&f) {
                 failures.push(format!("{name}/{fname}: post-pass verify: {e}"));
             }
-            if is_ssa(&f) {
-                if let Err(e) = helix_ir::verify_ssa(&f) {
-                    failures.push(format!("{name}/{fname}: strict SSA verify: {e}"));
-                }
+            if let (true, Err(e)) = (is_ssa(&f), helix_ir::verify_ssa(&f)) {
+                failures.push(format!("{name}/{fname}: strict SSA verify: {e}"));
             }
         }
     }
-    assert!(failures.is_empty(), "{} example(s) failed:\n{}", failures.len(), failures.join("\n\n"));
+    assert!(
+        failures.is_empty(),
+        "{} example(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
 }
 
 fn is_ssa(f: &helix_ir::FuncIr) -> bool {

@@ -8,9 +8,7 @@
 //! (`docs/research/ssa-design.md`, recommendation 7).
 
 use crate::ir::FuncIr;
-use crate::passes::{
-    const_fold, copy_prop, cse, dce, licm, simplify_cfg,
-};
+use crate::passes::{const_fold, copy_prop, cse, dce, licm, simplify_cfg};
 use crate::print::print_ir;
 use crate::verify;
 
@@ -109,10 +107,7 @@ pub fn run_pass_by_id(id: PassId, ir: &mut FuncIr) -> ChangeFlag {
 ///
 /// # Panics / Errors
 /// Returns the verifier message when the pass corrupted the IR.
-pub fn run_pass(
-    name: &str,
-    ir: &mut FuncIr,
-) -> Result<ChangeFlag, String> {
+pub fn run_pass(name: &str, ir: &mut FuncIr) -> Result<ChangeFlag, String> {
     let flag = match name {
         "const_fold" => const_fold(ir),
         "const_prop" => crate::passes::const_prop::const_prop(ir),

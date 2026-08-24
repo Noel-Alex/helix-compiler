@@ -155,8 +155,14 @@ fn place_phis(ir: &mut FuncIr, names: &GlobalNames, df: &[Vec<BlockId>]) {
         // Seed with every block that defines `var` (dst == var's cell id), or
         // that defines it as a parameter phi (zero args).
         for (bi, block) in ir.blocks.iter().enumerate() {
-            let defines = block.insts.iter().any(|i| i.dst().is_some_and(|d| d.0 == var.0))
-                || block.phis.iter().any(|p| p.var == *var && p.args.is_empty());
+            let defines = block
+                .insts
+                .iter()
+                .any(|i| i.dst().is_some_and(|d| d.0 == var.0))
+                || block
+                    .phis
+                    .iter()
+                    .any(|p| p.var == *var && p.args.is_empty());
             if defines {
                 work.push(bi);
                 queued[bi] = true;
@@ -231,8 +237,8 @@ fn rename(ir: &mut FuncIr, doms: &crate::dom::Doms) {
 
     // Current reaching name of each local (bottom of stack = cell id).
     let mut stacks: Vec<Vec<u32>> = vec![Vec::new(); n_locals];
-    for l in 0..n_locals.min(n_cells) {
-        stacks[l].push(l as u32); // version 0 = cell id
+    for st in stacks.iter_mut().take(n_locals.min(n_cells)) {
+        st.push(st.len() as u32); // version 0 = cell id (stack empty ⇒ len 0)
     }
 
     // Fresh ids start above every existing id (cell ids AND temporaries), so
@@ -358,7 +364,13 @@ fn rename(ir: &mut FuncIr, doms: &crate::dom::Doms) {
     }
 
     // ---- apply recorded renamings ------------------------------------------
-    apply_renamings(ir, &phi_dst_new, &pending_succ_args, &fresh_ty, &mut def_map);
+    apply_renamings(
+        ir,
+        &phi_dst_new,
+        &pending_succ_args,
+        &fresh_ty,
+        &mut def_map,
+    );
 }
 
 /// Rewrite every operand use in block `b` through the current stacks.
@@ -366,11 +378,7 @@ fn rewrite_uses_in_block(ir: &mut FuncIr, b: BlockId, stacks: &[Vec<u32>]) {
     // Jump targets and their phi variables must be snapshotted before the
     // mutable borrow starts.
     let jump_phi_vars: Vec<LocalId> = match &ir.blocks[b.0 as usize].term {
-        Term::Jump(t, _) => ir.blocks[t.0 as usize]
-            .phis
-            .iter()
-            .map(|p| p.var)
-            .collect(),
+        Term::Jump(t, _) => ir.blocks[t.0 as usize].phis.iter().map(|p| p.var).collect(),
         _ => Vec::new(),
     };
 
@@ -443,9 +451,7 @@ fn apply_renamings(
         }
         for (i, col) in columns.into_iter().enumerate() {
             ir.blocks[pi].phis[i].args = col;
-            ir.blocks[pi].phis[i]
-                .args
-                .sort_unstable_by_key(|(b, _)| *b);
+            ir.blocks[pi].phis[i].args.sort_unstable_by_key(|(b, _)| *b);
         }
     }
 

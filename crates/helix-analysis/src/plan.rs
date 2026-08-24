@@ -29,7 +29,7 @@ pub struct Reduction {
 /// One classified cross-iteration dependence edge.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DepEdge {
-    /// e.g. "RAW a[i] <- a[i-1]"
+    /// e.g. "RAW on 'a'" — display label.
     pub kind_label: String,
     pub array: String,
     /// Exact distance when determinable.
@@ -55,10 +55,8 @@ pub enum Verdict {
 pub struct LoopReport {
     pub loop_id: usize,
     pub depth: u32,
-    /// Header block label (bbN).
     pub header: String,
     pub blocks: Vec<String>,
-    /// Induction variable name when canonical (e.g. "i").
     pub iv: Option<String>,
     pub bounds: Option<(String, String)>,
     /// Pretty access lines: "READ a[i]", "WRITE out[i]".
@@ -66,7 +64,6 @@ pub struct LoopReport {
     pub raw_deps: Vec<DepEdge>,
     pub war_deps: Vec<DepEdge>,
     pub waw_deps: Vec<DepEdge>,
-    /// Non-reduction reasons collected during analysis (side effects, unknown shapes).
     pub notes: Vec<String>,
     pub verdict: Verdict,
 }
@@ -91,7 +88,8 @@ impl LoopReport {
     }
 }
 
-/// Analyze all loops of one function.
+/// Analyze all loops of one function. `func` must be in SSA form (the pipeline
+/// runs to_ssa before analysis).
 pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
     let mut reports = Vec::new();
 
@@ -99,97 +97,111 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
         let mut notes = Vec::new();
 
         // Side effects kill parallelization immediately (spec normative).
-        if func.loop_has_print(lp) {
+        if has_print(func, lp) {
             notes.push("contains a side effect (print)".to_string());
         }
 
         // Canonical shape?
         let canonical: Option<CanonicalLoop> = canon::canon(func, lp);
-        let iv_name = canonical.as_ref().map(|c| func.local_name(c.iv)).unwrap_or("?");
         if canonical.is_none() {
             notes.push("non-canonical loop shape".to_string());
         }
+        let iv_name = canonical
+            .as_ref()
+            .map(|c| local_name(func, c.iv))
+            .unwrap_or_else(|| "?".to_string());
 
-        // Access extraction per block/instruction.
-        let accesses = access::collect_accesses(func, lp);
+        // Access extraction relative to the induction value.
+        let accesses = match &canonical {
+            Some(c) => access::collect(func, lp, c.iv_value_in_loop),
+            None => Vec::new(),
+        };
 
         // Reduction recognition first — an approved reduction exempts its own
         // distance-1 RAW self-dependence on the accumulator.
         let reductions = reduce::find_reductions(func, &lp.blocks);
         let reduction_report = reductions
             .first()
-            .map(|r| Reduction { op: r.op, var: func.local_name(r.var).to_string() });
+            .map(|r| Reduction { op: r.op, var: local_name(func, r.var) });
 
-        // Pair accesses on the same array; classify RAW/WAR/WAW.
-        let mut raw_deps = Vec::new();
-        let mut war_deps = Vec::new();
-        let mut waw_deps = Vec::new();
-
+        // Iteration range for bound-aware testing (half-open [start, end)).
         let range = canonical.as_ref().map_or(
             IterRange { lo: i128::MIN / 4, hi: i128::MAX / 4 },
             |c| match (&c.start, &c.end) {
                 (Bound::Const(lo), Bound::Const(hi)) => IterRange {
                     lo: *lo as i128,
-                    hi: hi.saturating_sub(1) as i128, // half-open [start, end)
+                    hi: hi.saturating_sub(1) as i128,
                 },
-                _ => IterRange { lo: i128::MIN / 4, hi: i128::MAX / 4 },
+                _ => IterRange { lo: -1 << 40, hi: 1 << 40 }, // symbolic bounds: wide box
             },
         );
 
-        for a in &accesses {
-            for b in &accesses {
-                if a.arr != b.arr {
+        // Pair same-array accesses; classify RAW/WAR/WAW.
+        let mut raw_deps = Vec::new();
+        let mut war_deps = Vec::new();
+        let mut waw_deps = Vec::new();
+        let arr_name =
+            |l: helix_ir::LocalId| local_name(func, l);
+
+        for (i, src) in accesses.iter().enumerate() {
+            for dst in accesses.iter().skip(i + 1) {
+                if src.arr != dst.arr {
                     continue;
                 }
-                let (src, dst) = (a, b);
+                // Order pairs so the WRITE side is the "source" when present
+                // (dependence direction follows program order per iteration;
+                // cross-iteration both orderings are covered by the battery's
+                // ±distance handling).
+                let (w, r) = if src.is_write && !dst.is_write {
+                    (src, dst)
+                } else if dst.is_write && !src.is_write {
+                    (dst, src)
+                } else {
+                    (src, dst)
+                };
                 let kind = match (src.is_write, dst.is_write) {
-                    (true, false) => "RAW",
-                    (false, true) => "WAR",
+                    (true, false) | (false, true) => "RAW",
                     (true, true) => "WAW",
                     (false, false) => continue, // RAR never a dependence
                 };
-                // Same access pair in program order only (src executes before dst
-                // in some iteration ordering); skip self-pairs of reads already skipped.
-                let (aff_s, _) = src.affine.clone().into_tuple();
-                let _ = aff_s;
-                let aff_src = src.affine.unwrap_or(deps::Affine { a: 0, b: 0 });
-                let aff_dst = dst.affine.unwrap_or(deps::Affine { a: 0, b: 1 });
-                if src.affine.is_none() || dst.affine.is_none() {
+
+                let (Some(aff_w), Some(aff_r)) = (w.affine, r.affine) else {
                     notes.push(format!(
                         "unanalyzable subscript on '{}' — assuming dependence",
-                        func.local_name(src.arr)
+                        arr_name(src.arr)
                     ));
                     push_edge(
-                        if kind == "RAW" { &mut raw_deps } else if kind == "WAR" { &mut war_deps } else { &mut waw_deps },
+                        sink_for(kind, &mut raw_deps, &mut war_deps, &mut waw_deps),
                         kind,
-                        func.local_name(src.arr),
+                        &arr_name(src.arr),
                         None,
                         "*",
                         lp.depth,
-                        "subscript not affine — conservative dependence",
+                        &format!(
+                            "{} {}[?] vs {}[?] — subscript not affine, conservative",
+                            kind,
+                            arr_name(src.arr),
+                            arr_name(src.arr)
+                        ),
                     );
                     continue;
-                }
-                match deps::test_pair(&[aff_src], &[aff_dst], range) {
+                };
+
+                match deps::test_pair(&[aff_r], &[aff_w], range) {
                     DepOutcome::Independent => {}
                     DepOutcome::Dependence { distance, dirs } => {
-                        // Reduction exemption: WAW/RAW/WAR between the SAME scalar is not
-                        // possible here (scalars aren't arrays); reduction exemption shows
-                        // up as: the only deps are on the accumulator var, handled by
-                        // lowering. Array-level exemption does not apply.
                         let dir_str: String = dirs.iter().map(|d| d.describe()).collect();
                         let dist_txt = distance.map(|d| d.to_string()).unwrap_or("?".into());
+                        let name = arr_name(src.arr);
                         let label = format!(
-                            "{kind} {}[{}] <- {}[{}]",
-                            func.local_name(src.arr),
-                            render_affine(aff_src, iv_name),
-                            func.local_name(dst.arr),
-                            render_affine(aff_dst, iv_name)
+                            "{kind} {name}[{}] ← {name}[{}]",
+                            render_affine(aff_w, &iv_name),
+                            render_affine(aff_r, &iv_name),
                         );
                         push_edge(
-                            if kind == "RAW" { &mut raw_deps } else if kind == "WAR" { &mut war_deps } else { &mut waw_deps },
+                            sink_for(kind, &mut raw_deps, &mut war_deps, &mut waw_deps),
                             kind,
-                            func.local_name(src.arr),
+                            &name,
                             distance,
                             &dir_str,
                             lp.depth,
@@ -200,7 +212,8 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
             }
         }
 
-        // Verdict assembly.
+        // Verdict assembly: notes → sequential; real dependences → sequential
+        // with the first edge as the reason; otherwise reduction or plain DOALL.
         let verdict = if !notes.is_empty() {
             Verdict::Sequential(notes.join("; "))
         } else if !raw_deps.is_empty() || !war_deps.is_empty() || !waw_deps.is_empty() {
@@ -221,16 +234,22 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
             depth: lp.depth,
             header: format!("bb{}", lp.header.0),
             blocks: lp.blocks.iter().map(|b| format!("bb{}", b.0)).collect(),
-            iv: Some(iv_name.to_string()),
-            bounds: canonical.as_ref().map(|c| (bound_text(func, &c.start), bound_text(func, &c.end))),
+            iv: Some(iv_name.clone()),
+            bounds: canonical
+                .as_ref()
+                .map(|c| (bound_text(&c.start), bound_text(&c.end))),
             accesses: accesses
                 .iter()
                 .map(|a| {
+                    let sub = a
+                        .affine
+                        .map(|f| render_affine(f, &iv_name))
+                        .unwrap_or_else(|| "?".into());
                     format!(
                         "{} {}[{}]",
                         if a.is_write { "WRITE" } else { "READ" },
-                        func.local_name(a.arr),
-                        a.raw_index
+                        arr_name(a.arr),
+                        sub
                     )
                 })
                 .collect(),
@@ -244,15 +263,34 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
     reports
 }
 
-fn push_edge(
-    sink: &mut Vec<DepEdge>,
+fn local_name(func: &FuncIr, l: helix_ir::LocalId) -> String {
+    func.types.local_name(l).unwrap_or("?").to_string()
+}
+
+fn sink_for<'s>(
     kind: &str,
-    array: &str,
-    distance: Option<i64>,
-    dir: &str,
-    level: u32,
-    explain: &str,
-) {
+    raw: &'s mut Vec<DepEdge>,
+    war: &'s mut Vec<DepEdge>,
+    waw: &'s mut Vec<DepEdge>,
+) -> &'s mut Vec<DepEdge> {
+    match kind {
+        "WAW" => waw,
+        "WAR" => war,
+        _ => raw,
+    }
+}
+
+fn has_print(func: &FuncIr, lp: &crate::loops::Loop) -> bool {
+    lp.blocks
+        .iter()
+        .any(|b| func.block(*b).insts.iter().any(|i| is_print_call(i)))
+}
+
+fn is_print_call(i: &helix_ir::Inst) -> bool {
+    matches!(i, helix_ir::Inst::Call(c) if c.callee == "print")
+}
+
+fn push_edge(sink: &mut Vec<DepEdge>, kind: &str, array: &str, distance: Option<i64>, dir: &str, level: u32, explain: &str) {
     sink.push(DepEdge {
         kind_label: format!("{kind} on '{array}'"),
         array: array.to_string(),
@@ -266,28 +304,21 @@ fn push_edge(
 fn render_affine(a: deps::Affine, iv: &str) -> String {
     match (a.a, a.b) {
         (1, 0) => iv.to_string(),
-        (1, c) => format!("{iv} + {c}"),
+        (1, c) if c > 0 => format!("{iv} + {c}"),
+        (1, c) => format!("{iv} - {}", -c),
         (-1, 0) => format!("-{iv}"),
-        (-1, c) => format!("{c} - {iv}"),
+        (-1, c) if c > 0 => format!("{c} - {iv}"),
+        (-1, c) => format!("-{iv} - {}", -c),
         (k, 0) => format!("{k}*{iv}"),
-        (k, c) => format!("{k}*{iv} + {c}"),
-        (0, c) => c.to_string(),
+        (k, c) if c > 0 => format!("{k}*{iv} + {c}"),
+        (k, c) => format!("{k}*{iv} - {}", -c),
+        _ => "?".to_string(),
     }
 }
 
-fn bound_text(_func: &FuncIr, b: &Bound) -> String {
+fn bound_text(b: &Bound) -> String {
     match b {
         Bound::Const(c) => c.to_string(),
-        Bound::Sym(_) => "n".to_string(), // symbolic bound rendered by name at call sites
-    }
-}
-
-trait IntoTuple {
-    fn into_tuple(self) -> (Option<deps::Affine>, ());
-}
-
-impl IntoTuple for Option<deps::Affine> {
-    fn into_tuple(self) -> (Option<deps::Affine>, ()) {
-        (self, ())
+        Bound::Sym(_) => "n".to_string(), // rendered symbolically at call sites
     }
 }

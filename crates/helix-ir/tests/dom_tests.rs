@@ -2,7 +2,9 @@
 //! research digest flags as dangerous: irreducible-ish diamonds, self-loops
 //! and nested loops.
 
-use helix_ir::{dominance_frontiers, dominators, natural_loops, reachability, BlockId, FuncIr, Term};
+use helix_ir::{
+    BlockId, FuncIr, Term, dominance_frontiers, dominators, natural_loops, reachability,
+};
 
 /// Build a raw CFG: `edges` are (from, to), entry is block 0.
 fn cfg(n: usize, edges: &[(u32, u32)]) -> FuncIr {
@@ -22,7 +24,11 @@ fn cfg(n: usize, edges: &[(u32, u32)]) -> FuncIr {
             [one] => ir.set_term(BlockId(i as u32), Term::Jump(*one, Vec::new())),
             _ => ir.set_term(
                 BlockId(i as u32),
-                Term::Branch { cond: helix_ir::ValueId(0), t: ss[0], f: ss[1] },
+                Term::Branch {
+                    cond: helix_ir::ValueId(0),
+                    t: ss[0],
+                    f: ss[1],
+                },
             ),
         }
     }
@@ -81,7 +87,11 @@ fn nested_loops() {
     }
     // Back edge 4 -> 1 (1 dominates 4).
     let loops = natural_loops(&ir, &d);
-    assert!(loops.iter().any(|(h, body)| h.0 == 1 && ids(body).contains(&4)));
+    assert!(
+        loops
+            .iter()
+            .any(|(h, body)| h.0 == 1 && ids(body).contains(&4))
+    );
 }
 
 #[test]

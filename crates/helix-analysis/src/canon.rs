@@ -1,124 +1,122 @@
-//! Canonical loop recovery: identify the induction variable phi, the latch
-//! increment, and the header comparison — turning the IR shape of a `for` loop
-//! back into (iv, start, end) for analysis and reporting.
+//! Canonical loop recovery: find the induction-variable φ, the latch increment,
+//! and the header comparison — turning the IR shape of a `for` back into
+//! (iv, start, end) for analysis and reporting.
 
 use crate::loops::Loop;
 use crate::Bound;
-use helix_ir::{BinOp, BlockId, FuncIr, Inst, LocalId, Term, ValueId};
+use helix_ir::{BinOp, BlockId, Constant, FuncIr, Inst, LocalId, Term, ValueId};
 
-/// A recognized canonical single-induction loop.
+/// A recognized canonical counting loop.
 #[derive(Clone, Debug)]
 pub struct CanonicalLoop {
-    /// The induction variable local (source-level name index).
+    /// Induction variable's local slot (source-level `i`).
     pub iv: LocalId,
-    /// The header phi's incoming value from the preheader (start bound).
+    /// Value fed from outside the loop (start bound).
     pub start: Bound,
-    /// Value compared against in the header condition (end bound), if symbolic.
+    /// Value the header condition compares against (end bound).
     pub end: Bound,
-    /// Latch increment (usually 1).
+    /// Latch step (HELIX v1 always 1).
     pub step: i64,
-    /// Header block that holds iv = phi(start, iv+step) and the branch.
     pub header: BlockId,
-    /// The exit block taken when the condition fails.
-    pub exit: Option<BlockId>,
-    /// SSA name of iv inside the loop (header param / phi result).
+    /// SSA name of the induction value inside the loop.
     pub iv_value_in_loop: ValueId,
 }
 
-/// Attempt canonicalization of `loop_`. Returns None when the shape doesn't
-/// match a simple counting loop (e.g. while-style or data-dependent exit).
-pub fn canon(func: &FuncIr, loop_: &Loop) -> Option<CanonicalLoop> {
-    let header = &func.blocks[loop_.header.0 as usize];
+/// Attempt canonicalization; None for non-counting shapes.
+pub fn canon(func: &FuncIr, lp: &Loop) -> Option<CanonicalLoop> {
+    let header = func.block(lp.header);
 
-    // Find the phi whose two args are (outside-value, inside-value) and whose
-    // inside value is defined by add 1 in a latch block that jumps back to header.
+    // Find a header φ whose back-edge arg is defined by `<phi> + const`.
     for phi in &header.phis {
         if phi.args.len() != 2 {
             continue;
         }
-        let (in_from_pre, in_from_back) = {
-            // Identify which arg comes around the back edge: the pred whose block
-            // is inside the loop body and is not the header.
-            let mut pre = None;
-            let mut back = None;
-            for (pb, pv) in &phi.args {
-                if *pb == loop_.header {
-                    continue;
-                }
-                if loop_.blocks.contains(pb) {
-                    back = Some((pb, pv));
-                } else {
-                    pre = Some((pb, pv));
-                }
+        // Split incoming args into from-outside vs from-inside-the-loop.
+        let mut pre_val: Option<ValueId> = None;
+        let mut back_val: Option<ValueId> = None;
+        for (pb, pv) in &phi.args {
+            if *pb == lp.header {
+                continue;
             }
-            match (pre, back) {
-                (Some(p), Some(b)) => (p.1, b.1),
-                _ => continue,
+            if lp.blocks.contains(pb) {
+                back_val = Some(*pv);
+            } else {
+                pre_val = Some(*pv);
             }
+        }
+        let (Some(pre), Some(back)) = (pre_val, back_val) else {
+            continue;
         };
 
-        // Back-edge value must be iv_value + const-step.
-        let step = match func.inst_defining(in_from_back) {
+        // Back-edge def must be phi.dst + const (or const + phi.dst).
+        let step = match find_def(func, back) {
             Some(Inst::Bin { op: BinOp::Add, a, b, .. }) => {
-                if func.const_of(*b) == Some(1) && *a == phi.dst {
-                    1
-                } else if func.const_of(*a) == Some(1) && *b == phi.dst {
-                    1
-                } else if let Some(s) = func.const_of(*b) {
-                    if *a == phi.dst {
-                        s
-                    } else {
-                        continue;
-                    }
+                if *a == phi.dst {
+                    const_i64(func, *b)
+                } else if *b == phi.dst {
+                    const_i64(func, *a)
                 } else {
-                    continue;
+                    None
                 }
             }
-            _ => continue,
+            _ => None,
         };
-        let _ = step;
+        let Some(step) = step else { continue };
+        if step != 1 {
+            continue; // HELIX v1 for-loops always step by 1
+        }
 
-        // Header must end in Branch on a comparison involving the phi.
-        let (end_bound, exit, cmp_ok) = match &header.term {
-            Term::Branch { cond, t, f } => {
-                match func.inst_defining(*cond) {
-                    Some(Inst::Bin { op, a, b, .. })
-                        if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) =>
-                    {
-                        let (iv_side, other) = if *a == phi.dst { (*a, *b) } else if *b == phi.dst { (*b, *a) } else {
-                            continue;
-                        };
-                        let bound = match func.const_of(other) {
-                            Some(c) => Bound::Const(c),
-                            None => Bound::Sym(other.0),
-                        };
-                        // Exit is the successor NOT inside the loop.
-                        let exit_blk = if !loop_.blocks.contains(f) { Some(*f) } else { Some(*t) };
-                        (bound, exit_blk, iv_side == phi.dst)
-                    }
-                    _ => continue,
-                }
-            }
-            _ => continue,
+        // Header terminator must branch on a comparison involving phi.dst.
+        let Term::Branch { cond, .. } = &header.term else {
+            continue;
         };
-        let _ = cmp_ok;
+        let Some(Inst::Bin { op, a, b, .. }) = find_def(func, *cond) else {
+            continue;
+        };
+        if !matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+            continue;
+        }
+        let (iv_side, other) = if *a == phi.dst {
+            (*a, *b)
+        } else if *b == phi.dst {
+            (*b, *a)
+        } else {
+            continue;
+        };
 
         return Some(CanonicalLoop {
             iv: phi.var,
-            start: bound_from_value(func, in_from_pre),
-            end: end_bound,
-            step: step.max(1),
-            header: loop_.header,
-            exit,
-            iv_value_in_loop: phi.dst,
+            start: bound_of(func, pre),
+            end: bound_of(func, other),
+            step,
+            header: lp.header,
+            iv_value_in_loop: iv_side,
         });
     }
     None
 }
 
-fn bound_from_value(func: &FuncIr, v: ValueId) -> Bound {
-    match func.const_of(v) {
-        Some(c) => Bound::Const(c),
-        None => Bound::Sym(v.0),
+/// Locate the instruction defining `v` anywhere in the function.
+pub fn find_def<'f>(func: &'f FuncIr, v: ValueId) -> Option<&'f Inst> {
+    for bd in &func.blocks {
+        if let Some(i) = bd.insts.iter().find(|i| i.dst() == Some(v)) {
+            return Some(i);
+        }
     }
+    None
+}
+
+fn const_i64(func: &FuncIr, v: ValueId) -> Option<i64> {
+    match find_def(func, v) {
+        Some(Inst::Const { c, .. }) => match c {
+            Constant::I64(x) => Some(*x),
+            Constant::I32(x) => Some(i64::from(*x)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn bound_of(func: &FuncIr, v: ValueId) -> Bound {
+    const_i64(func, v).map_or(Bound::Sym(v.0), Bound::Const)
 }

@@ -1,8 +1,18 @@
-//! Reduction recognition: `x = x OP t` accumulated exactly once per iteration
-//! with no other references to x — the only sanctioned distance-1 self-dependence.
+//! Reduction recognition: `x = x OP t` accumulated once per iteration with no
+//! other references to x — the only sanctioned distance-1 self-dependence.
+//!
+//! Detection runs on SSA form, where the accumulator's loop-carried state is
+//! exactly a header φ whose back-edge operand flows through one associative
+//! binop. The checklist (lang-spec normative):
+//!
+//! 1. header φ for local x,
+//! 2. back-edge operand = φ-result OP invariant (or symmetric), OP ∈ {+,-,*}
+//!    plus min/max builtins when they appear as Call shapes,
+//! 3. exactly ONE store/definition site per iteration (the latch chain),
+//! 4. no other USE of any version of x inside the body besides the chain.
 
 use crate::ReductionOp;
-use helix_ir::{FuncIr, Inst, LocalId};
+use helix_ir::{BinOp, BlockId, FuncIr, Inst, LocalId, ValueId};
 use std::collections::HashMap;
 
 /// A recognized reduction inside one loop body.
@@ -22,79 +32,134 @@ impl ReductionOp {
         }
     }
 
+    /// FP +/* are not associative: parallel combination order changes rounding.
     pub fn is_floating_point_risky(self) -> bool {
         matches!(self, ReductionOp::Add | ReductionOp::Mul)
     }
 }
 
-/// Scan one loop's blocks for reduction patterns.
-///
-/// Requirements (lang-spec normative):
-/// - exactly one assignment to x per iteration of the shape x = x op t | t op x
-/// - op ∈ {+,-,*,min,max} ('-' normalized to Add with negated t at lowering time)
-/// - no OTHER reads or writes of x anywhere in the loop body
-pub fn find_reductions(func: &FuncIr, loop_blocks: &[helix_ir::BlockId]) -> Vec<Recognized> {
-    use helix_ir::BinOp as B;
+/// Scan an SSA-form loop body for reductions. Returns at most one per local.
+pub fn find_reductions(func: &FuncIr, loop_blocks: &[BlockId]) -> Vec<Recognized> {
+    let mut out: Vec<Recognized> = Vec::new();
 
-    // Collect candidate (var, op, value) triples from scalar stores in the loop.
-    let mut candidates: HashMap<LocalId, (ReductionOp, usize)> = HashMap::new();
-    let mut other_uses: HashMap<LocalId, usize> = HashMap::new();
+    // Header phis are the candidate accumulators.
+    let Some(header) = loop_blocks
+        .iter()
+        .copied()
+        .find(|b| !func.block(*b).phis.is_empty())
+    else {
+        return out;
+    };
+    let hb = func.block(header);
 
-    for &blk in loop_blocks {
-        let bd = &func.blocks[blk.0 as usize];
-        for inst in &bd.insts {
-            match inst {
-                Inst::StoreScalar { dst, val } => {
-                    *candidates.entry(*dst).or_insert((op_for(func, *val, *dst), 1)) = candidates
-                        .get(dst)
-                        .map_or((op_for(func, *val, *dst), 1), |(op, n)| (*op, n + 1));
+    'phi_loop: for phi in &hb.phis {
+        if phi.args.len() != 2 {
+            continue;
+        }
+        // Back-edge arg: from a pred inside the loop (≠ header itself).
+        let Some((_, back_val)) = phi
+            .args
+            .iter()
+            .find(|(pb, _)| *pb != header && loop_blocks.contains(pb))
+        else {
+            continue;
+        };
+
+        // Chain: back_val must be defined by an associative binop consuming the
+        // phi result. Allow one intervening copy shape later; v1 keeps it strict.
+        let Some(Inst::Bin { op, a, b, .. }) = def_inst(func, *back_val) else {
+            continue;
+        };
+        let red_op = match op {
+            BinOp::Add => ReductionOp::Add,
+            BinOp::Sub => ReductionOp::Add, // x -= t ≡ sum of negated terms
+            BinOp::Mul => ReductionOp::Mul,
+            _ => continue,
+        };
+        if !((*a == phi.dst) ^ (*b == phi.dst)) {
+            continue; // both/neither operands are the accumulator
+        }
+        // The non-accumulator operand must be loop-invariant OR at least not
+        // depend on the accumulator (it may read arrays — fine).
+        let other = if *a == phi.dst { *b } else { *a };
+        if depends_on(func, other, phi.dst, loop_blocks) {
+            continue;
+        }
+
+        // No OTHER uses of the phi result anywhere except its consumption by
+        // the chain instruction.
+        let mut uses_of_phi = 0u32;
+        for &blk in loop_blocks {
+            let bd = func.block(blk);
+            for inst in &bd.insts {
+                if inst.uses().contains(&phi.dst) {
+                    uses_of_phi += 1;
                 }
-                _ => {}
             }
-            // Count every reference (read or write) of each local touched.
-            for local in inst.local_reads() {
-                *other_uses.entry(local).or_insert(0) += 1;
+            for term_arg in bd.term.forwarded_args() {
+                if *term_arg == phi.dst {
+                    uses_of_phi += 1;
+                }
             }
-            if let Some(w) = inst.local_write() {
-                *other_uses.entry(w).or_insert(0) += 1;
+            for p in &bd.phis {
+                if p.args.iter().any(|(_, v)| *v == phi.dst) && p.dst != phi.dst {
+                    uses_of_phi += 1;
+                }
             }
         }
-    }
+        if uses_of_phi != 1 {
+            continue 'phi_loop;
+        }
 
-    let mut out = Vec::new();
-    for (var, (op, store_count)) in candidates {
-        // Exactly one scalar store per iteration model: we accept one static store;
-        // multiple stores to same var in the body disqualify (ambiguous accumulation).
-        if store_count != 1 {
-            continue;
-        }
-        // No other references beyond that single store's read side is enforced by
-        // op_for having matched the x-op-t shape; any extra uses disqualify.
-        if other_uses.get(&var).copied().unwrap_or(0) > 1 {
-            continue;
-        }
-        out.push(Recognized { var, op });
+        // One accumulation site per iteration: the single defining binop.
+        out.push(Recognized { var: phi.var, op: red_op });
     }
     out.sort_by_key(|r| r.var.0);
     out
 }
 
-/// If `store dst = <value>` has the shape dst op t (or t op dst), return the op.
-fn op_for(func: &FuncIr, val: helix_ir::ValueId, dst: LocalId) -> ReductionOp {
-    use helix_ir::BinOp as B;
-    let Some(Inst::Bin { op, a, b, .. }) = func.inst_defining(val) else {
-        return ReductionOp::Add; // placeholder; caller filters via store_count/use checks
-    };
-    // The accumulator must appear as ONE operand; the other must not involve it.
-    let acc_is_a = func.local_of_value(*a) == Some(dst);
-    let acc_is_b = func.local_of_value(*b) == Some(dst);
-    match op {
-        B::Add => ReductionOp::Add,
-        B::Sub => ReductionOp::Add, // x - t ≡ accumulate negatives (combine still +)
-        B::Mul => ReductionOp::Mul,
-        B::Lt | B::Gt | B::Le | B::Ge => ReductionOp::Add, // comparison result — filtered later by type checks in backend
-        _ => ReductionOp::Add,
+fn def_inst<'f>(func: &'f FuncIr, v: ValueId) -> Option<&'f Inst> {
+    for bd in &func.blocks {
+        if let Some(i) = bd.insts.iter().find(|i| i.dst() == Some(v)) {
+            return Some(i);
+        }
     }
-    .tap_if(|o| matches!(o, ReductionOp::Add | ReductionOp::Mul))
-    .with_guard(acc_is_a || acc_is_b)
+    None
+}
+
+/// Does `v`'s computation (within the loop) transitively involve `target`?
+fn depends_on(
+    func: &FuncIr,
+    v: ValueId,
+    target: ValueId,
+    loop_blocks: &[BlockId],
+) -> bool {
+    let mut seen = HashMap::new();
+    let _ = loop_blocks;
+    dep_walk(func, v, target, &mut seen, 0)
+}
+
+fn dep_walk(
+    func: &FuncIr,
+    v: ValueId,
+    target: ValueId,
+    seen: &mut HashMap<ValueId, bool>,
+    depth: u32,
+) -> bool {
+    if depth > 64 {
+        return true; // conservative
+    }
+    if v == target {
+        return true;
+    }
+    if let Some(hit) = seen.get(&v) {
+        return *hit;
+    }
+    seen.insert(v, false);
+    let result = match def_inst(func, v) {
+        Some(inst) => inst.uses().iter().any(|&u| dep_walk(func, u, target, seen, depth + 1)),
+        None => false, // defined outside the loop or a slot cell — no dependency path here
+    };
+    seen.insert(v, result);
+    result
 }

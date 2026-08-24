@@ -42,9 +42,9 @@ pub fn simplify_cfg(ir: &mut FuncIr) -> ChangeFlag {
         //    and no phi ANYWHERE takes an argument along an edge into t (such
         //    an argument list could not be migrated mechanically here).
         let phi_mentions = |ir: &FuncIr, t: BlockId| -> bool {
-            ir.blocks.iter().any(|b| {
-                b.phis.iter().any(|p| p.args.iter().any(|(f, _)| *f == t))
-            })
+            ir.blocks
+                .iter()
+                .any(|b| b.phis.iter().any(|p| p.args.iter().any(|(f, _)| *f == t)))
         };
         'outer: for bi in 0..ir.blocks.len() {
             let t = match &ir.blocks[bi].term {
@@ -65,7 +65,22 @@ pub fn simplify_cfg(ir: &mut FuncIr) -> ChangeFlag {
             // Splice t's contents after bi's instructions. Because t has
             // exactly one predecessor (bi) and no phis — and no third-party φ
             // takes a value along an edge into t (checked above) — moving its
-            // terminator into bi preserves every edge semantics.
+            // terminator into bi preserves every edge semantics. Phis in
+            // t's SUCCESSORS may list t as their predecessor; retarget those
+            // argument entries to bi, which now owns the edge.
+            {
+                let t_succs: Vec<BlockId> = ir.blocks[ti].term.succs();
+                for s in t_succs {
+                    for p in ir.blocks[s.0 as usize].phis.iter_mut() {
+                        for entry in p.args.iter_mut() {
+                            if entry.0 == t {
+                                entry.0 = BlockId(bi as u32);
+                            }
+                        }
+                        p.args.sort_unstable_by_key(|(b, _)| *b);
+                    }
+                }
+            }
             let tail = std::mem::take(&mut ir.blocks[ti].insts);
             let term = std::mem::replace(&mut ir.blocks[ti].term, Term::Return(None));
             ir.blocks[bi].insts.extend(tail);
@@ -104,12 +119,9 @@ pub fn simplify_cfg(ir: &mut FuncIr) -> ChangeFlag {
                 continue;
             }
             for p in preds {
-                let term = std::mem::replace(
-                    &mut ir.blocks[p.0 as usize].term,
-                    Term::Return(None),
-                );
+                let term = std::mem::replace(&mut ir.blocks[p.0 as usize].term, Term::Return(None));
                 let new_term = match term {
-                    Term::Jump(x, _) if x == BlockId(bi as u32) => Term::Jump(t, Vec::new()),
+                    Term::Jump(x, args) if x == BlockId(bi as u32) => Term::Jump(t, args),
                     Term::Branch { cond, t: tt, f } => Term::Branch {
                         cond,
                         t: if tt == BlockId(bi as u32) { t } else { tt },

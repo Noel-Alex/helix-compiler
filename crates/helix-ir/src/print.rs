@@ -26,7 +26,6 @@
 
 use std::fmt::Write as _;
 
-
 use crate::ir::{BlockId, Constant, FuncIr, Inst, Term};
 
 /// Render a whole function.
@@ -67,12 +66,7 @@ pub fn print_ir(ir: &FuncIr, ssa: bool) -> String {
                         .map(|(from, v)| format!("[bb{}: {}]", from.0, name_of(ir, *v)))
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let _ = writeln!(
-                        out,
-                        "  {} = φ(v{}) {args}",
-                        name_of(ir, p.dst),
-                        p.var.0
-                    );
+                    let _ = writeln!(out, "  {} = φ(v{}) {args}", name_of(ir, p.dst), p.var.0);
                 }
             }
         }
@@ -149,12 +143,14 @@ fn inst_line(ir: &FuncIr, inst: &Inst) -> String {
         Inst::Call(c) => {
             let mut parts: Vec<String> = c.args.iter().map(|v| name_of(ir, *v)).collect();
             for (k, arr) in c.arr_refs.iter().enumerate() {
-                parts.push(if k + 1 == c.arr_refs.len() && c.dst.is_none() && c.args.is_empty() {
-                    // Array-returning callee: destination rendered as output.
-                    format!("out={}", local_name(ir, *arr))
-                } else {
-                    format!("&{}", local_name(ir, *arr))
-                });
+                parts.push(
+                    if k + 1 == c.arr_refs.len() && c.dst.is_none() && c.args.is_empty() {
+                        // Array-returning callee: destination rendered as output.
+                        format!("out={}", local_name(ir, *arr))
+                    } else {
+                        format!("&{}", local_name(ir, *arr))
+                    },
+                );
             }
             let d = match c.dst {
                 Some(d) => format!("{} = ", name_of(ir, d)),

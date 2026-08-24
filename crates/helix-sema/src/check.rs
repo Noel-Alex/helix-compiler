@@ -238,8 +238,18 @@ pub enum TypedExprKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CallTarget {
-    Builtin(Builtin),
-    User { fn_idx: u32, name: String },
+    Builtin {
+        which: Builtin,
+        /// Typed argument subtrees (scalars; len() carries an ArrayRef).
+        args: Vec<TypedExpr>,
+    },
+    User {
+        fn_idx: u32,
+        name: String,
+        /// Typed argument subtrees. Kept in the tree so the IR builder and the
+        /// interpreter can lower/evaluate calls without re-walking source.
+        args: Vec<TypedExpr>,
+    },
 }
 
 impl TypedExpr {
@@ -1159,6 +1169,7 @@ impl FnCtx<'_> {
                 kind: TypedExprKind::Call(CallTarget::User {
                     fn_idx: fi as u32,
                     name: callee.name.clone(),
+                    args: typed_args,
                 }),
             };
         }
@@ -1258,7 +1269,10 @@ impl FnCtx<'_> {
                 TypedExpr {
                     ty: Ty::Unit,
                     span,
-                    kind: TypedExprKind::Call(CallTarget::Builtin(b)),
+                    kind: TypedExprKind::Call(CallTarget::Builtin {
+                        which: b,
+                        args: vec![t],
+                    }),
                 }
             }
             Builtin::Len => {
@@ -1284,7 +1298,14 @@ impl FnCtx<'_> {
                         TypedExpr {
                             ty: Ty::I64,
                             span,
-                            kind: TypedExprKind::Call(CallTarget::Builtin(b)),
+                            kind: TypedExprKind::Call(CallTarget::Builtin {
+                                which: b,
+                                args: vec![TypedExpr {
+                                    ty,
+                                    span: ident.span,
+                                    kind: TypedExprKind::ArrayRef(id),
+                                }],
+                            }),
                         }
                     }
                     other => {
@@ -1307,7 +1328,10 @@ impl FnCtx<'_> {
                     Some(w @ Ty::Array(_)) => TypedExpr {
                         ty: w,
                         span,
-                        kind: TypedExprKind::Call(CallTarget::Builtin(b)),
+                        kind: TypedExprKind::Call(CallTarget::Builtin {
+                            which: b,
+                            args: vec![n],
+                        }),
                     },
                     _ => {
                         self.diags.push(diag(
@@ -1328,7 +1352,10 @@ impl FnCtx<'_> {
                 TypedExpr {
                     ty: t.ty,
                     span,
-                    kind: TypedExprKind::Call(CallTarget::Builtin(b)),
+                    kind: TypedExprKind::Call(CallTarget::Builtin {
+                        which: b,
+                        args: vec![t],
+                    }),
                 }
             }
             Builtin::Sqrt => {
@@ -1344,7 +1371,10 @@ impl FnCtx<'_> {
                 TypedExpr {
                     ty: t.ty,
                     span,
-                    kind: TypedExprKind::Call(CallTarget::Builtin(b)),
+                    kind: TypedExprKind::Call(CallTarget::Builtin {
+                        which: b,
+                        args: vec![t],
+                    }),
                 }
             }
             Builtin::Min | Builtin::Max => {
@@ -1366,7 +1396,10 @@ impl FnCtx<'_> {
                 TypedExpr {
                     ty: a.ty,
                     span,
-                    kind: TypedExprKind::Call(CallTarget::Builtin(b)),
+                    kind: TypedExprKind::Call(CallTarget::Builtin {
+                        which: b,
+                        args: vec![a, c],
+                    }),
                 }
             }
         }
@@ -1507,3 +1540,4 @@ impl InitCx<'_, '_> {
         }
     }
 }
+
