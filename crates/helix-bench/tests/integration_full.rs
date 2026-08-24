@@ -43,24 +43,12 @@ fn require_native() -> Result<(), String> {
 }
 
 /// Runs one HELIX program through parse → sema → IR → analysis → plan → JIT,
-/// returning the printed lines. This is the exact construction the campaign
-/// will use behind [`helix_bench::ExecVariant`]; kept here (not in lib.rs)
-/// until M10 lands, then promoted into `native_variant`.
-#[allow(dead_code)]
-fn run_native(_src: &str) -> Result<Vec<String>, String> {
+/// returning the printed lines. Delegates to the real [`native_variant`]
+/// construction (M10 landed).
+fn run_native(src: &str) -> Result<Vec<String>, String> {
     require_native()?;
-    // TODO(M10-integration): replace with
-    //   let ast = helix_syntax::parse_str(src)?;
-    //   let typed = helix_sema::check(&ast)?;
-    //   let mut funcs = helix_ir::build(&typed);
-    //   for f in &mut funcs { to_ssa(f); verify(f)?; }
-    //   let loops: Vec<_> = funcs.iter().map(find_loops).collect();
-    //   let reports: Vec<_> = ...analyze...;
-    //   let plan = helix_analysis::plan::build_plan(&funcs, &loops, &reports);
-    //   assert_verdicts(&kernel, &reports);
-    //   let jit = helix_backend::JitEngine::compile(&funcs, &plan, false)?;
-    //   jit.run_main()?  → capture prints via host registry
-    unreachable!("wired when helix-backend lands its contracted surface")
+    let native = helix_bench::native_variant(src)?;
+    Ok(native.run_once()?.printed)
 }
 
 #[test]

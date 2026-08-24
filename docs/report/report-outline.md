@@ -1,120 +1,76 @@
-# HELIX Report Outline
+# HELIX Report Outline (map from lab notebook to final write-up)
 
-*Every section maps to material that already exists in this repository. Writing the
-final report is assembly, not archaeology.*
+Every section below can be assembled almost verbatim from existing `docs/` material.
 
-## 1. Introduction (≈2 pages)
-- Problem: sequential numerical code underuses multicore hardware; manual parallelization
-  is error-prone; existing auto-parallelizers are black boxes.
-- Contribution: a complete compiler that *proves* loop safety and *shows its work*
-  (Observatory), from source to x86-64 machine code.
-- Demo teaser: the scale vs recurrence pair (parallelized ×N vs rejected RAW-distance-1).
-- Sources: README.md, docs/notes/lang-spec.md intro.
+## 1. Introduction
+- Motivation: automatic parallelization as the intersection of every compiler course topic.
+- The pitch: sequential source in; *proven* multicore execution or a precise refusal, out.
+- Contributions list (language + full pipeline + dependence engine + Observatory).
+- Source: README.md intro.
 
-## 2. The HELIX Language (≈3 pages)
-- Design goals: small enough to specify completely, rich enough to demo.
-- Grammar (EBNF) + type rules + semantics table → docs/notes/lang-spec.md verbatim.
-- Deliberate restrictions and what they buy:
-  - zero implicit coercions → reduction associativity arguments stay honest;
-  - `f(a,a)` rejected → dependence analysis never guesses about aliasing;
-  - flat arrays → affine subscripts stay exact;
-  - braces mandatory → no dangling-else.
-- Sources: lang-spec.md, examples/*.hx.
+## 2. Language design (HELIX v1)
+- Grammar & typing rules → docs/notes/lang-spec.md (frozen spec, EBNF, type table).
+- Design decisions worth defending:
+  - zero implicit coercions (and why that protects reduction soundness),
+  - braces mandatory / assignment-as-statement (dangling-else & typo classes eliminated),
+  - arrays as fat references, aliasing rejected statically (`f(a,a)`) — deletes alias analysis,
+  - checked semantics by default (div/bounds), saturating casts.
+- Source: lang-spec.md + research/language-spec-review.md.
 
-## 3. Frontend (≈4 pages)
-### 3.1 Lexing
-- hand-written scanner, maximal munch, span tracking, comment nesting rules.
-### 3.2 Parsing
-- recursive descent + Pratt expression parsing; precedence ladder; why assignment is a
-  statement; else-if chains as nested spines.
-- Error handling philosophy: precise spans, "expected X found Y", first-error reporting
-  with carets (screenshot: `helix check examples/type_errors.hx`).
-### 3.3 Semantic analysis
-- two-pass signatures-then-bodies (recursion for free);
-- bidirectional checking with literal adaptation but NO coercions;
-- definite-assignment reality: mandatory initializers make use-before-init structurally
-  impossible (interesting design finding!);
-- all-paths-return structural check.
-- Sources: crates/helix-syntax (86 tests), helix-sema (12 conformance tests).
+## 3. Compiler architecture
+- Pipeline diagram (README) + crate map (10 crates, one concern each).
+- Interface-contract-driven development: how parallel agents built disjoint crates against
+  frozen contracts; deviations tracked. Source: notes/interface-contracts.md + devlog.
 
-## 4. Intermediate Representation & SSA (≈5 pages)
-- CFG construction: diamonds, short-circuit desugaring, dedicated exit blocks.
-- Dominators (CHK) + dominance frontiers + semi-pruned φ placement + renaming.
-- Arrays out of SSA (LLVM precedent); slot-value pre-SSA model → SSA renaming.
-- No out-of-SSA translation: φ → Cranelift block params 1:1 (lost-copy/swap problems
-  delegated to regalloc2).
-- The verifier: dominance, φ arity/pred-match; runs after EVERY pass.
-- Show `helix dump ssa examples/ssa_demo.hx` output (the textbook example).
-- Sources: ssa-notes.md, crates/helix-ir/{dom,ssa,verify}.rs.
+## 4. Frontend
+- Lexer/Pratt parser details; error recovery posture. Source: syntax crate docs + tests.
+- Semantic analysis: bidirectional checking, symbol arenas, definite assignment dataflow,
+  all-paths-return. Source: sema crate module docs + tests/spec_tests.rs.
 
-## 5. Optimizations (≈4 pages)
-- Six passes: const-fold, const-prop(+branch fold+CFG simplify), copy-prop, DCE, CSE, LICM.
-- For each: what it proves, SSA's role, before/after IR snippet from Observatory OPT view.
-- Engineering war stories (great report material):
-  - compact() must renumber φ args too;
-  - branch folding must clone-before-set_term or pred lists corrupt;
-  - multiply-defined ids in DCE.
-- Sources: optimization-passes.md, passmod.rs snapshots, devlog 2026-08-24.
+## 5. Reference interpreter
+- Tree-walking design; exact semantics conformance (srem %, saturating casts, IEEE min/max);
+  checksum definition for cross-backend comparison. Source: engine crate docs.
 
-## 6. Dependence Analysis ⭐ (≈6 pages)
-- Theory: distance/direction vectors, levels, the parallelization theorem.
-- The battery: ZIV → Strong SIV → Weak-Zero → Weak-Crossing → gcd+box; exactness claim
-  for HELIX's grammar; i128 analyzer arithmetic.
-- Reduction recognition checklist + monoid identities + FP honesty clause.
-- Worked examples with real verdicts:
-  - scale.hx → SAFE (table of accesses);
-  - recurrence_reject.hx → RAW dist 1 REJECTED;
-  - dot_reduction.hx → REDUCTION(+);
-  - gcd_box_test.hx → box-intersection decides where GCD alone can't;
-  - stencil_2d_reject.hx → level-2 carried, inner loop still parallel.
-- Loop #N summary-line format (`RAW 0 / WAR 0 / WAW 0 => SAFE`).
-- Sources: dependence-theory.md, deps.rs tests, plan.rs reports.
+## 6. IR and SSA  ⭐ course-core chapter
+- CFG construction: diamonds, short-circuit lowering, early-return exit blocks.
+- CHK dominators, dominance frontiers, semi-pruned SSA, renaming.
+- Why arrays stay out of SSA; φ→Cranelift block params (no out-of-SSA!).
+- Verifier discipline after every pass.
+- Sources: notes/ssa-notes.md + ir crate docs + golden tests.
 
-## 7. Code Generation (≈4 pages)
-- Why Cranelift: JIT speed, safe Rust, clean SSA-with-block-params match.
-- Windows x64 ABI facts learned by experiment (WindowsFastcall ≡ extern "C",
-  BlockArg wrapping, MemFlags redesign, finalize flow) — cite jit_spike.rs as evidence.
-- Checked semantics as guarded branches (div-by-zero, bounds) instead of SEH traps.
-- Builtin lowering choices (sqrt instruction; min/max via select+fcmp for NaN rules).
-- Parity testing vs interpreter (checksums, bit-exactness policy).
-- Sources: docs/research/cranelift-api.md, jit_spike.rs, backend tests.
+## 7. Optimization passes
+- Six passes with before/after evidence. Sources: notes/optimization-passes.md,
+  passmod snapshots (Observatory OPT view screenshots).
 
-## 8. Parallel Runtime (≈4 pages)
-- Two stages measured (scope-spawn vs pool); schedules static/dynamic/guided;
-  libgomp chunk formula; cost gate.
-- False sharing: aligned accumulator cells; measured impact.
-- Reduction combine protocol.
-- Honest expectations: bandwidth ceilings, Amdahl, small-N losses.
-- Env knobs for labs.
-- Sources: parallel-runtime-notes.md, helix-runtime tests (41).
+## 8. Loop dependence analysis  ⭐ the centerpiece chapter
+- Theory: distance/direction vectors, levels, DOALL theorem. → notes/dependence-theory.md.
+- The battery: ZIV → SIV family → gcd+box Diophantine; worked examples per test.
+- Reduction recognition rules + FP honesty clause.
+- Golden verdicts table for all examples (analysis crate tests).
 
-## 9. Evaluation (≈5 pages)
-- Methodology summary (interleaving, CV gating, anti-cheat checksums) → methodology.md.
-- Results tables per kernel × tier × threads; efficiency columns; STREAM-triad context.
-- The three headline narratives:
-  1. interpreter → native: orders of magnitude (with Rust-twin validation);
-  2. unoptimized → optimized native: the passes' measurable value;
-  3. sequential → parallel: scaling curves + the rejected-loop control case.
-- Threats to validity, honestly listed.
-- Sources: docs/benchmarks/data/*.json, figures via tools/plot_bench.py.
+## 9. Code generation
+- CLIF mapping table, WindowsFastcall ABI notes, guarded traps vs SEH.
+- Parallel lowering: body extraction, ctx packing, registry-after-finalize trick.
+- Sources: notes/cranelift-backend-notes.md + backend crate docs.
 
-## 10. The Observatory (≈2 pages)
-- Architecture: artifact JSON contract, server-side layout, offline-first.
-- Phase tour with screenshots; redundant verdict encoding rationale.
-- Sources: artifact-schema.md, web/, dev fixtures.
+## 10. Runtime
+- Pool vs spawn-per-call overhead graph; schedules; false-sharing padding; cost gate.
+- Source: notes/parallel-runtime-notes.md + runtime crate tests.
 
-## 11. Related Work (≈1 page)
-- Allen&Kennedy, Goff/Kennedy/Tseng, Cytron et al., Briggs et al., CHK, LLVM/GCC
-  (-ftree-parallelize-loops, Polly/Graphite), OpenMP semantics; Cranelift/wasmtime.
-- Position: teaching-complete pipeline with exact analysis on a restricted grammar.
+## 11. Evaluation  ⭐
+- Methodology → benchmarks/methodology.md (interleaving, CV gating, anti-cheat checklist).
+- Headline results tables + figures (campaign.json + tools/plot_bench.py outputs).
+- Correctness: selftest gauntlet 16/16 interp-vs-JIT parity.
+- Honest cases: small-N losses, jacobi conservative verdict, sieve stride fix history.
 
-## 12. Conclusions & Future Work (≈1 page)
-- What worked (SSA-native lowering, contracts-first parallel development, verifier spine).
-- Future: privatization/array expansion, while-loops, strided ranges, SIMD,
-  cranelift-object AOT path (already researched).
+## 12. Related work
+- Allen & Kennedy, Goff/Kennedy/Tseng, Cytron SSA, Briggs semi-pruned, CHK dominators,
+  LLVM DependenceAnalysis/Polly, GCC Graphite/parloops, OpenMP semantics.
+
+## 13. Conclusions & future work
+- Two-level affine extension (jacobi), multi-reduction loops (minmax demotion),
+  guided scheduling demos, AOT object emission via cranelift-object.
 
 ## Appendices
-- A: full language spec (lang-spec.md).
-- B: benchmark raw data + regeneration instructions.
-- C: artifact JSON schema (artifact-schema.md).
-- D: build/test reproduction commands (`cargo test --workspace`, `cargo run -p helix-cli`).
+- A: full language spec · B: artifact JSON schema · C: benchmark meta/environment ·
+  D: devlog excerpts showing the engineering process.

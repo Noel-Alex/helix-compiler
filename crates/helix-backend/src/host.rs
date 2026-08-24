@@ -217,6 +217,10 @@ pub extern "C" fn helix_print_bool(v: i64) {
 pub type ArrTag = i64;
 
 static ARR_TABLE: Mutex<HashMap<ArrTag, (i64, i64)>> = Mutex::new(HashMap::new());
+/// Byte length of each live allocation, keyed by tag — lets [`reset_tables`]
+/// free buffers (bench harness runs hundreds of programs in one process;
+/// without reclamation the leaked arrays reach tens of GB).
+static ARR_BYTES: Mutex<HashMap<ArrTag, usize>> = Mutex::new(HashMap::new());
 static NEXT_BUF: Mutex<i64> = Mutex::new(1);
 
 /// Records `(ptr, len)` for an array slot (called by the zeros wrapper).
@@ -230,9 +234,31 @@ pub fn arr_lookup(tag: ArrTag) -> (i64, i64) {
     lock(&ARR_TABLE).get(&tag).copied().unwrap_or((0, 0))
 }
 
-/// Clears every array/context record (test isolation helper).
+/// Frees every recorded allocation and clears all array/context records.
+///
+/// SAFETY-critical contract: only call when NO JITed code is running and no
+/// returned fat pointer will be dereferenced afterwards (i.e. between program
+/// executions — exactly what the bench harness and tests do).
 pub fn reset_tables() {
-    lock(&ARR_TABLE).clear();
+    let table = lock(&ARR_TABLE);
+    let mut bytes = lock(&ARR_BYTES);
+    for (tag, (ptr, _len)) in table.iter() {
+        if *ptr == 0 {
+            continue;
+        }
+        if let Some(&rounded) = bytes.get(tag) {
+            let layout = std::alloc::Layout::from_size_align(rounded, 8)
+                .expect("recorded layout was valid");
+            // SAFETY: ptr came from alloc with this exact layout and has not
+            // been freed before (each tag frees at most once per reset; tags
+            // are reused only after the table is cleared).
+            unsafe {
+                std::alloc::dealloc(ptr as *mut u8, layout);
+            }
+        }
+    }
+    table.clear();
+    bytes.clear();
     *lock(&NEXT_BUF) = 1;
     CAPS_I.lock().map(|mut g| g.clear()).ok();
     CAPS_F.lock().map(|mut g| g.clear()).ok();
@@ -270,8 +296,9 @@ pub extern "C" fn helix_alloc_zeros(len: i64, elem_size: i64, line: i64, tag: i6
     let n_bytes = usize::try_from(len.saturating_mul(elem_size)).unwrap_or(0);
     let rounded = n_bytes.next_multiple_of(8).max(8);
     let layout = std::alloc::Layout::from_size_align(rounded, 8).expect("allocation size");
-    // SAFETY: layout has non-zero size, alignment divides it; leaked by
-    // design (see FFI contract above).
+    // SAFETY: layout has non-zero size, alignment divides it. The buffer lives
+    // until process exit OR until `reset_tables()` reclaims it (the bench
+    // harness calls that between runs to bound memory).
     let ptr = unsafe { std::alloc::alloc(layout) };
     if ptr.is_null() {
         std::alloc::handle_alloc_error(layout);
@@ -280,6 +307,7 @@ pub extern "C" fn helix_alloc_zeros(len: i64, elem_size: i64, line: i64, tag: i6
     unsafe {
         std::ptr::write_bytes(ptr, 0, rounded);
     }
+    lock(&ARR_BYTES).insert(tag, rounded);
     arr_record(tag, ptr as i64, len);
     let buf = next_buf();
     ptr as i64 ^ 0 | buf * 0 + ptr as i64

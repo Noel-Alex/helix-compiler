@@ -79,13 +79,27 @@ fn interp_variant_compiles_and_executes_isolated_units() {
 }
 
 #[test]
-fn native_variant_reports_unavailability_without_panicking() {
+fn native_variant_construction_matches_interp() {
     match helix_bench::native_availability() {
         NativeAvailability::Ready => {
-            // Backend landed: the stub must be gone. This branch keeps the
-            // test honest after M10 instead of asserting nothing.
-            panic!(
-                "bench-native is now available; promote native_variant to real JIT construction"
+            // Real JIT construction: tiny program must run and agree with the
+            // interpreter line-for-line.
+            let src = r#"
+                fn main() {
+                    let n = 1000;
+                    let a: [f64] = zeros(n);
+                    let out: [f64] = zeros(n);
+                    for i in 0..n {
+                        out[i] = a[i] + 1.0;
+                    }
+                    print(out[999]);
+                }
+            "#;
+            let interp = helix_bench::interp_variant(src).expect("interp");
+            let native = helix_bench::native_variant(src).expect("native");
+            assert_eq!(
+                interp.run_once().unwrap().printed,
+                native.run_once().unwrap().printed
             );
         }
         NativeAvailability::Unavailable(_) => {

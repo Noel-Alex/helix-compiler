@@ -145,3 +145,8 @@ pub mod testutil {
         pub const NEG_ZEROS: i64 = 3;
     }
 }
+
+/// Frees all JIT-host allocations between program executions (see
+/// [`engine::reset_host_heap`]). The bench harness calls this after every
+/// timed run so repeated executions do not accumulate arrays.
+pub use engine::reset_host_heap;

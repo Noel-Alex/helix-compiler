@@ -140,6 +140,13 @@ pub struct KernelDef {
     /// Exclude from the timed campaign even though it stays registered
     /// (correctness-only kernels like `fib_recursion`).
     pub correctness_only: bool,
+    /// Largest problem size the INTERPRETER variant is timed at. Interpreting
+    /// millions of iterations costs minutes per sample — the numbers would be
+    /// meaningless and the campaign would stall; at big N only the native
+    /// variants are measured, and the interp/native ratio is taken from the
+    /// largest shared size (this is also methodologically honest: ns/elem
+    /// columns are compared, never absolute wall-times across sizes).
+    pub interp_max_size: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +397,7 @@ pub fn registry() -> Vec<KernelDef> {
             tolerance: Tolerance::Exact,
             expected_printed: &["0.0"],
             correctness_only: false,
+            interp_max_size: 262144,
         },
         KernelDef {
             name: "saxpy",
@@ -401,17 +409,19 @@ pub fn registry() -> Vec<KernelDef> {
             tolerance: Tolerance::Exact,
             expected_printed: &["0.0"],
             correctness_only: false,
+            interp_max_size: 262144,
         },
         KernelDef {
             name: "dot_reduction",
             description: "sum a[i]*b[i] — FP +-reduction",
             perf_source: DOT_SRC.to_string(),
             correctness_source: resize_source(DOT_SRC, &[("n", 4_096)]),
-            sizes: &[65_536, 16_777_216],
+            sizes: &[65_536, 4_194_304],
             expected_verdict: ExpectedVerdict::ReductionParallel,
             tolerance: Tolerance::RelEps(1e-9),
             expected_printed: &["0.0"],
             correctness_only: false,
+            interp_max_size: 400000,
         },
         KernelDef {
             name: "minmax_reduction",
@@ -423,17 +433,19 @@ pub fn registry() -> Vec<KernelDef> {
             tolerance: Tolerance::Exact,
             expected_printed: &["0.0", "0.0"],
             correctness_only: false,
+            interp_max_size: 400000,
         },
         KernelDef {
             name: "count_primes_sieve",
             description: "strided Eratosthenes — outer serial, inner DOALL writes",
             perf_source: SIEVE_SRC.to_string(),
             correctness_source: resize_source(SIEVE_SRC, &[("n", 100)]),
-            sizes: &[100_000, 10_000_000],
+            sizes: &[100_000, 4_000_000],
             expected_verdict: ExpectedVerdict::SafeParallel,
             tolerance: Tolerance::Exact,
             expected_printed: &["25"], // pi(100)
             correctness_only: false,
+            interp_max_size: 100000,
         },
         KernelDef {
             name: "recurrence_reject",
@@ -445,6 +457,7 @@ pub fn registry() -> Vec<KernelDef> {
             tolerance: Tolerance::Exact,
             expected_printed: &["1000"], // a[999] = 1 + 999 steps
             correctness_only: false,
+            interp_max_size: i64::MAX,
         },
         KernelDef {
             name: "small_n",
@@ -457,29 +470,32 @@ pub fn registry() -> Vec<KernelDef> {
             tolerance: Tolerance::Exact,
             expected_printed: &["1.0"],
             correctness_only: false,
+            interp_max_size: 1000,
         },
         KernelDef {
             name: "jacobi_2d",
             description: "5-point Jacobi stencil — level-2 DOALL, DRAM-bound",
             perf_source: JACOBI_SRC.to_string(),
             correctness_source: resize_source(JACOBI_SRC, &[("SIZE", 32), ("ITER", 4)]),
-            sizes: &[512, 4096],
+            sizes: &[512, 1024],
             expected_verdict: ExpectedVerdict::SafeParallel,
             tolerance: Tolerance::Exact,
             expected_printed: &["36.0"], // centre after 4 sweeps of the seeded cell
             correctness_only: false,
+            interp_max_size: 512,
         },
         KernelDef {
             name: "matmul",
             description: "C=A*B naive i-j-k — outer DOALL + inner +-reduction",
             perf_source: MATMUL_SRC.to_string(),
             correctness_source: resize_source(MATMUL_SRC, &[("N", 8)]),
-            sizes: &[128, 512],
+            sizes: &[128, 256],
             expected_verdict: ExpectedVerdict::ReductionParallel,
             tolerance: Tolerance::RelEps(1e-9),
             // Independently recomputed by rust_twins::matmul_centre(8).
             expected_printed: &["1626.625"],
             correctness_only: false,
+            interp_max_size: 128,
         },
         KernelDef {
             name: "fib_recursion",
@@ -491,6 +507,7 @@ pub fn registry() -> Vec<KernelDef> {
             tolerance: Tolerance::Exact,
             expected_printed: &["20001"],
             correctness_only: true,
+            interp_max_size: i64::MAX,
         },
     ]
 }

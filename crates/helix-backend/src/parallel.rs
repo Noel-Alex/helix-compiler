@@ -488,8 +488,11 @@ fn to_an(op: crate::engine::helix_analysis_stub::ReductionOp) -> AnOp {
 }
 
 /// Debug helper: logs a demotion gate (temporary).
-fn gate<T>(_: T, line: u32) -> Option<T> {
-    eprintln!("gate hit at line {line}");
+fn gate<T>(dbg: T, line: u32) -> Option<T> {
+    if std::env::var("HELIX_GATE_DEBUG").is_ok() {
+        eprintln!("gate hit at line {line}");
+    }
+    let _ = dbg;
     None
 }
 

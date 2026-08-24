@@ -108,6 +108,9 @@ pub trait ExecVariant {
         let start = std::time::Instant::now();
         for _ in 0..reps {
             let _ = std::hint::black_box(self.run_once());
+            // Reclaim JIT-host allocations (each run's zeros(n) arrays would
+            // otherwise accumulate across hundreds of timed samples).
+            helix_backend::reset_host_heap();
         }
         start.elapsed()
     }
@@ -200,16 +203,132 @@ pub fn native_availability() -> NativeAvailability {
 
 /// Builds the sequential-native variant for one program, if possible.
 ///
+/// Full pipeline: parse → check → IR build → SSA → loop analysis → parallel
+/// plan → Cranelift compile. Each `run_once` executes the machine code once
+/// (prints captured host-side).
+///
 /// # Errors
-/// Backend unavailability or compile failure, as readable text.
-pub fn native_variant(_src: &str) -> Result<Box<dyn ExecVariant>, String> {
+/// Backend unavailability or any pipeline-stage failure, as readable text.
+pub fn native_variant(src: &str) -> Result<Box<dyn ExecVariant>, String> {
     match native_availability() {
-        NativeAvailability::Ready => Err(
-            "native_variant: JIT construction lands with helix-backend M10 \
-             (JitEngine::compile + ParallelPlan); see docs/notes/interface-contracts.md"
-                .to_string(),
-        ),
+        NativeAvailability::Ready => Ok(Box::new(NativeVariant::new(src, false)?)),
         NativeAvailability::Unavailable(why) => Err(why.to_string()),
+    }
+}
+
+/// JIT-backed [`ExecVariant`] — sequential or parallel per the analysis plan.
+pub struct NativeVariant {
+    src: String,
+    engine: helix_backend::JitEngine,
+    /// "native-seq" or "native-par<P>" — par variants pin HELIX_NTHREADS
+    /// around every execution (the runtime reads it at dispatch time).
+    label: &'static str,
+    /// When Some(p), HELIX_NTHREADS is set to p for each run/batch.
+    threads: Option<usize>,
+}
+
+impl NativeVariant {
+    /// Compile once up front (JIT compilation is measured separately from
+    /// steady-state execution by the sampler's warmup discipline).
+    ///
+    /// # Errors
+    /// Any pipeline stage or backend compile failure, as text.
+    pub fn new(src: &str, unchecked: bool) -> Result<Self, String> {
+        let ast = helix_syntax::parse_str(src).map_err(|e| format!("syntax error: {e}"))?;
+        let typed = helix_sema::check(&ast).map_err(|ds| format!("{ds:#?}"))?;
+        let mut funcs = helix_ir::build(&typed);
+        for f in &mut funcs {
+            helix_ir::to_ssa(f);
+        }
+        let loops: Vec<_> = funcs.iter().map(helix_analysis::find_loops).collect();
+        let reports: Vec<_> = funcs
+            .iter()
+            .zip(&loops)
+            .map(|(f, l)| helix_analysis::analyze(f, l))
+            .collect();
+        let plan = helix_analysis::build_plan(&funcs, &loops, &reports);
+        // Convert to the backend seam type.
+        let mut bplan = helix_backend::ParallelPlan::default();
+        for r in &plan.regions {
+            bplan.regions.push(helix_backend::RegionDesc {
+                func_idx: r.func_idx,
+                header: r.header,
+                kind: match r.kind {
+                    helix_analysis::RegionKind::DoAll => helix_backend::RegionKind::DoAll,
+                    helix_analysis::RegionKind::Reduction(op) => {
+                        helix_backend::RegionKind::Reduction(match op {
+                            helix_analysis::ReductionOp::Add => {
+                                helix_backend::engine::helix_analysis_stub::ReductionOp::Add
+                            }
+                            helix_analysis::ReductionOp::Mul => {
+                                helix_backend::engine::helix_analysis_stub::ReductionOp::Mul
+                            }
+                            helix_analysis::ReductionOp::Min => {
+                                helix_backend::engine::helix_analysis_stub::ReductionOp::Min
+                            }
+                            helix_analysis::ReductionOp::Max => {
+                                helix_backend::engine::helix_analysis_stub::ReductionOp::Max
+                            }
+                        })
+                    }
+                },
+                body_fn_name: r.body_fn_name.clone(),
+            });
+        }
+        let engine = helix_backend::JitEngine::compile(&funcs, &bplan, unchecked)?;
+        Ok(Self {
+            src: src.to_string(),
+            engine,
+            label: "native-seq",
+            threads: None,
+        })
+    }
+
+    /// Same compilation, but executions pin HELIX_NTHREADS=p (the parallel
+    /// variant). The plan is baked at compile time; the runtime honours the
+    /// env override per dispatch, so ONE engine serves the whole sweep.
+    pub fn new_parallel(src: &str, p: usize) -> Result<Self, String> {
+        let mut v = Self::new(src, false)?;
+        v.label = "native-par";
+        v.threads = Some(p);
+        Ok(v)
+    }
+
+    /// One full native execution.
+    ///
+    /// # Errors
+    /// Runtime trap or execution failure, as text.
+    pub fn execute(&self) -> Result<RunOutputLike, String> {
+        helix_backend::engine::arm_trap_recorder();
+        let (printed, result) = helix_backend::engine::capture_prints(|| self.engine.run_main());
+        helix_backend::reset_host_heap(); // reclaim this run's arrays
+        result?;
+        if let Some((code, a, b)) = helix_backend::engine::take_last_trap() {
+            return Err(format!("runtime trap code={code} at ({a},{b})"));
+        }
+        // Match the interpreter's checksum definition loosely: bench parity is
+        // asserted on printed lines; checksums recomputed FNV-1a style here.
+        let mut checksum = 0xcbf29ce484222325u64;
+        for line in &printed {
+            for byte in line.bytes().chain(std::iter::once(b'\n')) {
+                checksum ^= u64::from(byte);
+                checksum = checksum.wrapping_mul(0x100000001b3);
+            }
+        }
+        Ok(RunOutputLike { printed, checksum })
+    }
+}
+
+impl ExecVariant for NativeVariant {
+    fn name(&self) -> &str {
+        self.label
+    }
+
+    fn run_once(&self) -> Result<RunOutputLike, String> {
+        let _guard = self
+            .threads
+            .map(|p| env_guard("HELIX_NTHREADS", &p.to_string()));
+        self.execute()
     }
 }
 
@@ -376,15 +495,37 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
         let src = kernel.source_at_size(*size);
         let mut variants: Vec<Box<dyn ExecVariant>> = Vec::new();
 
-        match interp_variant(&src) {
-            Ok(v) => variants.push(Box::new(v)),
-            Err(e) => panic!(
-                "{}: interpreter compile failed at N={size}: {e}",
-                kernel.name
-            ),
+        // Interpreter only up to `interp_max_size`: interpreting millions of
+        // iterations costs minutes per sample and adds no information (the
+        // interp/native ratio is read from the largest shared size).
+        if *size <= kernel.interp_max_size {
+            match interp_variant(&src) {
+                Ok(v) => variants.push(Box::new(v)),
+                Err(e) => panic!(
+                    "{}: interpreter compile failed at N={size}: {e}",
+                    kernel.name
+                ),
+            }
         }
+        let has_regions = kernel.is_parallel_candidate();
         if let Ok(native) = native_variant(&src) {
             variants.push(native);
+        }
+        // Parallel variant: same compiled plan, executions pin HELIX_NTHREADS
+        // to a mid-range count (the efficiency table carries the full sweep).
+        if has_regions && config.thread_sweep.len() > 1 {
+            let hw = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let p = config
+                .thread_sweep
+                .iter()
+                .copied()
+                .filter(|&x| x > 1)
+                .find(|&x| x >= hw / 2)
+                .unwrap_or(hw.min(config.max_threads).max(2));
+            match NativeVariant::new_parallel(&src, p) {
+                Ok(v) => variants.push(Box::new(v)),
+                Err(_) => {}
+            }
         }
         if variants.is_empty() {
             continue;
@@ -477,35 +618,35 @@ fn sweep_efficiency(src: &str, config: &BenchConfig) -> Vec<EfficiencyRow> {
         return Vec::new();
     }
 
-    // NOTE: until the parallel backend exists the interpreter ignores thread
-    // hints, so every row measures the same serial cost. The p=1 row is
-    // DEFINED as the baseline (speedup exactly 1) rather than measured twice;
-    // higher-p rows are then measured against it and honestly report ~1.0
-    // speedups (E = 1/p) instead of fabricating scaling.
-    let Ok(variant) = interp_variant(src) else {
-        return Vec::new();
-    };
-    let base = timing::measure_with_reps(|r| variant.time_batch(r)).median_ms;
-    ps.iter()
-        .map(|&p| {
-            if p == 1 {
-                EfficiencyRow {
-                    threads: 1,
-                    speedup: 1.0,
-                    efficiency: 1.0,
-                }
-            } else {
-                let _guard = env_guard("HELIX_NTHREADS", &p.to_string());
-                let med = timing::measure_with_reps(|r| variant.time_batch(r)).median_ms;
-                let speedup = base.max(f64::MIN_POSITIVE) / med.max(f64::MIN_POSITIVE);
-                EfficiencyRow {
-                    threads: p,
-                    speedup,
-                    efficiency: speedup / f64::from(p as u32),
-                }
-            }
-        })
-        .collect()
+    // Every row (INCLUDING p=1) gets its own variant whose executions pin
+    // HELIX_NTHREADS=p. Pinning the baseline matters: without it the engine's
+    // baked-in hint (8) would run, and since the env override CAPS the hint,
+    // every p >= 8 would tie the baseline at ~1.0x — exactly the flat-sweep
+    // bug this replaces.
+    let mut rows = Vec::with_capacity(ps.len());
+    let mut base = f64::NAN;
+    for &p in &ps {
+        let Ok(variant) = NativeVariant::new_parallel(src, p) else {
+            return Vec::new();
+        };
+        let med = timing::measure_with_reps(|r| variant.time_batch(r)).median_ms;
+        if p == 1 {
+            base = med;
+            rows.push(EfficiencyRow {
+                threads: 1,
+                speedup: 1.0,
+                efficiency: 1.0,
+            });
+        } else {
+            let speedup = base.max(f64::MIN_POSITIVE) / med.max(f64::MIN_POSITIVE);
+            rows.push(EfficiencyRow {
+                threads: p,
+                speedup,
+                efficiency: speedup / f64::from(p as u32),
+            });
+        }
+    }
+    rows
 }
 
 /// Sets `name=value`, returning a guard restoring the previous value on drop.

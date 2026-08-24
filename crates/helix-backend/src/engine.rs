@@ -247,10 +247,36 @@ extern "C" fn helix_print_bool(v: i64) {
 
 /// Allocates a zero-initialized buffer of `n` elements of `elem_size` bytes.
 ///
-/// Demo-lifetime ownership: buffers are boxed raw and intentionally never
-/// freed — HELIX has no free operation and programs are short-lived demo
-/// runs (documented leak, matching the task contract). Negative lengths are
-/// a trapped runtime error (`NegativeZeros`), mirroring the interpreter.
+/// Live allocations from `helix_zeros`, tracked so [`reset_host_heap`] can
+/// reclaim them. The bench harness runs hundreds of programs per process;
+/// without this table each run's arrays would accumulate (measured: 18 GB
+/// during a full campaign).
+static LIVE_BUFS: std::sync::Mutex<Vec<(i64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Frees every array allocation made by JITed code since the last call, and
+/// clears print/panic/trap state.
+///
+/// # Safety-critical contract
+/// Call ONLY between program executions — never while JITed code is running
+/// and never dereferencing a fat pointer handed out before the reset (the
+/// bench harness and tests satisfy this by construction). Single CLI runs
+/// never need to call it (buffers die with the process).
+pub fn reset_host_heap() {
+    if let Ok(mut bufs) = LIVE_BUFS.lock() {
+        for (ptr, len) in bufs.drain(..) {
+            // SAFETY: `ptr` came from `Vec::into_raw_parts_style` allocation
+            // below with this exact length/capacity and is freed exactly once
+            // (entries are drained under the lock).
+            unsafe {
+                drop(Vec::from_raw_parts(ptr as *mut u8, len, len));
+            }
+        }
+    }
+    LAST_PANIC.lock().map(|mut g| g.take()).ok();
+    TRAP_RECORDER.lock().map(|mut g| *g = (g.0, None)).ok();
+}
+
+/// Allocating variant used by `helix_zeros`: tracks `(ptr, len)` for reclamation.
 extern "C" fn helix_zeros(n: i64, elem_size: i64) -> i64 {
     if n < 0 {
         helix_panic(3, n, 0);
@@ -258,7 +284,11 @@ extern "C" fn helix_zeros(n: i64, elem_size: i64) -> i64 {
     let bytes =
         usize::try_from(n.checked_mul(elem_size).unwrap_or(i64::MAX)).unwrap_or(usize::MAX - 1);
     let vec = vec![0u8; bytes.max(1)]; // ≥1 byte keeps dangling-pointer rules happy at n=0
+    let len = vec.len();
     let ptr = Box::into_raw(vec.into_boxed_slice());
+    if let Ok(mut bufs) = LIVE_BUFS.lock() {
+        bufs.push((ptr as *const u8 as i64, len));
+    }
     ptr as *mut u8 as i64
 }
 
