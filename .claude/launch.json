@@ -2,10 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "observatory",
-      "runtimeExecutable": "cargo",
-      "runtimeArgs": ["run", "-p", "helix-cli", "--release", "--", "observe", "--port", "8931", "--no-open"],
-      "port": 8931
+      "name": "helix-observe",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["web/dev-server.mjs", "8199"],
+      "port": 8199
     }
   ]
 }
