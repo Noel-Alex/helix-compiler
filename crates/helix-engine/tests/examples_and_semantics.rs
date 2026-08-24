@@ -165,15 +165,12 @@ fn row_recurrence_interpreter_semantics() {
 
 #[test]
 fn example_count_primes_sieve_reduced_n() {
-    // NOTE: despite its name/comment, this example is NOT a correct sieve:
-    // the inner loop `for j in i + i..n` marks every index >= 2i (there is
-    // no stride), so the i=2 iteration alone sets composite[4..n) to true
-    // and only 2 and 3 are ever counted. The engine reproduces that
-    // faithfully — the point of the example is dependence structure, not
-    // primality.
+    // The stride-i inner sweep (`j from 2*i step i`, expressed with an
+    // affine subscript since HELIX has no step clause) makes this a REAL
+    // sieve: pi(100) = 25 primes below 100.
     let src = with_n(include_str!("../../../examples/count_primes_sieve.hx"), 100);
     let out = run_src(&src).unwrap();
-    assert_eq!(out.printed, vec!["2"]);
+    assert_eq!(out.printed, vec!["25"]);
 }
 
 #[test]

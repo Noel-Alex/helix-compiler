@@ -61,8 +61,24 @@ pub struct GlobalNames {
 }
 
 /// One linear pass classifying global names (semi-pruned SSA's only dataflow).
+///
+/// Compiler temporaries (`LocalId >= n_source_locals`: `$sc` short-circuit
+/// results, `$ret` return accumulators) are classified like any other
+/// variable — they ARE multi-path globals, and skipping them left them with
+/// several un-merged definitions after renaming.
+///
+/// ARRAY locals are excluded: arrays stay outside SSA by design (their slot
+/// names the fat pointer, never re-bound), and renaming their cell spelling
+/// in call arguments would silently alias them onto an unrelated scalar's
+/// SSA name.
 #[must_use]
 pub fn global_names(ir: &FuncIr) -> GlobalNames {
+    let is_array_local = |l: u32| -> bool {
+        matches!(
+            ir.types.local_ty(LocalId(l)),
+            Some(helix_sema::Ty::Array(_))
+        )
+    };
     let live = crate::dom::reachability(ir);
     let mut set: HashSet<LocalId> = HashSet::new();
     for (bi, block) in ir.blocks.iter().enumerate() {
@@ -71,7 +87,8 @@ pub fn global_names(ir: &FuncIr) -> GlobalNames {
         }
         let mut defs: HashSet<u32> = HashSet::new();
 
-        // Entry phis (no args) are parameter definitions.
+        // Entry phis (no args) are parameter definitions. Array parameters
+        // keep their zero-arg phi as the definition but are NOT renamed.
         for p in &block.phis {
             if p.args.is_empty() {
                 defs.insert(p.var.0);
@@ -82,12 +99,12 @@ pub fn global_names(ir: &FuncIr) -> GlobalNames {
         }
         for inst in &block.insts {
             for u in inst.uses() {
-                if ir.is_slot_value(u) && !defs.contains(&u.0) {
+                if (u.0 as usize) < ir.n_locals && !defs.contains(&u.0) && !is_array_local(u.0) {
                     set.insert(LocalId(u.0));
                 }
             }
             if let Some(d) = inst.dst()
-                && ir.is_slot_value(d)
+                && (d.0 as usize) < ir.n_locals
             {
                 defs.insert(d.0);
             }
@@ -95,18 +112,19 @@ pub fn global_names(ir: &FuncIr) -> GlobalNames {
         match &block.term {
             Term::Jump(_, args) => {
                 for v in args {
-                    if ir.is_slot_value(*v) && !defs.contains(&v.0) {
+                    if (v.0 as usize) < ir.n_locals && !defs.contains(&v.0) && !is_array_local(v.0)
+                    {
                         set.insert(LocalId(v.0));
                     }
                 }
             }
             Term::Branch { cond, .. } => {
-                if ir.is_slot_value(*cond) && !defs.contains(&cond.0) {
+                if (cond.0 as usize) < ir.n_locals && !defs.contains(&cond.0) {
                     set.insert(LocalId(cond.0));
                 }
             }
             Term::Return(Some(v)) => {
-                if ir.is_slot_value(*v) && !defs.contains(&v.0) {
+                if (v.0 as usize) < ir.n_locals && !defs.contains(&v.0) {
                     set.insert(LocalId(v.0));
                 }
             }
@@ -220,25 +238,38 @@ fn set_dst(inst: &mut Inst, new: ValueId) {
 /// Dominator-tree preorder renaming with per-local stacks (iterative, so deep
 /// dominator trees cannot overflow the native stack).
 ///
-/// Only *cell-range* defs participate: a definition whose id is below
-/// `n_source_locals` redefines its source variable and gets a fresh SSA name.
-/// Fresh temporaries (`dst >= n_source_locals`) are already single-assignment,
-/// so they pass through untouched — renaming them would break their uses.
+/// EVERY instruction destination participates — source-variable cells *and*
+/// compiler temporaries (`$sc`, `$ret`). Temporaries were historically left
+/// untouched on the grounds of being single-assignment, but short-circuit
+/// results and return accumulators are defined on MULTIPLE control paths, so
+/// they are ordinary globals and must be renamed and φ-merged like cells.
+///
+/// Uses are rewritten **interleaved** with definitions (classic Cytron):
+/// an instruction's operands see the reaching name at its own program point,
+/// not the block's final stack. This keeps `x = x + 1` self-consistent — the
+/// read resolves to the incoming name, the write mints the next one — and
+/// fixes same-block use-before-redefine sequences.
 fn rename(ir: &mut FuncIr, doms: &crate::dom::Doms) {
-    let n_cells = ir.n_source_locals;
     let cell_stride = ir.max_value_id() + 1;
-    let n_locals = ir.n_locals.max(
+    // Stacks are indexed by LOCAL SLOT id, but temporary VALUES (v3, v4, …)
+    // spell their slot as their own id — the builder allocates temporaries
+    // with LocalId == ValueId. Size the vector over both spaces so every
+    // id in either space has a stack.
+    let n_slots = ir.n_locals.max(cell_stride as usize).max(
         ir.blocks
             .iter()
             .flat_map(|b| b.phis.iter().map(|p| p.var.0 as usize))
             .max()
             .map_or(0, |m| m + 1),
     );
+    let n_cells = ir.n_source_locals;
 
     // Current reaching name of each local (bottom of stack = cell id).
-    let mut stacks: Vec<Vec<u32>> = vec![Vec::new(); n_locals];
-    for st in stacks.iter_mut().take(n_locals.min(n_cells)) {
-        st.push(st.len() as u32); // version 0 = cell id (stack empty ⇒ len 0)
+    // Temporaries get the same treatment as source variables: their id is
+    // version 0, so pre-rename uses resolve and multi-path defs get φs.
+    let mut stacks: Vec<Vec<u32>> = vec![Vec::new(); n_slots];
+    for (idx, st) in stacks.iter_mut().enumerate() {
+        st.push(idx as u32); // version 0 = own id
     }
 
     // Fresh ids start above every existing id (cell ids AND temporaries), so
@@ -248,18 +279,6 @@ fn rename(ir: &mut FuncIr, doms: &crate::dom::Doms) {
     let mut def_map: HashMap<ValueId, ValueId> = HashMap::new();
     let mut undo_log: Vec<Vec<u32>> = vec![Vec::new(); ir.blocks.len()];
     let mut phi_dst_new: HashMap<(usize, u32), u32> = HashMap::new(); // (block idx, var idx) -> new id
-
-    // Pre-collect CELL def sites so Enter pushes them in program order.
-    let sites: Vec<Vec<ValueId>> = ir
-        .blocks
-        .iter()
-        .map(|b| {
-            b.insts
-                .iter()
-                .filter_map(|inst| inst.dst().filter(|d| (d.0 as usize) < n_cells))
-                .collect()
-        })
-        .collect();
 
     enum Step {
         Enter(BlockId),
@@ -289,45 +308,73 @@ fn rename(ir: &mut FuncIr, doms: &crate::dom::Doms) {
                     }
                 }
 
-                // Instructions define afterwards (uses below see the new top).
-                let mut fresh_of_site: Vec<Option<u32>> = Vec::with_capacity(sites[bi].len());
-                for orig in &sites[bi] {
-                    let li = orig.0 as usize;
-                    let Some(ty) = ir.types.val_tys.get(li).copied() else {
-                        fresh_of_site.push(None);
+                // Instructions: rewrite uses at their own program point,
+                // THEN push this instruction's fresh def (Cytron order).
+                // Array-typed values (call arguments naming an array slot)
+                // are NEVER rewritten — arrays stay outside SSA by design,
+                // and rewriting them would alias the array onto a scalar.
+                for ii in 0..ir.blocks[bi].insts.len() {
+                    // 1. Operands see the stack as of *before* this def.
+                    {
+                        let block = &mut ir.blocks[bi];
+                        let inst = &mut block.insts[ii];
+                        inst.rewrite_uses(&mut |v: ValueId| {
+                            let vi = v.0 as usize;
+                            if vi >= n_slots
+                                || matches!(ir.types.val_tys.get(vi), Some(Ty::Array(_)))
+                            {
+                                return v;
+                            }
+                            stacks[vi].last().map_or(v, |top| ValueId(*top))
+                        });
+                    }
+                    // 2. Mint + push the fresh name for this def.
+                    let Some(d) = ir.blocks[bi].insts[ii].dst() else {
                         continue;
                     };
+                    let li = d.0 as usize;
+                    if matches!(ir.types.val_tys.get(li), Some(Ty::Array(_))) {
+                        continue; // array slots keep their single cell name
+                    }
+                    let ty = ir.types.val_tys.get(li).copied().unwrap_or(Ty::I64);
                     let fresh = next_fresh;
                     next_fresh += 1;
                     fresh_ty.insert(fresh, ty);
-                    fresh_of_site.push(Some(fresh));
-                    if let Some(st) = stacks.get_mut(li) {
-                        st.push(fresh);
-                        undo_log[bi].push(orig.0);
-                        def_map.insert(*orig, ValueId(fresh));
+                    if li < stacks.len() {
+                        stacks[li].push(fresh);
+                        undo_log[bi].push(d.0);
+                        def_map.insert(d, ValueId(fresh));
+                    }
+                    set_dst(&mut ir.blocks[bi].insts[ii], ValueId(fresh));
+                }
+
+                // Terminator operands (condition / return value) see the
+                // block-final stack.
+                {
+                    let block = &mut ir.blocks[bi];
+                    match &mut block.term {
+                        Term::Branch { cond, .. } => {
+                            *cond = stacks
+                                .get(cond.0 as usize)
+                                .and_then(|st| st.last())
+                                .map_or(*cond, |top| ValueId(*top));
+                        }
+                        Term::Return(v) => {
+                            if let Some(x) = v {
+                                *x = stacks
+                                    .get(x.0 as usize)
+                                    .and_then(|st| st.last())
+                                    .map_or(*x, |top| ValueId(*top));
+                            }
+                        }
+                        Term::Jump(..) => {} // args rebuilt in apply_renamings
                     }
                 }
 
-                // Rewrite uses inside this block now (stacks are correct
-                // here — that is the whole point of the preorder walk), then
-                // patch each cell def site so the instruction itself carries
-                // its fresh name.
-                rewrite_uses_in_block(ir, b, &stacks);
-                {
-                    let block = &mut ir.blocks[bi];
-                    let mut di = 0usize;
-                    for inst in &mut block.insts {
-                        if inst.dst().is_some_and(|d| (d.0 as usize) < n_cells) {
-                            if let Some(Some(new)) = fresh_of_site.get(di) {
-                                set_dst(inst, ValueId(*new));
-                            }
-                            di += 1;
-                        }
-                    }
-                    for p in block.phis.iter_mut() {
-                        if let Some(new) = phi_dst_new.get(&(bi, p.var.0)) {
-                            p.dst = ValueId(*new);
-                        }
+                // Patch φ destinations to their fresh names.
+                for p in ir.blocks[bi].phis.iter_mut() {
+                    if let Some(new) = phi_dst_new.get(&(bi, p.var.0)) {
+                        p.dst = ValueId(*new);
                     }
                 }
 
@@ -371,43 +418,6 @@ fn rename(ir: &mut FuncIr, doms: &crate::dom::Doms) {
         &fresh_ty,
         &mut def_map,
     );
-}
-
-/// Rewrite every operand use in block `b` through the current stacks.
-fn rewrite_uses_in_block(ir: &mut FuncIr, b: BlockId, stacks: &[Vec<u32>]) {
-    // Jump targets and their phi variables must be snapshotted before the
-    // mutable borrow starts.
-    let jump_phi_vars: Vec<LocalId> = match &ir.blocks[b.0 as usize].term {
-        Term::Jump(t, _) => ir.blocks[t.0 as usize].phis.iter().map(|p| p.var).collect(),
-        _ => Vec::new(),
-    };
-
-    let mut lookup = |v: ValueId| -> ValueId {
-        if let Some(st) = stacks.get(v.0 as usize)
-            && let Some(top) = st.last()
-        {
-            return ValueId(*top);
-        }
-        v
-    };
-
-    let block = &mut ir.blocks[b.0 as usize];
-    for inst in &mut block.insts {
-        inst.rewrite_uses(&mut lookup);
-    }
-    match &mut block.term {
-        Term::Jump(_, args) => {
-            *args = jump_phi_vars.iter().map(|l| lookup(ValueId(l.0))).collect();
-        }
-        Term::Branch { cond, .. } => {
-            *cond = lookup(*cond);
-        }
-        Term::Return(v) => {
-            if let Some(x) = v {
-                *x = lookup(*x);
-            }
-        }
-    }
 }
 
 /// Second phase: install renamed phi destinations, patch predecessor-supplied

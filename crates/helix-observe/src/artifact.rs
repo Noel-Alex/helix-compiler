@@ -131,7 +131,10 @@ pub struct SpanView {
 
 impl From<helix_syntax::Span> for SpanView {
     fn from(s: helix_syntax::Span) -> Self {
-        Self { start: s.start, end: s.end }
+        Self {
+            start: s.start,
+            end: s.end,
+        }
     }
 }
 
@@ -584,7 +587,10 @@ mod tests {
 
     #[test]
     fn verdict_labels_serialize_screaming() {
-        assert_eq!(serde_json::to_string(&VerdictLabel::Safe).unwrap(), "\"SAFE\"");
+        assert_eq!(
+            serde_json::to_string(&VerdictLabel::Safe).unwrap(),
+            "\"SAFE\""
+        );
         assert_eq!(
             serde_json::to_string(&VerdictLabel::Reduction).unwrap(),
             "\"REDUCTION\""

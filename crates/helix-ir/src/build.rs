@@ -517,17 +517,20 @@ impl Builder {
         match target {
             CallTarget::Builtin {
                 which: Builtin::Zeros,
-                ..
+                args,
             } => {
                 // The array lands in the destination cell directly (arrays are
-                // referenced by local slot, never moved as values).
+                // referenced by local slot, never moved as values). The length
+                // operand travels in `args` — the JIT backend needs it to size
+                // the allocation (interpreter reads it from the AST instead).
+                let vals = self.eval_args(args);
                 let out_local = dst
                     .map(|d| LocalId(d.0))
                     .unwrap_or_else(|| alloc_temp(&mut self.ir, "$arr", ret));
                 self.emit(Inst::Call(Call {
                     dst: None,
                     callee: "zeros".into(),
-                    args: Vec::new(),
+                    args: vals,
                     arr_refs: vec![out_local],
                 }));
             }
@@ -572,16 +575,18 @@ impl Builder {
         match s {
             TypedStmt::Let { sym, init, ty, .. } => {
                 let cell = ValueId(sym.0);
-                if init_is_zeros(init) {
+                if let TypedExprKind::Call(
+                    target @ CallTarget::Builtin {
+                        which: Builtin::Zeros,
+                        ..
+                    },
+                ) = &init.kind
+                {
                     // Arrays bind by reference: the call writes the cell.
-                    self.call_expr(
-                        &CallTarget::Builtin {
-                            which: Builtin::Zeros,
-                            args: Vec::new(),
-                        },
-                        *ty,
-                        Some(cell),
-                    );
+                    // Route through call_expr so the length argument is
+                    // evaluated and threaded into the IR (the backend sizes
+                    // the allocation from it).
+                    self.call_expr(target, *ty, Some(cell));
                 } else {
                     self.expr_into(init, cell);
                 }
@@ -808,17 +813,6 @@ impl Builder {
 
         self.cur = exit;
     }
-}
-
-/// Does this expression initialize an array from `zeros(n)`?
-fn init_is_zeros(e: &TypedExpr) -> bool {
-    matches!(
-        &e.kind,
-        TypedExprKind::Call(CallTarget::Builtin {
-            which: Builtin::Zeros,
-            ..
-        })
-    )
 }
 
 /// Scalar type of a value whose recorded type may be missing or array-shaped;

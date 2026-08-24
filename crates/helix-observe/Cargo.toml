@@ -9,9 +9,9 @@ helix-syntax = { workspace = true }
 helix-sema = { workspace = true }
 helix-ir = { workspace = true }
 helix-analysis = { workspace = true }
-helix-backend = { workspace = true }
 helix-engine = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+webbrowser = { workspace = true }

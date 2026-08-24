@@ -445,6 +445,10 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "helix-engine",
+ "helix-ir",
+ "helix-sema",
+ "helix-syntax",
 ]
 
 [[package]]
@@ -504,7 +508,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "helix-analysis",
- "helix-backend",
  "helix-engine",
  "helix-ir",
  "helix-sema",
@@ -512,6 +515,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "webbrowser",
 ]
 
 [[package]]

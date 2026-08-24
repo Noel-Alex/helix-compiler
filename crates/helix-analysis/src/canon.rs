@@ -1,6 +1,22 @@
 //! Canonical loop recovery: find the induction-variable φ, the latch increment,
 //! and the header comparison — turning the IR shape of a `for` back into
 //! (iv, start, end) for analysis and reporting.
+//!
+//! HELIX's builder emits one exact shape per source loop:
+//!
+//! ```text
+//! pre:  iv_cell = start; end_t = eval(end)
+//!       jump hdr
+//! hdr ←──────────────────┐
+//!   iv = φ(pre: iv0,     │
+//!          latch: iv+1)  │
+//!   cond = iv < end_t ───┼──▶ body … jump latch
+//! latch: iv = iv + 1 ────┘   (self-referential spelling — see below)
+//! ```
+//!
+//! The header comparison must involve the φ result; the back-edge operand
+//! must be a `+1` over either the φ result or (the renamer's in-block
+//! spelling of the same increment) the chain's own destination.
 
 use crate::Bound;
 use crate::loops::Loop;
@@ -48,7 +64,14 @@ pub fn canon(func: &FuncIr, lp: &Loop) -> Option<CanonicalLoop> {
             continue;
         };
 
-        // Back-edge def must be phi.dst + const (or const + phi.dst).
+        // Back-edge def must be `<acc> + const` (or const + `<acc>`).
+        //
+        // Two spellings of `<acc>` occur in real IR. The textbook one is the
+        // φ result; but the SSA renamer rewrites a block's uses against the
+        // block's *final* definition stack, so the latch's `i = i + 1` —
+        // whose read and write share one block — surfaces as a
+        // self-referential definition (`dst` appears as its own operand).
+        // Both mean "the previous iteration's value".
         let step = match find_def(func, back) {
             Some(Inst::Bin {
                 op: BinOp::Add,
@@ -56,9 +79,9 @@ pub fn canon(func: &FuncIr, lp: &Loop) -> Option<CanonicalLoop> {
                 b,
                 ..
             }) => {
-                if *a == phi.dst {
+                if *a == phi.dst || *a == back {
                     const_i64(func, *b)
-                } else if *b == phi.dst {
+                } else if *b == phi.dst || *b == back {
                     const_i64(func, *a)
                 } else {
                     None

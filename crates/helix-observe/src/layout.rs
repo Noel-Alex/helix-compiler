@@ -1,19 +1,23 @@
 //! Server-side graph layout: the browser paints coordinates, it never
-//! computes them (`artifact-schema.md` rule). Two tidy algorithms live here.
+//! computes them (`artifact-schema.md` rule: "cfg layout coordinates are
+//! FINAL"). Two tidy algorithms live here.
 //!
-//! * [`ast_tree`] — Reingold–Tilford-flavoured layered tree over the serde
-//!   JSON of a `Program`. Depth ⇒ row (`y`), in-order leaf slots ⇒ column
-//!   (`x`), parents centred over their children. ~60 lines, no dependencies,
-//!   and deterministic for identical trees — golden-test friendly.
-//! * [`cfg_layout`] — longest-path layering from the entry block (backedges
-//!   ignored for layering), DFS-discovery order within each column, block
-//!   boxes sized from their monospace line estimate, straight/elbow/curve
-//!   edge routing with 3-point quadratic beziers for backedges.
+//! * [`ast_tree`] — Reingold–Tilford-flavoured layered tree over the display
+//!   hierarchy produced from a serde `Program`: depth ⇒ row (`y`), in-order
+//!   leaf slots ⇒ column (`x`), parents centred over their children. Small,
+//!   dependency-free, and deterministic for identical trees.
+//! * [`program_to_tree`] — the adapter converting externally-tagged serde
+//!   enum JSON (`{"Bin": ["+", …]}`) into that hierarchy, labelling nodes by
+//!   variant plus a payload summary so the picture reads like the grammar.
+//! * [`cfg_layout`] — per-function CFG layout: longest-path layering from the
+//!   entry block (backedges excluded ⇒ acyclic ⇒ termination), DFS-discovery
+//!   order within each layer, monospace box sizing, and edge routing with
+//!   straight/elbow polylines plus 3-point quadratic curves for backedges.
 //!
-//! All arithmetic is `f64`; every emitted coordinate is checked finite by
-//! [`CompileArtifact`] tests, so NaN can never reach the SVG.
+//! Every coordinate is finite by construction (no division, no trig); the
+//! artifact tests assert this anyway so NaN can never reach the SVG.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::artifact::{BlockRole, CfgEdge, CfgFunction, CfgNode, EdgeKind};
 
@@ -21,22 +25,28 @@ use crate::artifact::{BlockRole, CfgEdge, CfgFunction, CfgNode, EdgeKind};
 // Shared geometry constants
 // ---------------------------------------------------------------------------
 
-/// Horizontal gap between sibling subtrees / CFG columns.
-pub(crate) const COL_GAP: f64 = 46.0;
+/// Horizontal gap between neighbouring leaf slots / CFG columns.
+const COL_GAP: f64 = 46.0;
+/// Minimum horizontal room a leaf claims (its own label must fit).
+const LEAF_MIN_W: f64 = 90.0;
 /// Vertical gap between tree depths / CFG rows.
-pub(crate) const ROW_GAP: f64 = 74.0;
-/// Left/top margin of the canvas.
+const ROW_GAP: f64 = 78.0;
+/// Canvas margin on every side.
 pub(crate) const MARGIN: f64 = 28.0;
 /// Monospace glyph advance used to size CFG boxes (px per char).
 const CHAR_W: f64 = 9.0;
 /// Horizontal padding inside a CFG box.
-const PAD_X: f64 = 24.0;
+const PAD_X: f64 = 28.0;
 /// Line height inside a CFG box.
 const LINE_H: f64 = 18.0;
 /// Vertical padding of a CFG box (title row + bottom air).
 const PAD_Y: f64 = 26.0;
-/// Minimum box width so tiny blocks still fit `"bb0 · exit"`.
+/// Minimum box width so tiny blocks still hold `"bb0 · exit"`.
 const MIN_NODE_W: f64 = 120.0;
+/// Maximum box width; wider lines are clipped by the UI anyway.
+const MAX_NODE_W: f64 = 460.0;
+/// Gap between boxes stacked in the same CFG layer.
+const NODE_GAP_X: f64 = 30.0;
 
 // ---------------------------------------------------------------------------
 // AST tidy tree
@@ -45,36 +55,44 @@ const MIN_NODE_W: f64 = 120.0;
 /// One node of the display hierarchy handed to [`ast_tree`].
 #[derive(Debug, Clone)]
 pub struct TreeNode {
-    /// Short kind label rendered as the primary text (`"FnDef"`, `"Bin(+)"`).
+    /// Primary label (`"FnDef"`, `"Bin(+)"`, `"42"`).
     pub label: String,
-    /// Secondary detail line (`"main"`, literal value, type name).
+    /// Secondary detail line (`"main"`, a type, a literal tag).
     pub detail: String,
     /// Ordered children.
     pub children: Vec<TreeNode>,
 }
 
 impl TreeNode {
-    /// Builds a leaf.
+    /// Builds a leaf (label + optional detail).
     #[must_use]
     pub fn leaf(label: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self { label: label.into(), detail: detail.into(), children: Vec::new() }
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+            children: Vec::new(),
+        }
     }
 
-    /// Builds an internal node from labelled children.
+    /// Builds an internal node.
     #[must_use]
     pub fn node(
         label: impl Into<String>,
         detail: impl Into<String>,
         children: Vec<TreeNode>,
     ) -> Self {
-        Self { label: label.into(), detail: detail.into(), children }
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+            children,
+        }
     }
 }
 
 /// A laid-out tree node: payload plus final canvas coordinates.
 #[derive(Debug, Clone)]
 pub struct LaidOutNode {
-    /// The payload subtree rooted here.
+    /// Payload subtree rooted here.
     pub node: TreeNode,
     /// Final x (column centre), canvas pixels.
     pub x: f64,
@@ -82,50 +100,48 @@ pub struct LaidOutNode {
     pub y: f64,
 }
 
-/// Lay out a tidy tree: depth ⇒ row, in-order leaves ⇒ columns, parents
-/// centred over children (the textbook Reingold–Tilford simplification).
+/// Lay out a tidy tree.
 ///
-/// Returns nodes in preorder; index 0 is always the root.
+/// Leaves claim successive column slots (in-order traversal); an internal
+/// node is centred over its children. Depth `d` lands at row `d`. Returns
+/// nodes in preorder with the root first.
 #[must_use]
 pub fn ast_tree(root: &TreeNode) -> Vec<LaidOutNode> {
     let mut out = Vec::new();
-    if root.label.is_empty() && root.children.is_empty() && root.detail.is_empty() {
-        // Degenerate empty payload still renders one dot rather than nothing.
-    }
-    let mut cursor = 0.0f64; // next free leaf slot
-    layout(root, 0, &mut cursor, &mut out);
+    let mut cursor = MARGIN; // next free leaf-slot centre
+    layout_node(root, 0, &mut cursor, &mut out);
     out
 }
 
-/// Recursive worker: assigns `x` after all children claim leaf slots.
-fn layout(
-    node: &TreeNode,
-    depth: usize,
-    cursor: &mut f64,
-    out: &mut Vec<LaidOutNode>,
-) {
+/// Recursive worker. `cursor` is advanced past everything this subtree uses,
+/// so sibling subtrees can never overlap.
+fn layout_node(node: &TreeNode, depth: usize, cursor: &mut f64, out: &mut Vec<LaidOutNode>) {
     let y = MARGIN + depth as f64 * ROW_GAP;
     if node.children.is_empty() {
-        let x = *cursor;
-        *cursor += COL_GAP.max(90.0); // leaves need room for their own label
-        out.push(LaidOutNode { node: node.clone(), x, y });
+        out.push(LaidOutNode {
+            node: node.clone(),
+            x: *cursor,
+            y,
+        });
+        *cursor += LEAF_MIN_W.max(COL_GAP);
         return;
     }
     let first_child = out.len();
     for child in &node.children {
-        layout(child, depth + 1, cursor, out);
+        layout_node(child, depth + 1, cursor, out);
     }
     let kids = &out[first_child..];
-    let left = kids.first().map_or(0.0, |k| k.x);
-    let right = kids.last().map_or(0.0, |k| k.x);
+    let left = kids.first().map_or(*cursor, |k| k.x);
+    let right = kids.last().map_or(left, |k| k.x);
     let x = (left + right) / 2.0;
-    // A wide internal label may not overlap its left sibling; nudge right.
-    if x < *cursor - 40.0 {
-        *cursor = x + 40.0 + 40.0;
-    } else {
-        *cursor = (*cursor).max(x);
-    }
-    out.insert(first_child, LaidOutNode { node: node.clone(), x, y });
+    out.insert(
+        first_child,
+        LaidOutNode {
+            node: node.clone(),
+            x,
+            y,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -135,21 +151,22 @@ fn layout(
 /// Converts the raw serialized [`helix_syntax::ast::Program`] JSON into the
 /// parent-child hierarchy the AST view draws.
 ///
-/// Externally tagged enums arrive as `{"Variant": payload}` (tuple variants:
-/// payload is an array; struct variants: payload is an object). Labels are
-/// formed from the variant plus a short payload summary so the picture reads
-/// like the grammar.
+/// Externally tagged enums arrive as `{"Variant": payload}` — tuple variants
+/// carry an array payload, struct variants an object. Nodes are labelled by
+/// variant plus a short payload summary (`Let i`, `Bin(*)`, literal values).
+/// Returns `None` only when the JSON is not object-shaped (the caller then
+/// simply omits the AST view).
 #[must_use]
 pub fn program_to_tree(ast_json: &serde_json::Value) -> Option<TreeNode> {
     let items = ast_json.get("items")?.as_array()?;
-    let mut kids = Vec::new();
-    for item in items {
-        match variant_of(item) {
-            ("Fn", payload) => kids.push(fn_def_tree(payload)),
-            ("Const", payload) => kids.push(const_def_tree(payload)),
-            _ => kids.push(generic_tree("Item", item)),
-        }
-    }
+    let kids = items
+        .iter()
+        .map(|item| match variant_of(item) {
+            ("Fn", payload) => fn_def_tree(payload),
+            ("Const", payload) => const_def_tree(payload),
+            _ => generic_tree("Item", item),
+        })
+        .collect();
     Some(TreeNode::node("Program", items.len().to_string(), kids))
 }
 
@@ -157,26 +174,24 @@ pub fn program_to_tree(ast_json: &serde_json::Value) -> Option<TreeNode> {
 /// `("", self)`.
 fn variant_of(value: &serde_json::Value) -> (&str, &serde_json::Value) {
     match value {
-        serde_json::Value::Object(map) => {
-            if map.len() == 1 {
-                let (k, v) = map.iter().next().expect("len == 1");
-                return (k.as_str(), v);
-            }
-            ("", value)
+        serde_json::Value::Object(map) if map.len() == 1 => {
+            let (k, v) = map.iter().next().expect("len == 1");
+            (k.as_str(), v)
         }
         _ => ("", value),
     }
 }
 
-/// `FnDef` → `FnDef name` node with params/ret/body children.
+/// `FnDef` → `FnDef name` node with param/ret/body children.
 fn fn_def_tree(f: &serde_json::Value) -> TreeNode {
     let name = ident_text(f.get("name"));
     let mut kids = Vec::new();
     if let Some(params) = f.get("params").and_then(|p| p.as_array()) {
         for p in params {
-            let pname = ident_text(p.get("name"));
-            let ty = ty_text(p.get("ty"));
-            kids.push(TreeNode::leaf(format!("Param {pname}"), ty));
+            kids.push(TreeNode::leaf(
+                format!("Param {}", ident_text(p.get("name"))),
+                ty_text(p.get("ty")),
+            ));
         }
     }
     if let Some(ret) = f.get("ret") {
@@ -186,116 +201,109 @@ fn fn_def_tree(f: &serde_json::Value) -> TreeNode {
     TreeNode::node("FnDef", name, kids)
 }
 
-/// `ConstDef` → leaf-ish node showing `NAME: ty = value`.
+/// `ConstDef` → node showing `NAME: ty` with the value as detail.
 fn const_def_tree(c: &serde_json::Value) -> TreeNode {
     let name = ident_text(c.get("name"));
     let ty = ty_text(c.get("ty"));
     let val = c
         .get("value")
         .map(literal_text)
-        .unwrap_or_else(|| "?".to_string());
+        .unwrap_or_else(|| "?".into());
     TreeNode::leaf(format!("Const {name}: {ty}"), format!("= {val}"))
 }
 
-/// Renders a `Block`'s statements as child nodes.
+/// Renders a `Block`'s statements as child nodes behind a `Block n` header.
 fn block_children(body: Option<&serde_json::Value>) -> Vec<TreeNode> {
-    let stmts = body
-        .and_then(|b| b.get("stmts"))
-        .and_then(|s| s.as_array())
-        .map_or(&[][..], std::vec::Vec::as_slice);
-    let mut kids = vec![TreeNode::leaf("Block", stmts.len().to_string())];
-    for s in stmts {
+    let stmts = body.and_then(|b| b.get("stmts")).and_then(|s| s.as_array());
+    let mut kids = vec![TreeNode::leaf(
+        "Block",
+        stmts.map_or("0".into(), |a| a.len().to_string()),
+    )];
+    for s in stmts.into_iter().flatten() {
         kids.push(stmt_tree(s));
     }
     kids
 }
 
-/// Statement dispatcher — mirrors `helix_syntax::ast::Stmt` variants.
+/// Statement dispatcher — mirrors `helix_syntax::ast::Stmt`.
 fn stmt_tree(stmt: &serde_json::Value) -> TreeNode {
-    let (variant, payload) = variant_of(stmt);
+    let (variant, p) = variant_of(stmt);
     match variant {
         "Let" => {
             let mut kids = Vec::new();
-            if let Some(ty) = payload.get("ty") {
+            if let Some(ty) = p.get("ty") {
                 kids.push(TreeNode::leaf("Ty", ty_text(Some(ty))));
             }
-            if let Some(init) = payload.get("init") {
+            if let Some(init) = p.get("init") {
                 kids.push(expr_tree(init));
             }
-            TreeNode::node("Let", ident_text(payload.get("name")), kids)
+            TreeNode::node("Let", ident_text(p.get("name")), kids)
         }
-        "Assign" => {
-            let target = payload
-                .get("target")
-                .map(lvalue_tree)
-                .unwrap_or_else(|| TreeNode::leaf("LVal", "?"));
-            let value = payload
-                .get("value")
-                .map(expr_tree)
-                .unwrap_or_else(|| TreeNode::leaf("Expr", "?"));
-            TreeNode::node("Assign", "", vec![target, value])
-        }
+        "Assign" => TreeNode::node(
+            "Assign",
+            "",
+            vec![
+                p.get("target")
+                    .map(lvalue_tree)
+                    .unwrap_or_else(|| TreeNode::leaf("LVal", "?")),
+                p.get("value")
+                    .map(expr_tree)
+                    .unwrap_or_else(|| TreeNode::leaf("Expr", "?")),
+            ],
+        ),
         "If" => {
             let mut kids = vec![
-                payload
-                    .get("cond")
+                p.get("cond")
                     .map(expr_tree)
                     .unwrap_or_else(|| TreeNode::leaf("Cond", "?")),
             ];
-            kids.extend(block_children(payload.get("then_blk")));
-            if let Some(else_part) = payload.get("else_part") {
-                let inner = else_part.get("If").or_else(|| else_part.get("Block"));
-                match inner {
-                    Some(ep) if ep.get("stmts").is_some() => {
-                        kids.extend(block_children(Some(ep)));
+            kids.extend(block_children(p.get("then_blk")));
+            if let Some(ep) = p.get("else_part") {
+                match ep.get("If").or_else(|| ep.get("Block")) {
+                    Some(inner) if inner.get("stmts").is_some() => {
+                        kids.extend(block_children(Some(inner)));
                     }
-                    Some(ep) => kids.push(stmt_tree(ep)),
+                    Some(inner) => kids.push(stmt_tree(inner)),
                     None => kids.push(TreeNode::leaf("Else", "?")),
                 }
             }
             TreeNode::node("If", "", kids)
         }
-        "For" => TreeNode::node(
-            "For",
-            ident_text(payload.get("iv")),
-            vec![
-                payload
-                    .get("start")
+        "For" => {
+            let mut kids = vec![
+                p.get("start")
                     .map(expr_tree)
                     .unwrap_or_else(|| TreeNode::leaf("Start", "?")),
-                payload
-                    .get("end")
-                    .map(|e| expr_tree(e))
+                p.get("end")
+                    .map(expr_tree)
                     .unwrap_or_else(|| TreeNode::leaf("End", "?")),
-            ]
-            .into_iter()
-            .chain(block_children(payload.get("body")))
-            .collect(),
-        ),
-        "Return" => {
-            let kids = payload
-                .get("value")
+            ];
+            kids.extend(block_children(p.get("body")));
+            TreeNode::node("For", ident_text(p.get("iv")), kids)
+        }
+        "Return" => TreeNode::node(
+            "Return",
+            "",
+            p.get("value")
                 .filter(|v| !v.is_null())
                 .map(|v| vec![expr_tree(v)])
-                .unwrap_or_default();
-            TreeNode::node("Return", "", kids)
-        }
-        "Expr" => TreeNode::node("ExprStmt", "", vec![expr_tree(payload)]),
+                .unwrap_or_default(),
+        ),
+        "Expr" => TreeNode::node("ExprStmt", "", vec![expr_tree(p)]),
         "Empty" => TreeNode::leaf("Empty", ""),
         "Block" => TreeNode::node(
             "Block",
             "",
-            payload
-                .get("stmts")
+            p.get("stmts")
                 .and_then(|s| s.as_array())
                 .map(|a| a.iter().map(stmt_tree).collect())
                 .unwrap_or_default(),
         ),
-        other => generic_tree(other, payload),
+        other => generic_tree(other, p),
     }
 }
 
-/// `LValue` → `Var base` / `Index base[expr]`.
+/// `LValue` → `Var base` / `Index base[idx]`.
 fn lvalue_tree(lv: &serde_json::Value) -> TreeNode {
     let base = ident_text(lv.get("base"));
     match lv.get("index").filter(|i| !i.is_null()) {
@@ -304,11 +312,11 @@ fn lvalue_tree(lv: &serde_json::Value) -> TreeNode {
     }
 }
 
-/// Expression dispatcher — mirrors `helix_syntax::ast::Expr` tuple/struct
-/// variants (payload arrays keep field order).
+/// Expression dispatcher — mirrors `helix_syntax::ast::Expr`; tuple variants
+/// address fields positionally, struct variants by name.
 fn expr_tree(expr: &serde_json::Value) -> TreeNode {
-    let (variant, payload) = variant_of(expr);
-    let fields = payload.as_array();
+    let (variant, p) = variant_of(expr);
+    let fields = p.as_array();
     let field = |i: usize| -> Option<&serde_json::Value> {
         fields.and_then(|f| f.get(i)).filter(|v| !v.is_null())
     };
@@ -316,7 +324,7 @@ fn expr_tree(expr: &serde_json::Value) -> TreeNode {
         "IntLit" => TreeNode::leaf(field(0).map(value_text).unwrap_or_default(), "int"),
         "FloatLit" => TreeNode::leaf(field(0).map(value_text).unwrap_or_default(), "float"),
         "Bool" => TreeNode::leaf(field(0).map(value_text).unwrap_or_default(), "bool"),
-        "Var" => TreeNode::leaf(ident_text(Some(payload)), "var"),
+        "Var" => TreeNode::leaf(ident_text(Some(p)), "var"),
         "Unary" => TreeNode::node(
             format!("Un({})", field(0).map(op_symbol).unwrap_or_default()),
             "",
@@ -325,7 +333,7 @@ fn expr_tree(expr: &serde_json::Value) -> TreeNode {
         "Bin" => TreeNode::node(
             format!("Bin({})", field(0).map(op_symbol).unwrap_or_default()),
             "",
-            vec![field(1), field(2)]
+            [field(1), field(2)]
                 .into_iter()
                 .flatten()
                 .map(expr_tree)
@@ -336,20 +344,20 @@ fn expr_tree(expr: &serde_json::Value) -> TreeNode {
             ident_text(field(0)),
             field(1).map(|e| vec![expr_tree(e)]).unwrap_or_default(),
         ),
-        "Call" => {
-            let args = payload
-                .get("args")
+        "Call" => TreeNode::node(
+            format!("{}()", ident_text(p.get("callee"))),
+            "",
+            p.get("args")
                 .and_then(|a| a.as_array())
                 .map(|a| a.iter().map(expr_tree).collect())
-                .unwrap_or_default();
-            TreeNode::node(format!("{}()", ident_text(payload.get("callee"))), "", args)
-        }
+                .unwrap_or_default(),
+        ),
         "Cast" => TreeNode::node(
             "Cast",
             ty_text(field(1)),
             field(0).map(|e| vec![expr_tree(e)]).unwrap_or_default(),
         ),
-        other => generic_tree(other, payload),
+        other => generic_tree(other, p),
     }
 }
 
@@ -357,7 +365,7 @@ fn expr_tree(expr: &serde_json::Value) -> TreeNode {
 fn generic_tree(label: &str, value: &serde_json::Value) -> TreeNode {
     match value {
         serde_json::Value::Array(items) => TreeNode::node(
-            format!("{label}[…]") ,
+            format!("{label}[…]"),
             items.len().to_string(),
             items.iter().map(|v| generic_tree("", v)).collect(),
         ),
@@ -375,7 +383,7 @@ fn generic_tree(label: &str, value: &serde_json::Value) -> TreeNode {
 
 // -- little render helpers ---------------------------------------------------
 
-/// Identifier text (`{name: "x", span…}` → `"x"`).
+/// Identifier text (`{"name":"x","span":…}` → `"x"`).
 fn ident_text(v: Option<&serde_json::Value>) -> String {
     v.and_then(|v| v.get("name"))
         .and_then(|n| n.as_str())
@@ -383,13 +391,10 @@ fn ident_text(v: Option<&serde_json::Value>) -> String {
         .to_string()
 }
 
-/// Type rendering mirroring `Type::render` on the serde shape.
+/// Type rendering mirroring `Type::render` over the serde shape.
 fn ty_text(v: Option<&serde_json::Value>) -> String {
-    let Some(ty) = v else { return "?".to_string() };
+    let Some(ty) = v else { return "?".into() };
     let (variant, payload) = variant_of(ty);
-    if variant.is_empty() {
-        return "?".to_string();
-    }
     match variant {
         "I32" => "i32".into(),
         "I64" => "i64".into(),
@@ -398,6 +403,7 @@ fn ty_text(v: Option<&serde_json::Value>) -> String {
         "Bool" => "bool".into(),
         "Unit" => "()".into(),
         "Array" => format!("[{}]", scalar_name(payload)),
+        "" => "?".into(),
         other => other.to_lowercase(),
     }
 }
@@ -416,13 +422,12 @@ fn scalar_name(v: &serde_json::Value) -> String {
 
 /// Literal payload spelling (`{"Int": 3}` → `"3"`).
 fn literal_text(v: &serde_json::Value) -> String {
-    let (_, payload) = variant_of(v);
-    value_text(payload)
+    value_text(variant_of(v).1)
 }
 
-/// Operator symbol for Un/Bin payloads (`"Add"` → `"+"`).
+/// Operator symbol for `UnOp`/`BinOp` payloads (`"Add"` → `"+"`).
 fn op_symbol(v: &serde_json::Value) -> String {
-    let sym = match variant_of(v).0 {
+    match variant_of(v).0 {
         "Add" => "+",
         "Sub" => "-",
         "Mul" => "*",
@@ -439,8 +444,8 @@ fn op_symbol(v: &serde_json::Value) -> String {
         "Neg" => "-",
         "Not" => "!",
         other => other,
-    };
-    sym.to_string()
+    }
+    .to_string()
 }
 
 /// Any JSON scalar as display text.
@@ -458,96 +463,88 @@ fn value_text(v: &serde_json::Value) -> String {
 // CFG layout
 // ---------------------------------------------------------------------------
 
-/// Input edge before routing (block ids only).
+/// Input edge before routing (ids + classification only).
 #[derive(Debug, Clone)]
 struct RawEdge {
     from: u32,
     to: u32,
     kind: EdgeKind,
-    label: String,
+    label: &'static str,
 }
 
 /// Lays out one function's CFG.
 ///
-/// Algorithm (longest-path layering + barycentre-free DFS ordering):
-///
-/// 1. classify edges (backedge when `to` dominates `from`, i.e. loop latch);
-/// 2. DFS from entry over non-backedges recording discovery order and depth;
-/// 3. `layer[b] = max(layer[pred]) + 1` over discovered preds (backedges
-///    ignored ⇒ acyclic ⇒ termination guaranteed);
-/// 4. within-layer order = DFS discovery order, columns packed left→right;
-/// 5. box size from the widest rendered line, centred in its column.
-///
-/// Edge routing happens after boxes exist so ports sit exactly on borders:
-/// fallthroughs get a straight or elbow polyline, branch arms elbow through
-/// side ports, backedges curve via a sideways control point (3 points ⇒
-/// quadratic bezier in the browser).
+/// Pipeline: classify edges (an edge whose target dominates its source closes
+/// a natural loop ⇒ backedge) → longest-path layering over the remaining
+/// acyclic edge set → DFS-discovery order inside each layer → monospace box
+/// sizing → placement → port-exact edge routing. Runs after SSA + passes, so
+/// φ lines are shown when present.
 #[must_use]
-pub fn cfg_layout(name: &str, ir: &helix_ir::FuncIr, loops: &helix_analysis::LoopInfo) -> CfgFunction {
+pub fn cfg_layout(
+    name: &str,
+    ir: &helix_ir::FuncIr,
+    loops: &helix_analysis::LoopInfo,
+) -> CfgFunction {
     let n = ir.blocks.len();
-
-    // ---- roles + loop membership ------------------------------------------
     let doms = helix_ir::dominators(ir);
-    let mut role = vec![BlockRole::Straight; n];
-    if n > 0 && role[ir.entry.0 as usize] != BlockRole::LoopHeader {
-        role[ir.entry.0 as usize] = BlockRole::Entry;
-    }
 
-    // Innermost loop containing each block (for colour coding + spotlight).
-    let mut loop_of: Vec<Option<usize>> = vec![None; n];
-    for lp in &loops.loops {
-        for b in &lp.blocks {
-            let i = b.0 as usize;
-            if i < n
-                && loop_of[i].is_none_or(|cur| {
-                    loops.loops[cur].depth >= lp.depth
-                })
+    // ---- backedge predicate --------------------------------------------------
+    let mut backedge: HashSet<(u32, u32)> = HashSet::new();
+    for bi in 0..n {
+        for s in ir.succs(helix_ir::BlockId(bi as u32)) {
+            let si = s.0;
+            if si == bi as u32
+                || doms.dominates(helix_ir::BlockId(si), helix_ir::BlockId(bi as u32))
             {
-                loop_of[i] = Some(lp.id);
+                backedge.insert((bi as u32, si));
             }
         }
+    }
+
+    // ---- roles ---------------------------------------------------------------
+    // Priority: loop_header > join > entry/exit, because the UI's spotlight
+    // and colour story key off loops first; a block that both joins edges
+    // and returns still reads best as a join.
+    let mut role = vec![BlockRole::Straight; n];
+    for (bi, r) in role.iter_mut().enumerate() {
+        if matches!(
+            ir.term(helix_ir::BlockId(bi as u32)),
+            helix_ir::Term::Return(_)
+        ) {
+            *r = BlockRole::Exit;
+        }
+        if ir.block(helix_ir::BlockId(bi as u32)).preds.len() > 1 && *r != BlockRole::Exit {
+            *r = BlockRole::Join;
+        }
+    }
+    let mut loop_of: Vec<Option<usize>> = vec![None; n];
+    for lp in &loops.loops {
         let h = lp.header.0 as usize;
         if h < n {
             role[h] = BlockRole::LoopHeader;
         }
-    }
-
-    // ---- edge classification ------------------------------------------------
-    let mut raw_edges: Vec<RawEdge> = Vec::new();
-    for bi in 0..n {
-        let id = helix_ir::BlockId(bi as u32);
-        let term = ir.term(id);
-        match term {
-            helix_ir::Term::Jump(t, _) => raw_edges.push(RawEdge {
-                from: bi as u32,
-                to: t.0,
-                kind: edge_kind(bi as u32, t.0, &doms),
-                label: String::new(),
-            }),
-            helix_ir::Term::Branch { t, f, .. } => {
-                raw_edges.push(RawEdge {
-                    from: bi as u32,
-                    to: t.0,
-                    kind: edge_kind(bi as u32, t.0, &doms),
-                    label: "T".to_string(),
-                });
-                raw_edges.push(RawEdge {
-                    from: bi as u32,
-                    to: f.0,
-                    kind: edge_kind(bi as u32, f.0, &doms),
-                    label: "F".to_string(),
-                });
+        for b in &lp.blocks {
+            let i = b.0 as usize;
+            if i >= n {
+                continue;
             }
-            helix_ir::Term::Return(_) => {
-                role[bi] = BlockRole::Exit;
+            // Keep the deepest (innermost) matching loop.
+            let deeper = loop_of[i].is_none_or(|cur| loops.loops[cur].depth <= lp.depth);
+            if deeper {
+                loop_of[i] = Some(lp.id);
             }
         }
     }
+    // Entry wins last (it is the most navigational of the roles).
+    if n > 0 {
+        role[ir.entry.0 as usize] = BlockRole::Entry;
+    }
 
-    // ---- layering + ordering -------------------------------------------------
-    let (layer, order_pos) = layer_and_order(ir, n);
+    // ---- layering + ordering ---------------------------------------------------
+    let order = discovery_order(ir, n);
+    let layer = longest_path_layers(ir, n, &backedge);
 
-    // ---- box sizing -----------------------------------------------------------
+    // ---- box sizing ------------------------------------------------------------
     let lines_per_block: Vec<Vec<String>> = (0..n)
         .map(|bi| block_lines(ir, helix_ir::BlockId(bi as u32)))
         .collect();
@@ -555,7 +552,7 @@ pub fn cfg_layout(name: &str, ir: &helix_ir::FuncIr, loops: &helix_analysis::Loo
         .iter()
         .map(|lines| {
             let widest = lines.iter().map(String::len).max().unwrap_or(6);
-            (widest as f64 * CHAR_W + PAD_X).clamp(MIN_NODE_W, 460.0)
+            (widest as f64 * CHAR_W + PAD_X).clamp(MIN_NODE_W, MAX_NODE_W)
         })
         .collect();
     let heights: Vec<f64> = lines_per_block
@@ -563,35 +560,37 @@ pub fn cfg_layout(name: &str, ir: &helix_ir::FuncIr, loops: &helix_analysis::Loo
         .map(|lines| lines.len() as f64 * LINE_H + PAD_Y)
         .collect();
 
-    // Column width per layer accommodates its widest box.
+    // Column geometry per layer: widest box defines the column.
     let mut col_w: BTreeMap<u32, f64> = BTreeMap::new();
-    for (bi, &l) in layer.iter().enumerate() {
+    for (bi, l) in layer.iter().enumerate() {
         col_w
-            .entry(l)
+            .entry(*l)
             .and_modify(|w| *w = (*w).max(widths[bi]))
             .or_insert(widths[bi]);
     }
-    let total_w: f64 = col_w.values().sum::<f64>()
-        + col_w.len().saturating_sub(1) as f64 * COL_GAP;
 
-    // ---- place nodes ------------------------------------------------------------
-    let mut cx: Vec<Option<f64>> = vec![None; n];
-    let mut col_cursor: BTreeMap<u32, f64> = BTreeMap::new();
-    for &bi in &order_pos {
+    // ---- place nodes -----------------------------------------------------------
+    // Column left edge for layer L = Σ widths of narrower layers + gaps.
+    let mut prefix: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut acc = MARGIN;
+    for (l, w) in &col_w {
+        prefix.insert(*l, acc);
+        acc += w + COL_GAP;
+    }
+    let mut used_in_col: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut cx = vec![MARGIN; n];
+    for &bi in &order {
         let l = layer[bi];
-        let col_left = col_w.range(..l).map(|(_, w)| *w).sum::<f64>()
-            + col_w.range(..l).count().saturating_sub(1) as f64 * COL_GAP;
-        let slot = col_cursor.entry(l).or_insert(col_left);
-        cx[bi] = Some(*slot + widths[bi] / 2.0);
-        *slot += widths[bi] + COL_GAP.min(18.0); // intra-column stacking offset
+        let col_left = prefix.get(&l).copied().unwrap_or(MARGIN);
+        let slot = used_in_col.entry(l).or_insert(col_left);
+        cx[bi] = *slot + widths[bi] / 2.0;
+        *slot += widths[bi] + NODE_GAP_X;
     }
 
     let mut nodes = Vec::with_capacity(n);
     for bi in 0..n {
-        let w = widths[bi];
-        let h = heights[bi];
-        let centre = cx[bi].unwrap_or(MARGIN + w / 2.0);
-        let x = (MARGIN + centre - w / 2.0).max(0.0);
+        let (w, h) = (widths[bi], heights[bi]);
+        let x = (cx[bi] - w / 2.0).max(0.0);
         let y = MARGIN + layer[bi] as f64 * ROW_GAP;
         nodes.push(CfgNode {
             id: format!("bb{bi}"),
@@ -605,111 +604,135 @@ pub fn cfg_layout(name: &str, ir: &helix_ir::FuncIr, loops: &helix_analysis::Loo
         });
     }
 
-    // ---- route edges ---------------------------------------------------------------
-    let edges: Vec<CfgEdge> = raw_edges
-        .iter()
-        .map(|e| route_edge(e, &nodes))
-        .collect();
+    // ---- route edges -------------------------------------------------------------
+    let mut raw_edges: Vec<RawEdge> = Vec::new();
+    for bi in 0..n {
+        match ir.term(helix_ir::BlockId(bi as u32)) {
+            helix_ir::Term::Jump(t, _) => raw_edges.push(RawEdge {
+                from: bi as u32,
+                to: t.0,
+                kind: classify(bi as u32, t.0, &backedge),
+                label: "",
+            }),
+            helix_ir::Term::Branch { t, f, .. } => {
+                raw_edges.push(RawEdge {
+                    from: bi as u32,
+                    to: t.0,
+                    kind: classify(bi as u32, t.0, &backedge),
+                    label: "T",
+                });
+                raw_edges.push(RawEdge {
+                    from: bi as u32,
+                    to: f.0,
+                    kind: classify(bi as u32, f.0, &backedge),
+                    label: "F",
+                });
+            }
+            helix_ir::Term::Return(_) => {}
+        }
+    }
+    let edges: Vec<CfgEdge> = raw_edges.iter().map(|e| route_edge(e, &nodes)).collect();
 
-    CfgFunction { name: name.to_string(), nodes, edges }
+    CfgFunction {
+        name: name.to_string(),
+        nodes,
+        edges,
+    }
 }
 
-/// Fallthrough unless the edge closes a natural loop (`to` dominates `from`).
-fn edge_kind(from: u32, to: u32, doms: &helix_ir::Doms) -> EdgeKind {
-    let (f, t) = (helix_ir::BlockId(from), helix_ir::BlockId(to));
-    if from >= to || doms.dominates(t, f) {
+/// Backedge test shared by layering and routing.
+fn classify(from: u32, to: u32, backedge: &HashSet<(u32, u32)>) -> EdgeKind {
+    if backedge.contains(&(from, to)) {
         EdgeKind::Backedge
     } else {
         EdgeKind::Fallthrough
     }
 }
 
-/// Longest-path layering from entry over forward edges only, plus DFS
-/// discovery order. Iterative DFS — deep chains must not blow the stack.
-fn layer_and_order(ir: &helix_ir::FuncIr, n: usize) -> (Vec<u32>, Vec<usize>) {
-    let mut order: Vec<usize> = Vec::new();
+/// DFS preorder over successor lists, entry first, then any unreachable
+/// blocks in id order (they still deserve rectangles). Iterative — deep
+/// chains cannot blow the native stack.
+fn discovery_order(ir: &helix_ir::FuncIr, n: usize) -> Vec<usize> {
+    let mut out = Vec::with_capacity(n);
     let mut seen = vec![false; n];
-    let mut stack: Vec<(usize, usize)> = if n == 0 { Vec::new() } else { vec![(ir.entry.0 as usize, 0)] };
-    if n > 0 {
-        seen[ir.entry.0 as usize] = true;
-    }
-    while let Some(&(b, ref mut _c)) = stack.last().copied().as_mut().map(|_| stack.last().copied().expect("checked")).as_mut() {
-        let (_b, ci) = stack.last_mut().expect("nonempty");
-        let succs = ir.succs(helix_ir::BlockId(_b as u32)).to_vec();
-        if ci < succs.len() {
-            *stack.last_mut().expect("nonempty") = (_b, ci + 1);
-            let s = succs[ci].0 as usize;
-            if !seen[s] {
-                seen[s] = true;
-                stack.push((s, 0));
-            }
-        } else {
-            stack.pop();
-            order.push(_b);
+    let mut stack: Vec<usize> = Vec::new();
+    for root in 0..n {
+        if seen[root] {
+            continue;
         }
-    }
-    // Any block unreachable from entry still deserves a rectangle.
-    for bi in 0..n {
-        if !seen[bi] {
-            seen[bi] = true;
-            order.push(bi);
-        }
-    }
-    order.reverse(); // discovery order (preorder)
-
-    // Longest path over forward edges, relaxing in discovery order.
-    let pos: Vec<usize> = {
-        let mut p = vec![usize::MAX; n];
-        for (i, &b) in order.iter().enumerate() {
-            p[b] = i;
-        }
-        p
-    };
-    let mut layer = vec![0u32; n];
-    for &b in &order {
-        let lb = layer[b];
-        for s in ir.succs(helix_ir::BlockId(b as u32)) {
-            let si = s.0 as usize;
-            // Ignore backedges (target already ordered before us in a loop).
-            if pos[si] != usize::MAX && pos[si] < pos[b] && si != b {
-                continue;
-            }
-            if layer[si] < lb + 1 {
-                layer[si] = lb + 1;
+        seen[root] = true;
+        stack.push(root);
+        while let Some(b) = stack.pop() {
+            out.push(b);
+            // Reverse-push keeps successor visit order = terminator order.
+            for s in ir.succs(helix_ir::BlockId(b as u32)).iter().rev() {
+                let si = s.0 as usize;
+                if !seen[si] {
+                    seen[si] = true;
+                    stack.push(si);
+                }
             }
         }
     }
-    (layer, order)
+    out
 }
 
-/// Rendered instruction lines of one block (phis first, terminator last) —
-/// the same content `print_ir` writes, minus headers/preds noise.
+/// Longest-path layering: `layer[s] ≥ layer[b] + 1` for every forward edge.
+///
+/// Relax Bellman-Ford style (bounded by block count — the forward-edge graph
+/// is acyclic, so this converges quickly). Backedges are skipped, which is
+/// exactly what breaks the cycle and keeps loop bodies beside their header.
+fn longest_path_layers(
+    ir: &helix_ir::FuncIr,
+    n: usize,
+    backedge: &HashSet<(u32, u32)>,
+) -> Vec<u32> {
+    let mut layer = vec![0u32; n];
+    for _round in 0..n.max(1) {
+        let mut changed = false;
+        for b in 0..n {
+            let lb = layer[b];
+            for s in ir.succs(helix_ir::BlockId(b as u32)) {
+                let si = s.0 as usize;
+                if backedge.contains(&(b as u32, s.0)) || layer[si] > lb {
+                    continue;
+                }
+                layer[si] = lb + 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    layer
+}
+
+/// Rendered instruction lines of one block (φs first, terminator last) — the
+/// same content `print_ir` writes, minus the `fn`/`bbN:` scaffolding.
 fn block_lines(ir: &helix_ir::FuncIr, b: helix_ir::BlockId) -> Vec<String> {
-    use std::fmt::Write as _;
     let block = ir.block(b);
     let mut lines = Vec::new();
     for p in &block.phis {
-        let args = p
-            .args
-            .iter()
-            .map(|(from, v)| format!("[bb{}: v{}]", from.0, v.0))
-            .collect::<Vec<_>>()
-            .join(" ");
         if p.args.is_empty() {
             lines.push(format!("v{} = param", p.dst.0));
         } else {
-            let mut l = format!("v{} = φ({args})", p.dst.0);
-            let _ = write!(l, "");
-            lines.push(l);
+            let args = p
+                .args
+                .iter()
+                .map(|(from, v)| format!("[bb{}: v{}]", from.0, v.0))
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(format!("v{} = φ {args}", p.dst.0));
         }
     }
     for inst in &block.insts {
-        lines.push(print_inst_short(inst));
+        lines.push(inst_line_short(inst));
     }
     match ir.term(b) {
         helix_ir::Term::Jump(t, _) => lines.push(format!("jump bb{}", t.0)),
         helix_ir::Term::Branch { t, f, .. } => {
-            lines.push(format!("branch ? bb{} : bb{}", t.0, f.0))
+            lines.push(format!("branch ? bb{} : bb{}", t.0, f.0));
         }
         helix_ir::Term::Return(None) => lines.push("return".to_string()),
         helix_ir::Term::Return(Some(v)) => lines.push(format!("return v{}", v.0)),
@@ -717,103 +740,126 @@ fn block_lines(ir: &helix_ir::FuncIr, b: helix_ir::BlockId) -> Vec<String> {
     lines
 }
 
-/// Compact instruction spelling for box lines (no local-name resolution —
-/// ids stay stable and short enough for the monospace estimate).
-fn print_inst_short(i: &helix_ir::Inst) -> String {
+/// Compact instruction spelling for box lines. Ids stay numeric (stable,
+/// short) — full pretty names live in the IR panes.
+fn inst_line_short(i: &helix_ir::Inst) -> String {
     match i {
-        helix_ir::Inst::Const { dst, .. } => format!("v{} = const …", dst.0),
-        helix_ir::Inst::Bin { op, dst, .. } => {
-            format!("v{} = bin {} …", dst.0, op.symbol())
+        helix_ir::Inst::Const { dst, c } => format!("v{} = const {}", dst.0, const_text(c)),
+        helix_ir::Inst::Bin { op, dst, a, b } => {
+            format!("v{} = {} v{}, v{}", dst.0, op.symbol(), a.0, b.0)
         }
-        helix_ir::Inst::Unary { op, dst, .. } => format!("v{} = {} …", dst.0, op.symbol()),
-        helix_ir::Inst::Cast { dst, .. } => format!("v{} = cast …", dst.0),
-        helix_ir::Inst::Load(l) => format!("v{} = load …", l.dst.0),
-        helix_ir::Inst::Store { arr, .. } => format!("store [l{}] …", arr.0),
-        helix_ir::Inst::Call(c) => match c.dst {
-            Some(d) => format!("v{} = call {}", d.0, c.callee),
-            None => format!("call {}", c.callee),
-        },
+        helix_ir::Inst::Unary { op, dst, a } => format!("v{} = {} v{}", dst.0, op.symbol(), a.0),
+        helix_ir::Inst::Cast { dst, val, to } => {
+            format!("v{} = cast v{} as {}", dst.0, val.0, to.name())
+        }
+        helix_ir::Inst::Load(l) => format!("v{} = load v{}", l.dst.0, l.idx.0),
+        helix_ir::Inst::Store { idx, val, .. } => format!("store [..] = v{}, v{}", idx.0, val.0),
+        helix_ir::Inst::Call(c) => {
+            let args = c
+                .args
+                .iter()
+                .map(|a| format!("v{}", a.0))
+                .collect::<Vec<_>>();
+            match c.dst {
+                Some(d) => format!("v{} = call {}({})", d.0, c.callee, args.join(",")),
+                None => format!("call {}({})", c.callee, args.join(",")),
+            }
+        }
+    }
+}
+
+/// Constant rendering kept deliberately terse for box lines.
+fn const_text(c: &helix_ir::Constant) -> String {
+    match c {
+        helix_ir::Constant::I64(v) => v.to_string(),
+        helix_ir::Constant::I32(v) => format!("{v}i"),
+        helix_ir::Constant::F32(v) => format!("{v:?}f"),
+        helix_ir::Constant::F64(v) => format!("{v:?}"),
+        helix_ir::Constant::Bool(b) => b.to_string(),
     }
 }
 
 /// Routes one edge around/through the placed boxes.
+///
+/// * **Fallthrough**: vertical straight line when aligned, otherwise a soft
+///   4-point elbow dropping out of the source bottom into the target top.
+/// * **Branch**: leaves through a side port (true = right wall, false = left
+///   wall) so the two arms never overlap; same-row targets are entered
+///   through their facing wall.
+/// * **Backedge**: 3 points `[start, control, end]` — the browser draws a
+///   quadratic bezier bowing past the right side of both boxes.
 fn route_edge(e: &RawEdge, nodes: &[CfgNode]) -> CfgEdge {
+    let id = |i: u32| format!("bb{i}");
     let (Some(a), Some(b)) = (nodes.get(e.from as usize), nodes.get(e.to as usize)) else {
         return CfgEdge {
-            from: format!("bb{}", e.from),
-            to: format!("bb{}", e.to),
+            from: id(e.from),
+            to: id(e.to),
             kind: e.kind,
             points: Vec::new(),
-            label: String::new(),
+            label: e.label.to_string(),
         };
     };
 
-    let a_bottom = (a.x + a.w / 2.0, a.y + a.h);
-    let b_top = (b.x + b.w / 2.0, b.y);
-
-    if matches!(e.kind, EdgeKind::Backedge) {
-        // Curve out to the side: start at the source's bottom-right corner
-        // region, bow past the right of both boxes, re-enter the header's top.
-        let bulge_x = a.x + a.w + 34.0;
-        let mid_y = (a_bottom.1 + b_top.1) / 2.0;
-        let start = (a.x + a.w, a.y + a.h * 0.75);
-        let end = (b.x + b.w, b.y + b.h * 0.25);
-        let ctrl = (bulge_x.max(start.0 + 30.0), mid_y);
-        return CfgEdge {
-            from: a.id.clone(),
-            to: b.id.clone(),
-            kind: e.kind,
-            points: vec![[start.0, start.1], [ctrl.0, ctrl.1], [end.0, end.1]],
-            label: e.label.clone(),
-        };
-    }
-
-    if matches!(e.kind, EdgeKind::Branch) {
-        // Branch arms leave through side ports so T/F never overlap.
-        let same_row = (a.y - b.y).abs() < 1.0;
-        let start_x = if e.label == "F" { a.x } else { a.x + a.w };
-        let start_y = a.y + a.h * 0.5;
-        let end_x = b.x + b.w / 2.0;
-        let end_y = b.y;
-        let pts = if same_row {
-            // Sideways hop on one row: enter through the facing wall.
-            let ex = if start_x < b.x { b.x } else { b.x + b.w };
-            vec![
-                [start_x, start_y],
-                [(start_x + ex) / 2.0, start_y],
-                [ex, b.y + b.h * 0.5],
-            ]
-        } else {
-            // Elbow: out of the side, drop below the source row, into the top.
-            vec![
-                [start_x, start_y],
-                [start_x, (start_y + end_y) / 2.0],
-                [end_x, end_y],
-            ]
-        };
-        return CfgEdge {
-            from: a.id.clone(),
-            to: b.id.clone(),
-            kind: e.kind,
-            points: pts,
-            label: e.label.clone(),
-        };
-    }
-
-    // Plain fallthrough: straight when aligned, else a soft elbow.
-    let dx = b_top.0 - a_bottom.0;
-    let dy = b_top.1 - a_bottom.1;
-    let points = if dx.abs() < 4.0 {
-        vec![[a_bottom.0, a_bottom.1], [b_top.0, b_top.1]]
-    } else {
-        let bend_y = a_bottom.1 + dy * 0.55;
-        vec![[a_bottom.0, a_bottom.1], [a_bottom.0, bend_y], [b_top.0, bend_y], [b_top.0, b_top.1]]
-    };
-    CfgEdge {
-        from: a.id.clone(),
-        to: b.id.clone(),
-        kind: e.kind,
-        points,
-        label: String::new(),
+    match e.kind {
+        EdgeKind::Backedge => {
+            let start = [a.x + a.w, a.y + a.h * 0.7];
+            let end = [b.x + b.w, b.y + b.h * 0.25];
+            let bulge_x = (start[0] + 34.0).max(end[0] + 34.0);
+            let ctrl = [bulge_x, (start[1] + end[1]) / 2.0];
+            CfgEdge {
+                from: a.id.clone(),
+                to: b.id.clone(),
+                kind: e.kind,
+                points: vec![start, ctrl, end],
+                label: e.label.to_string(),
+            }
+        }
+        EdgeKind::Branch => {
+            let start_x = if e.label == "F" { a.x } else { a.x + a.w };
+            let start = [start_x, a.y + a.h * 0.5];
+            let same_row = (a.y - b.y).abs() < 1.0;
+            let points = if same_row {
+                // Sideways hop: enter through the facing wall of the target.
+                let end_x = if start_x < b.x { b.x } else { b.x + b.w };
+                let mid_x = (start_x + end_x) / 2.0;
+                let end_y = b.y + b.h * 0.5;
+                vec![start, [mid_x, start[1]], [mid_x, end_y], [end_x, end_y]]
+            } else {
+                // Elbow out of the side wall, drop past the source row,
+                // enter the target top.
+                let mid_y = a.y + a.h + (b.y - a.y - a.h).max(0.0) / 2.0 + LINE_H / 2.0;
+                vec![
+                    start,
+                    [start[0], mid_y],
+                    [b.x + b.w / 2.0, mid_y],
+                    [b.x + b.w / 2.0, b.y],
+                ]
+            };
+            CfgEdge {
+                from: a.id.clone(),
+                to: b.id.clone(),
+                kind: e.kind,
+                points,
+                label: e.label.to_string(),
+            }
+        }
+        EdgeKind::Fallthrough => {
+            let start = [a.x + a.w / 2.0, a.y + a.h];
+            let end = [b.x + b.w / 2.0, b.y];
+            let dx = end[0] - start[0];
+            let points = if dx.abs() < 4.0 {
+                vec![start, end]
+            } else {
+                let bend_y = start[1] + (end[1] - start[1]).max(0.0) * 0.55 + LINE_H / 2.0;
+                vec![start, [start[0], bend_y], [end[0], bend_y], end]
+            };
+            CfgEdge {
+                from: a.id.clone(),
+                to: b.id.clone(),
+                kind: e.kind,
+                points,
+                label: String::new(),
+            }
+        }
     }
 }

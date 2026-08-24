@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "helix-observe",
-      "runtimeExecutable": "node",
-      "runtimeArgs": ["web/dev-server.mjs", "8199"],
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-p", "helix-observe", "--", "--port", "8199", "--no-open"],
       "port": 8199
     }
   ]
