@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Parallel-plan seam (RegionDesc/ReductionOp) and the fork/join runtime.
+helix-analysis = { workspace = true }
+helix-runtime = { workspace = true }
 helix-ir = { workspace = true }
 helix-sema = { workspace = true }
 cranelift = { workspace = true }

@@ -47,6 +47,9 @@
 
 pub mod engine;
 pub mod lower;
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub mod parallel;
 
 /// M0 de-risk spike: proves the pinned cranelift 0.135 JIT flow works on this
 /// machine (Windows x64, MSVC ABI). Kept as a permanent regression net.

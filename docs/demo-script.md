@@ -1,97 +1,84 @@
-# HELIX Live-Demo Script
-
-*A 10-minute presentation flow, ordered for maximum impact. Rehearse once with real
-numbers; fill the blanks from the latest benchmark campaign.*
+# HELIX Demo Script (10-minute presentation flow)
 
 ## Setup (before audience)
 
 ```bash
-cargo build --release
-# Terminal 1: Observatory
-./target/release/helix observe --port 8931
-# Browser: http://127.0.0.1:8931  (works offline)
+cargo build --release -p helix-cli
 ```
 
-## Beat 1 — The hook (90 s)
+Two terminals:
+1. `target/release/helix observe --port 8931` — Observatory
+2. spare terminal for CLI demos
 
-Open **scale.hx** in the Observatory SOURCE phase:
+Browser on the Observatory. Have [examples/](../examples/) open in an editor.
 
-```helix
-for i in 0..n { out[i] = a[i] * 5.0; }
+## Beat 1 — The hook (2 min)
+
+> *"I wrote a compiler that reads ordinary sequential code and decides — by proving
+> theorems about arrays — which loops can run on all 32 of these cores."*
+
+In the Observatory, open **scale**. Walk the pipeline chips left→right:
+
+- **SOURCE**: trivial loop, nothing special.
+- **TOKENS/AST**: "the compiler builds a tree…"
+- **CFG**: basic blocks; point at the back edge (amber curve) — "that's the loop".
+- **SSA**: φ-functions at joins.
+- **LOOP ANALYSIS**: green card — `✓ PARALLELIZED × N THREADS`.
+
+## Beat 2 — The rejection (the money shot, 3 min)
+
+Open **recurrence_reject**:
+
 ```
-
-> "Ordinary sequential code. Watch what the compiler does with it."
-
-Click compile → pipeline animation runs → land on **LOOP ANALYSIS**:
-green card, `✓ PARALLELIZED × N THREADS`, accesses listed, `RAW 0 / WAR 0 / WAW 0`.
-
-## Beat 2 — The rejection (90 s) ← the money shot
-
-Switch to **recurrence_reject.hx**:
-
-```helix
 for i in 1..n { a[i] = a[i - 1] + 1; }
 ```
 
-Red dashed card, hazard stripes: `✗ REJECTED — RAW a[i] ← a[i-1], distance 1`.
+LOOP ANALYSIS now shows the red dashed card:
 
-> "Iteration 42 writes what iteration 43 reads. There is no way around the physics —
-> this loop is *provably* serial. The compiler didn't guess; it solved the equation
-> `i' − i = 1` and checked feasibility."
+> ✗ SEQUENTIAL — RAW a[i] ← a[i−1] (distance 1)
 
-## Beat 3 — The proof machinery (2 min)
+> *"Iteration i+1 needs the value iteration i just wrote. No amount of cores helps —
+> this is a data dependence, and the compiler PROVED it. This is the same analysis
+> production compilers do — GCD test, Banerjee inequalities, SIV subscripts."*
 
-Walk the stepper backwards: **SSA** phase — point at φ nodes.
-**CFG** phase — show the loop header/latch/exit and the back-edge arc.
-**OPT** phase — show a pass that shrank the IR (`insts 42 → 37`).
+Show `gcd_box_test` too: "here the cheap tests are inconclusive, so my analyzer solves
+the Diophantine equation and intersects solution family with the trip-count box."
 
-> "Everything on screen is computed by the same compiler you're reading the source of."
+## Beat 3 — Reductions (2 min)
 
-## Beat 4 — Reductions (90 s)
+Open **dot_reduction**: blue card, `Σ+ REDUCTION`.
 
-**dot_reduction.hx**: blue card `Σ+ REDUCTION — private accumulator per thread`.
-Explain: looks like distance-1 RAW on `dot`, but `+` is associative → split per thread,
-combine at join. FP honesty clause in one sentence.
+> *"`dot += a[i]*b[i]` looks sequential but isn't: plus is associative, so each thread
+> sums a private partial and we combine at the end. My compiler recognizes this shape
+> and lowers it to per-thread accumulators — false-sharing-padded to 128 bytes."*
 
-## Beat 5 — Numbers (2 min)
-
-BENCH phase bars + terminal table from `helix bench`:
-
-| tier | median |
-|---|---|
-| interpreter | ___ |
-| native seq | ___ |
-| native par ×N | ___ |
-
-Headline: "___× vs interpreter, ___× parallel speedup at N threads — and we reach
-___% of this machine's measured memory bandwidth." Show the small-N honest case
-where threading loses.
-
-## Beat 6 — Safety net (60 s)
+## Beat 4 — Proof of correctness + speed (2 min)
 
 Terminal:
 
 ```bash
-helix run examples/div_guard.hx     # -7 % 2 == -1 …
-helix check examples/type_errors.hx # caret diagnostics
+helix selftest
 ```
 
-> "Checked semantics everywhere: bounds, division, saturating casts — identical in the
-> interpreter and the JIT because both share one spec."
+> *"Every example runs through BOTH the interpreter I wrote as a reference and the JIT
+> — outputs must match bit-for-bit."*
 
-## Beat 7 — Close (30 s)
+Then run the campaign numbers (BENCH phase in the UI): interpreter vs native vs parallel,
+with efficiency columns and the honest small-N case where threading loses.
 
-> "A complete compiler — lexer to machine code — whose headline feature is proving
-> which loops are safe for all your cores, and showing you the proof. 243 tests,
-> every stage inspectable. Thank you."
+## Beat 5 — Architecture tour for questions (1 min)
 
-## Q&A ammunition
+- `docs/research/` — verified Aug-2026 research digests (Cranelift APIs, dependence theory)
+- `docs/decisions/` — every design decision recorded
+- `docs/notes/` — course notes per topic (SSA, dependence theory, passes, runtime)
+- 393+ tests across 10 crates
 
-- *"How do you know it's safe?"* → dependence battery is exact for our grammar;
-  anything unproven stays serial (conservative by construction).
-- *"What about aliasing?"* → rejected statically: `f(a,a)` won't type-check.
-- *"Why Cranelift?"* → SSA block params ≈ our φs 1:1; safe Rust; JIT latency fine.
-- *"FP reductions deterministic?"* → integer/min/max bit-exact; FP +/* documented
-  order-unspecified (same as OpenMP).
-- *"Test coverage?"* → 243 tests incl. differential interpreter-vs-JIT and adversarial
-  verifier passes.
+## Anticipated questions
+
+- **"Why not LLVM?"** — Cranelift gives fast JIT compilation (ms not seconds), tiny deps,
+  block params = our phis 1:1. LLVM would dominate codegen effort over analysis effort.
+- **"Is this real SSA?"** — semi-pruned SSA (Briggs et al.) built via CHK dominators +
+  iterated dominance frontiers; verified after every pass.
+- **"What can't it parallelize?"** — flattened 2D stencil subscripts are non-affine in one
+  level (honestly reported); arbitrary pointers don't exist in HELIX by design.
+- **"FP reductions deterministic?"** — no, documented OpenMP-style; integers/min/max exact.

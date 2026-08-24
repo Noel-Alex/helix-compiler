@@ -40,6 +40,9 @@ mod scope_stage;
 
 pub mod schedule;
 
+pub use pool::BodyFn;
+pub use registry::CombineFn;
+
 use std::hint;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Mutex;

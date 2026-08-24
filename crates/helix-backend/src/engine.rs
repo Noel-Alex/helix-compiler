@@ -294,24 +294,44 @@ pub struct JitEngine {
 impl JitEngine {
     /// Compiles every function of `program` into one JIT module and finalizes.
     ///
-    /// `plan`'s regions are reserved for M10; today only emptiness matters
-    /// (empty ⇒ fully sequential lowering; non-empty is rejected until the
-    /// parallel milestone implements region extraction). `unchecked` strips
-    /// bounds checks (`--unchecked`); division guards always remain.
+    /// `plan`'s approved loops become extracted body functions dispatched
+    /// through the helix-runtime fork/join machinery ([`crate::parallel`]);
+    /// regions whose shape the transform cannot express are silently demoted
+    /// to the sequential lowering. `unchecked` strips bounds checks
+    /// (`--unchecked`); division guards always remain.
     ///
     /// # Errors
     /// Any CLIF/module-level failure (verification, define, finalize), or a
-    /// missing `main`, or a non-empty plan.
+    /// missing `main`.
     pub fn compile(
         program: &[FuncIr],
         plan: &ParallelPlan,
         unchecked: bool,
     ) -> Result<JitEngine, String> {
-        if !plan.regions.is_empty() {
-            return Err("parallel regions are not implemented yet (M10); \
-                 pass an empty ParallelPlan"
-                .into());
+        // ---- plan preparation -------------------------------------------------
+        // Extract every expressible region up front; parents with at least one
+        // surviving region get the dispatch hook during lowering, everything
+        // else lowers exactly as before.
+        let regions = crate::parallel::prepare(plan, program);
+        let mut hooks: HashMap<usize, crate::parallel::RtHook> = HashMap::new();
+        let mut bodies: Vec<crate::parallel::BodyArtifact> = Vec::new();
+        for r in &regions {
+            hooks
+                .entry(r.func_idx)
+                .or_insert_with(|| crate::parallel::RtHook::of(r));
+            let body = r
+                .body
+                .clone()
+                .expect("prepare keeps extractable regions only");
+            bodies.push(crate::parallel::BodyArtifact {
+                name: r.body_fn_name.clone(),
+                ir: body,
+                prebind: r.array_prebind.clone(),
+            });
+            crate::parallel::register_spec(r.region_id, r.spec_meta());
         }
+        // Dispatcher metadata must exist even for regions that later fail to
+        // compile — registration above happens once per surviving region.
 
         // --- flags + ISA + builder (jit-minimal.rs skeleton) ---------------
         let mut flag_builder = settings::builder();
@@ -330,6 +350,9 @@ impl JitEngine {
         for (name, ptr) in HostRt::symbols() {
             jb.symbol(name, ptr);
         }
+        for (name, ptr) in crate::parallel::host_symbols() {
+            jb.symbol(name, ptr);
+        }
         let mut module = JITModule::new(jb);
 
         // --- declare every function first (cross-references need ids) ------
@@ -344,6 +367,19 @@ impl JitEngine {
             fn_sigs.push(sig.clone());
             sigs_by_name.insert(f.name.clone(), sig);
             funcs.insert(f.name.clone(), fid);
+        }
+
+        // Declare extracted parallel-region bodies: `extern "C" fn(i64 iter,
+        // i64 ctx)` — two I64 params, no returns (WindowsFastcall == Rust's
+        // extern "C" on this target).
+        let body_sig = crate::parallel::body_signature();
+        for body in &bodies {
+            let name = &body.name;
+            let fid = module
+                .declare_function(name, Linkage::Local, &body_sig)
+                .map_err(|e| format!("declaring region body '{name}': {e}"))?;
+            sigs_by_name.insert(name.clone(), body_sig.clone());
+            funcs.insert(name.clone(), fid);
         }
 
         // Declare the host builtins this program can reach.
@@ -367,17 +403,31 @@ impl JitEngine {
             funcs.insert((*name).to_string(), fid);
         }
 
+        // Declare the dispatch-ABI host symbols (stash/dispatch/readback and
+        // the body-context imports extracted regions call).
+        for name in crate::parallel::HOST_SYMBOL_NAMES {
+            let Some(sig) = lower::builtin_signature(name) else {
+                return Err(format!("internal: no dispatch-ABI signature for {name}"));
+            };
+            let fid = module
+                .declare_function(name, Linkage::Import, &sig)
+                .map_err(|e| format!("declaring dispatch symbol '{name}': {e}"))?;
+            sigs_by_name.insert((*name).to_string(), sig);
+            funcs.insert((*name).to_string(), fid);
+        }
+
         // --- translate + define bodies -------------------------------------
-        for (f, sig) in program.iter().zip(fn_sigs) {
+        for (fi, f) in program.iter().enumerate() {
             let mut ctx = module.make_context();
-            ctx.func.signature = sig;
-            lower::translate_fn(
+            ctx.func.signature = fn_sigs[fi].clone();
+            lower::translate_fn_rt(
                 f,
                 unchecked,
                 &mut ctx.func,
                 &mut module,
                 &funcs,
                 &sigs_by_name,
+                hooks.remove(&fi),
             )?;
             let fid = funcs[&f.name];
             // Verify first so failures carry a precise CLIF location instead
@@ -391,9 +441,57 @@ impl JitEngine {
             module.clear_context(&mut ctx);
         }
 
+        // Extracted region bodies: lowered with array fat pointers prebound to
+        // their ctx slots (no zeros call runs inside the region).
+        for body in &bodies {
+            let mut ctx = module.make_context();
+            ctx.func.signature = crate::parallel::body_signature();
+            lower::translate_body_fn(
+                &body.ir,
+                unchecked,
+                &mut ctx.func,
+                &mut module,
+                &funcs,
+                &sigs_by_name,
+                &body.prebind,
+            )?;
+            let fid = funcs[&body.name];
+            if let Err(errs) = ctx.verify(module.isa()) {
+                return Err(format!("verifying region body '{}': {errs:?}", body.name));
+            }
+            module
+                .define_function(fid, &mut ctx)
+                .map_err(|e| format!("defining region body '{}': {e}", body.name))?;
+            module.clear_context(&mut ctx);
+        }
+
         module
             .finalize_definitions()
             .map_err(|e| format!("finalizing definitions: {e}"))?;
+
+        // --- register region bodies/combines AFTER finalize ------------------
+        // Contract rule: never embed or share pointers before their addresses
+        // exist; registry entries are keyed by the same ids baked into the
+        // parent's dispatch calls.
+        let _registered = {
+            let mut reg = Vec::with_capacity(regions.len());
+            for r in &regions {
+                let Some(fid) = funcs.get(&r.body_fn_name) else {
+                    continue;
+                };
+                let ptr = module.get_finalized_function(*fid);
+                debug_assert!(!ptr.is_null(), "region body finalized");
+                // SAFETY: `ptr` is a finalized `extern "C" fn(i64, *mut u8)`
+                // emitted from `body_signature` (see above); transmute mirrors
+                // `run_main`'s established pattern.
+                let body_fn: helix_runtime::BodyFn =
+                    unsafe { std::mem::transmute::<*const u8, helix_runtime::BodyFn>(ptr) };
+                helix_runtime::register_body(r.region_id, body_fn);
+                helix_runtime::register_combine(r.region_id, crate::parallel::combine_for(r.kind));
+                reg.push(r.region_id);
+            }
+            reg
+        };
 
         let main_fid = funcs
             .get("main")

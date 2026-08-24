@@ -445,8 +445,10 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "helix-analysis",
  "helix-engine",
  "helix-ir",
+ "helix-runtime",
  "helix-sema",
  "helix-syntax",
 ]

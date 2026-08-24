@@ -141,6 +141,9 @@ pub fn signature_of(ir: &FuncIr) -> Signature {
 ///
 /// Kept declarative (one function per row) so codegen never hand-builds a
 /// signature at a call site; `docs/research/cranelift-api.md` recommendation 4.
+/// Rows below the separator belong to the parallel-region dispatch ABI (see
+/// [`crate::parallel`]): parent-side stash/dispatch/readback plus the
+/// body-context imports extracted regions call.
 #[must_use]
 pub fn builtin_signature(name: &str) -> Option<Signature> {
     let mut s = Signature::new(CALL_CONV);
@@ -172,9 +175,82 @@ pub fn builtin_signature(name: &str) -> Option<Signature> {
             s.params.push(AbiParam::new(types::I64)); // aux a
             s.params.push(AbiParam::new(types::I64)); // aux b
         }
+        // ---- parallel-region dispatch ABI ---------------------------------
+        "helix_stash_i" => {
+            s.params.push(AbiParam::new(types::I64)); // packed word index
+            s.payload_int();
+        }
+        "helix_stash_f" => {
+            s.params.push(AbiParam::new(types::I64)); // packed word index
+            s.params.push(AbiParam::new(types::F64)); // payload (widened)
+        }
+        "helix_stash_arr" => {
+            s.params.push(AbiParam::new(types::I64)); // layout slot
+            s.params.push(AbiParam::new(types::I64)); // data pointer
+            s.params.push(AbiParam::new(types::I64)); // length
+        }
+        "helix_dispatch" => {
+            s.params.push(AbiParam::new(types::I64)); // start
+            s.params.push(AbiParam::new(types::I64)); // end
+            s.params.push(AbiParam::new(types::I64)); // region id
+            s.params.push(AbiParam::new(types::I64)); // nthreads hint
+            s.returns.push(AbiParam::new(types::I64)); // context handle
+        }
+        "helix_read_i64" => read_sig(&mut s, types::I64),
+        "helix_read_i32" => read_sig(&mut s, types::I32),
+        "helix_read_f64" => read_sig(&mut s, types::F64),
+        "helix_read_f32" => read_sig(&mut s, types::F32),
+        // ---- body-context imports -----------------------------------------
+        "helix_ld_i64" | "helix_acc_ptr" => ld_sig(&mut s, types::I64),
+        "helix_ld_i32" => ld_sig(&mut s, types::I32),
+        "helix_ld_f64" => ld_sig(&mut s, types::F64),
+        "helix_ld_f32" => ld_sig(&mut s, types::F32),
+        "helix_acc_load_i64" => acc_load_sig(&mut s, types::I64),
+        "helix_acc_load_i32" => acc_load_sig(&mut s, types::I32),
+        "helix_acc_load_f64" => acc_load_sig(&mut s, types::F64),
+        "helix_acc_load_f32" => acc_load_sig(&mut s, types::F32),
+        "helix_acc_store_i64" => acc_store_sig(&mut s, types::I64),
+        "helix_acc_store_i32" => acc_store_sig(&mut s, types::I32),
+        "helix_acc_store_f64" => acc_store_sig(&mut s, types::F64),
+        "helix_acc_store_f32" => acc_store_sig(&mut s, types::F32),
         _ => return None,
     }
     Some(s)
+}
+
+/// `(word, payload:i64)` stash row helper.
+trait StashSig {
+    fn payload_int(&mut self);
+}
+impl StashSig for Signature {
+    fn payload_int(&mut self) {
+        self.params.push(AbiParam::new(types::I64));
+    }
+}
+
+/// `(handle) -> value` readback row.
+fn read_sig(s: &mut Signature, ret: Type) {
+    s.params.push(AbiParam::new(types::I64));
+    s.returns.push(AbiParam::new(ret));
+}
+
+/// `(cell, offset) -> value` shared-ctx load row.
+fn ld_sig(s: &mut Signature, ret: Type) {
+    s.params.push(AbiParam::new(types::I64)); // participant cell
+    s.params.push(AbiParam::new(types::I64)); // byte offset
+    s.returns.push(AbiParam::new(ret));
+}
+
+/// `(cell) -> value` private-accumulator load row.
+fn acc_load_sig(s: &mut Signature, ret: Type) {
+    s.params.push(AbiParam::new(types::I64)); // participant cell
+    s.returns.push(AbiParam::new(ret));
+}
+
+/// `(cell, value)` private-accumulator store row.
+fn acc_store_sig(s: &mut Signature, arg: Type) {
+    s.params.push(AbiParam::new(types::I64)); // participant cell
+    s.params.push(AbiParam::new(arg)); // payload
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +297,8 @@ struct Lw<'m> {
     /// (see the module docs, "Same-block self-use repair"). The CLIF param
     /// is appended lazily when the owning block's terminator is translated.
     self_uses: HashMap<ValueId, SelfUse>,
+    /// Parallel-region hook for THIS function (`None` = sequential lowering).
+    rt: Option<crate::parallel::RtHook>,
 }
 
 /// Translates `ir` into the prepared (empty-bodied) CLIF `func`.
@@ -236,6 +314,22 @@ pub fn translate_fn(
     module: &mut JITModule,
     imports: &HashMap<String, FuncId>,
     sigs: &HashMap<String, Signature>,
+) -> Result<(), String> {
+    translate_fn_rt(ir, unchecked, func, module, imports, sigs, None)
+}
+
+/// [`translate_fn`] with an optional parallel-region hook (see
+/// [`crate::parallel`]): when set for the function owning `hook.header`, that
+/// header's terminator becomes a stash→dispatch→readback sequence jumping to
+/// the loop exit, and every block reachable only through the loop is skipped.
+pub(crate) fn translate_fn_rt(
+    ir: &FuncIr,
+    unchecked: bool,
+    func: &mut cranelift::codegen::ir::Function,
+    module: &mut JITModule,
+    imports: &HashMap<String, FuncId>,
+    sigs: &HashMap<String, Signature>,
+    rt: Option<crate::parallel::RtHook>,
 ) -> Result<(), String> {
     // Snapshot before the builder takes its exclusive borrow of `func`.
     let ret_tys: Vec<Type> = func
@@ -283,6 +377,7 @@ pub fn translate_fn(
         imports,
         sigs,
         self_uses: collect_self_uses(ir),
+        rt,
     };
 
     // Import helix_panic EAGERLY: guards create the panic block lazily, but
@@ -359,8 +454,34 @@ pub fn translate_fn(
         }
     }
 
+    // ---- parallel-region bookkeeping -----------------------------------------
+    // When a region replaces this function's loop: blocks inside the loop span
+    // that are NOT the header become orphans (unreachable after the dispatch
+    // jump) and are skipped entirely below. Orphans are exactly the natural-
+    // loop members minus the header — exact for the canonical `for` shape;
+    // regions with exotic control flow never reach the hook because extraction
+    // demotes them.
+    let rt_header: Option<usize> = lw.rt.as_ref().map(|h| h.header.0 as usize);
+    let mut orphans: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    if let Some(hook) = &lw.rt {
+        let doms = helix_ir::dominators(ir);
+        if let Some((_, body)) = helix_ir::natural_loops(ir, &doms)
+            .into_iter()
+            .find(|(h, _)| *h == hook.header)
+        {
+            for b in body {
+                if b != hook.header {
+                    orphans.insert(b.0 as usize);
+                }
+            }
+        }
+    }
+
     // ---- translate every block in id order ----------------------------------
     for bi in 0..ir.blocks.len() {
+        if orphans.contains(&bi) {
+            continue;
+        }
         let clif = lw.blocks[bi].clif;
         // The entry block is already current (parameters + zero prebinds were
         // just emitted into it); switching to a filled block is an error.
@@ -368,9 +489,6 @@ pub fn translate_fn(
             builder.switch_to_block(clif);
         }
 
-        // Same-block self-use repair: append the extra block parameter BEFORE
-        // the instructions so `lookup_scalar` can resolve their cyclic
-        // operands to it (the parameter IS the phi-merged incoming value).
         // Same-block self-use repair: append the extra block parameter BEFORE
         // the instructions so `lookup_scalar` can resolve their cyclic
         // operands to it (the parameter IS the phi-merged incoming value).
@@ -390,10 +508,30 @@ pub fn translate_fn(
                 lw.vals.insert(p.dst, cv);
             }
         }
+        // PREBIND every other block's φ results too: a terminator may reference
+        // a φ defined in a block translated LATER in id order (forward edge
+        // reference — e.g. bb3's `jump bb1(v34)` names v34, the φ of bb6). The
+        // CLIF block params were appended for ALL blocks before translation,
+        // so their value handles are already valid; binding early keeps
+        // `edge_value` from silently fabricating zeros for definitions that
+        // have not been translated yet.
+        for oj in 0..ir.blocks.len() {
+            if oj == bi || oj == ir.entry.0 as usize || orphans.contains(&oj) {
+                continue;
+            }
+            let params = lw.blocks[oj].phi_params.clone();
+            for (p, cv) in ir.blocks[oj].phis.iter().zip(params) {
+                lw.vals.entry(p.dst).or_insert(cv);
+            }
+        }
         for inst in &ir.blocks[bi].insts.clone() {
             translate_inst(&mut builder, &mut lw, inst)?;
         }
-        translate_term(&mut builder, &mut lw, bi)?;
+        if rt_header == Some(bi) {
+            emit_region_dispatch(&mut builder, &mut lw)?;
+        } else {
+            translate_term(&mut builder, &mut lw, bi)?;
+        }
     }
 
     // ---- shared panic block (created on demand by guards) -------------------
@@ -1019,6 +1157,21 @@ fn translate_call(
         "min" | "max" => {
             return translate_minmax(b, lw, call, marshalled);
         }
+        // ---- parallel-region body-context imports --------------------------
+        // Extracted bodies unpack their context through these; the byte offset
+        // rides in `arr_refs[0]` (the established side-channel for constants).
+        c if c.starts_with("helix_ld_") || c.starts_with("helix_acc_") => {
+            let fref = import_in_func(b, lw, c)?;
+            let inst = b.ins().call(fref, &marshalled);
+            if let Some(dst) = call.dst {
+                let v = *b
+                    .inst_results(inst)
+                    .first()
+                    .ok_or_else(|| format!("'{c}' returned no value"))?;
+                lw.vals.insert(dst, v);
+            }
+            return Ok(());
+        }
         _ => import_in_func(b, lw, &call.callee)?, // user function
     };
 
@@ -1177,6 +1330,270 @@ fn ir_val_ty(lw: &Lw<'_>, v: ValueId) -> Ty {
     lw.ir.types.val_ty(v).unwrap_or(Ty::I64)
 }
 
+// ---------------------------------------------------------------------------
+// Parallel-region dispatch emission
+// ---------------------------------------------------------------------------
+
+/// Host symbols used by the dispatch sequence (implemented in
+/// [`crate::parallel`], registered on the JITBuilder like every other import).
+const STASH_I_SYM: &str = "helix_stash_i";
+/// Float capture stash.
+const STASH_F_SYM: &str = "helix_stash_f";
+/// Array fat-pointer stash.
+const STASH_ARR_SYM: &str = "helix_stash_arr";
+/// Region dispatcher.
+const DISPATCH_SYM: &str = "helix_dispatch";
+/// Reduction readback imports.
+const READ_I64_SYM: &str = "helix_read_i64";
+/// Narrow integer readback.
+const READ_I32_SYM: &str = "helix_read_i32";
+/// f64 readback.
+const READ_F64_SYM: &str = "helix_read_f64";
+/// f32 readback.
+const READ_F32_SYM: &str = "helix_read_f32";
+
+/// CLIF signature for one fixed host dispatch-ABI symbol.
+pub(crate) fn rt_signature(name: &str) -> Option<Signature> {
+    let mut s = Signature::new(CALL_CONV);
+    match name {
+        STASH_I_SYM => {
+            s.params.push(AbiParam::new(types::I64)); // word index
+            s.params.push(AbiParam::new(types::I64)); // payload (i32 sign-ext)
+        }
+        READ_I64_SYM => {
+            s.params.push(AbiParam::new(types::I64)); // handle
+            s.returns.push(AbiParam::new(types::I64));
+        }
+        STASH_F_SYM => {
+            s.params.push(AbiParam::new(types::I64)); // word index
+            s.params.push(AbiParam::new(types::F64)); // payload
+        }
+        STASH_ARR_SYM => {
+            s.params.push(AbiParam::new(types::I64)); // slot
+            s.params.push(AbiParam::new(types::I64)); // data pointer
+            s.params.push(AbiParam::new(types::I64)); // length
+        }
+        DISPATCH_SYM => {
+            s.params.push(AbiParam::new(types::I64)); // start
+            s.params.push(AbiParam::new(types::I64)); // end
+            s.params.push(AbiParam::new(types::I64)); // region id
+            s.params.push(AbiParam::new(types::I64)); // nthreads hint
+            s.returns.push(AbiParam::new(types::I64)); // handle
+        }
+        READ_I32_SYM => {
+            s.params.push(AbiParam::new(types::I64));
+            s.returns.push(AbiParam::new(types::I32));
+        }
+        READ_F64_SYM => {
+            s.params.push(AbiParam::new(types::I64));
+            s.returns.push(AbiParam::new(types::F64));
+        }
+        READ_F32_SYM => {
+            s.params.push(AbiParam::new(types::I64));
+            s.returns.push(AbiParam::new(types::F32));
+        }
+        _ => return None,
+    }
+    Some(s)
+}
+
+/// Emits the stash→dispatch→readback sequence in place of a region header's
+/// terminator. The builder is positioned at the end of the header block; on
+/// return control flows unconditionally to the loop's exit block, feeding its
+/// φs exactly as the original false edge did.
+///
+/// Emission order matters: every stash call happens BEFORE the dispatch call
+/// (evaluation order is program order and Cranelift does not reorder calls).
+fn emit_region_dispatch(b: &mut FunctionBuilder<'_>, lw: &mut Lw<'_>) -> Result<(), String> {
+    // Clone the (small, all-plain-data) hook out of `lw` so the import helper
+    // can borrow `lw` mutably while emission reads layout data.
+    let Some(hook) = lw.rt.clone() else {
+        return Err("internal: dispatch emission without a region hook".into());
+    };
+
+    // Imports (or reuses) one dispatch-ABI symbol in this function.
+    fn import_rt(
+        b: &mut FunctionBuilder<'_>,
+        lw: &mut Lw<'_>,
+        sym: &str,
+    ) -> Result<cranelift::codegen::ir::FuncRef, String> {
+        if !lw.funcs.contains_key(sym) {
+            let fid = *lw
+                .imports
+                .get(sym)
+                .ok_or_else(|| format!("callee '{sym}' was never declared"))?;
+            let sig = lw
+                .sigs
+                .get(sym)
+                .cloned()
+                .or_else(|| rt_signature(sym))
+                .ok_or_else(|| format!("no signature available for '{sym}'"))?;
+            let user_ref =
+                b.func
+                    .declare_imported_user_function(cranelift::codegen::ir::UserExternalName {
+                        namespace: 0,
+                        index: fid.as_u32(),
+                    });
+            let sig_ref = b.func.import_signature(sig);
+            let fr = b.func.import_function(cranelift::codegen::ir::ExtFuncData {
+                name: cranelift::codegen::ir::ExternalName::user(user_ref),
+                signature: sig_ref,
+                colocated: false,
+                patchable: false,
+            });
+            lw.funcs.insert(sym.to_string(), fr);
+        }
+        Ok(lw.funcs[sym])
+    }
+
+    for (k, (local, _, _)) in hook.arrays.iter().enumerate() {
+        let fp = lookup_array(lw, *local)?;
+        let slot = b.ins().iconst(types::I64, k as i64);
+        let fref = import_rt(b, lw, STASH_ARR_SYM)?;
+        b.ins().call(fref, &[slot, fp.data, fp.len]);
+    }
+    for (k, (sid, w, float, off)) in hook.scalars.iter().enumerate() {
+        // Stash keys are PACKED WORD positions (`off / 8`), matching the
+        // dispatcher's packing loop — array slots occupy words 2.. and scalar
+        // slots follow directly after them.
+        let word = off / 8;
+        let _ = k;
+        let v = lookup_scalar(lw, ValueId(*sid))?;
+        match (*w, *float) {
+            (8, false) => {
+                // Widen narrow ints to the i64 stash ABI.
+                let arg = if b.func.dfg.value_type(v) == types::I32 {
+                    b.ins().sextend(types::I64, v)
+                } else {
+                    v
+                };
+                let idx = b.ins().iconst(types::I64, word);
+                let fref = import_rt(b, lw, STASH_I_SYM)?;
+                b.ins().call(fref, &[idx, arg]);
+            }
+            (4, false) => {
+                let wide = b.ins().sextend(types::I64, v);
+                let idx = b.ins().iconst(types::I64, word);
+                let fref = import_rt(b, lw, STASH_I_SYM)?;
+                b.ins().call(fref, &[idx, wide]);
+            }
+            (_, true) => {
+                // f32 rides widened inside the f64 stash ABI (lossless).
+                let arg = if b.func.dfg.value_type(v) == types::F32 {
+                    b.ins().fpromote(types::F64, v)
+                } else {
+                    v
+                };
+                let idx = b.ins().iconst(types::I64, word);
+                let fref = import_rt(b, lw, STASH_F_SYM)?;
+                b.ins().call(fref, &[idx, arg]);
+            }
+            _ => {}
+        }
+    }
+
+    // ---- 2. bounds + dispatch ---------------------------------------------------
+    let start = bound_value(b, lw, hook.start_ssa, hook.start_const)?;
+    let end = bound_value(b, lw, hook.end_ssa, hook.end_const)?;
+    let rid = b.ins().iconst(types::I64, hook.region_id);
+    let nthr = b.ins().iconst(types::I64, crate::parallel::NTHREADS_HINT);
+    let dref = import_rt(b, lw, DISPATCH_SYM)?;
+    let dinst = b.ins().call(dref, &[start, end, rid, nthr]);
+    let handle = *b
+        .inst_results(dinst)
+        .first()
+        .ok_or("helix_dispatch returned no handle")?;
+
+    // ---- 3. reduction readback ----------------------------------------------------
+    if let Some(dst) = hook.acc_dst {
+        let (width, float) = match hook.kind {
+            crate::parallel::RKind::Reduction(s) => (s.width, s.float),
+            crate::parallel::RKind::DoAll => {
+                return Err("internal: DoAll region with readback".into());
+            }
+        };
+        let total = match (width, float) {
+            (4, false) => {
+                let rref = import_rt(b, lw, READ_I32_SYM)?;
+                let inst = b.ins().call(rref, &[handle]);
+                let v = *b
+                    .inst_results(inst)
+                    .first()
+                    .ok_or("read returned nothing")?;
+                b.ins().sextend(types::I64, v)
+            }
+            (8, false) => {
+                let rref = import_rt(b, lw, READ_I64_SYM)?;
+                let inst = b.ins().call(rref, &[handle]);
+                *b.inst_results(inst)
+                    .first()
+                    .ok_or("read returned nothing")?
+            }
+            (_, true) => {
+                // f32 totals are combined widened; demote on readback.
+                let rr = import_rt(
+                    b,
+                    lw,
+                    if width == 4 {
+                        READ_F32_SYM
+                    } else {
+                        READ_F64_SYM
+                    },
+                )?;
+                let inst = b.ins().call(rr, &[handle]);
+                *b.inst_results(inst)
+                    .first()
+                    .ok_or("read returned nothing")?
+            }
+            _ => return Err("internal: unsupported reduction width".into()),
+        };
+        lw.vals.insert(ValueId(dst), total);
+    }
+
+    // ---- 4. jump to the loop exit, feeding its φs ------------------------------
+    let me = BlockId(lw.rt.as_ref().map(|h| h.header.0).unwrap_or(0));
+    let exit = hook.exit;
+    let mut cargs: Vec<BlockArg> = Vec::with_capacity(lw.ir.block(exit).phis.len());
+    for p in &lw.ir.block(exit).phis {
+        let v = p
+            .args
+            .iter()
+            .find(|(from, _)| *from == me)
+            .map(|(_, v)| *v)
+            // No φ input recorded from the header: the loop never fell through
+            // to this value from the header path — supply zero of the right
+            // width (semantically dead: the header always branched away).
+            .unwrap_or(ValueId(u32::MAX));
+        let ev = if v.0 == u32::MAX {
+            let ty = clif_ty(ir_val_ty(lw, p.dst));
+            if ty.is_int() {
+                b.ins().iconst(ty, 0)
+            } else {
+                b.ins()
+                    .f64const(cranelift::codegen::ir::immediates::Ieee64::with_bits(0))
+            }
+        } else {
+            edge_value(b, lw, v, clif_ty(ir_val_ty(lw, p.dst)))
+        };
+        cargs.push(BlockArg::Value(ev));
+    }
+    b.ins().jump(lw.blocks[exit.0 as usize].clif, &cargs);
+    Ok(())
+}
+
+/// CLIF value of a loop bound: SSA id when symbolic, constant otherwise.
+fn bound_value(
+    b: &mut FunctionBuilder<'_>,
+    lw: &Lw<'_>,
+    ssa: Option<u32>,
+    konst: i64,
+) -> Result<CValue, String> {
+    match ssa {
+        Some(id) => lookup_scalar(lw, ValueId(id)),
+        None => Ok(b.ins().iconst(types::I64, konst)),
+    }
+}
+
 /// Resolves an EDGE-carried value, tolerating names with no CLIF binding.
 ///
 /// The renamer occasionally leaves a φ argument spelling that names a value
@@ -1235,3 +1652,148 @@ fn edge_args(
 /// Unused-import silencer for symbols kept deliberately (see engine usage).
 #[allow(unused)]
 fn _keep(_: &Signature, _: &Type) {}
+
+// ---------------------------------------------------------------------------
+// Extracted region-body lowering
+// ---------------------------------------------------------------------------
+
+/// Lowers an EXTRACTED REGION BODY into `extern "C" fn(i64 iter, i64 ctx)`.
+///
+/// Differences from [`translate_fn`]:
+///
+/// * the signature is the fixed two-I64 body ABI ([`crate::parallel::
+///   body_signature`]);
+/// * entry phis carry no edges — they bind function parameters positionally:
+///   φ 0 is the iteration index, φ 1 the context pointer;
+/// * array fat pointers arrive PREBOUND as SSA ids (allocated by the
+///   extractor) whose defining `helix_ld_i64` calls are already IN the entry
+///   instruction list, so they lower through the ordinary call path;
+/// * the panic block returns nothing (body functions have no results).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn translate_body_fn(
+    ir: &FuncIr,
+    unchecked: bool,
+    func: &mut cranelift::codegen::ir::Function,
+    module: &mut JITModule,
+    imports: &HashMap<String, FuncId>,
+    sigs: &HashMap<String, Signature>,
+    prebind: &[(LocalId, ValueId, ValueId)],
+) -> Result<(), String> {
+    func.signature = crate::parallel::body_signature();
+
+    let mut bctx = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(func, &mut bctx);
+
+    // ---- blocks -----------------------------------------------------------------
+    let mut blocks: Vec<BlockEntry> = Vec::with_capacity(ir.blocks.len());
+    for _ in 0..ir.blocks.len() {
+        blocks.push(BlockEntry {
+            clif: builder.create_block(),
+            phi_params: Vec::new(),
+        });
+    }
+    for (bi, hblock) in ir.blocks.iter().enumerate() {
+        if bi == ir.entry.0 as usize {
+            continue;
+        }
+        for p in &hblock.phis {
+            let ty = ir
+                .types
+                .val_ty(p.dst)
+                .or_else(|| ir.types.local_ty(p.var))
+                .unwrap_or(Ty::I64);
+            let v = builder.append_block_param(blocks[bi].clif, clif_ty(ty));
+            blocks[bi].phi_params.push(v);
+        }
+    }
+
+    let mut lw = Lw {
+        ir,
+        unchecked,
+        blocks,
+        vals: HashMap::new(),
+        arrays: HashMap::new(),
+        panic: None,
+        funcs: HashMap::new(),
+        imports,
+        sigs,
+        self_uses: collect_self_uses(ir),
+        rt: None,
+    };
+
+    import_in_func(&mut builder, &mut lw, PANIC_SYM)?;
+
+    // ---- entry block ------------------------------------------------------------
+    let entry = lw.blocks[ir.entry.0 as usize].clif;
+    builder.switch_to_block(entry);
+    builder.append_block_params_for_function_params(entry);
+
+    // Bind entry phis to parameters positionally. The extractor emits exactly
+    // two: φ 0 → iteration index, φ 1 → ctx pointer (an I64-carried address).
+    let entry_vals: Vec<CValue> = builder.block_params(entry).to_vec();
+    for (cursor, p) in ir.blocks[ir.entry.0 as usize].phis.iter().enumerate() {
+        if cursor >= entry_vals.len() {
+            return Err("region body entry has more phis than parameters".into());
+        }
+        lw.vals.insert(p.dst, entry_vals[cursor]);
+    }
+
+    // ---- remaining blocks + instructions -------------------------------------------
+    // The entry block's instruction list STARTS with the array ctx-loads (the
+    // extractor put them there), so translating it binds the prebound ids;
+    // afterwards we can record the array local-slot table. Everything else is
+    // translated exactly like an ordinary function.
+    let mut arrays_bound = false;
+    for bi in 0..ir.blocks.len() {
+        let clif = lw.blocks[bi].clif;
+        if bi != ir.entry.0 as usize {
+            builder.switch_to_block(clif);
+        }
+        lw.self_uses
+            .iter_mut()
+            .filter(|(_, e)| e.block_idx == bi && e.param.is_none())
+            .for_each(|(_, e)| {
+                let p = builder.append_block_param(clif, e.ty);
+                e.param = Some(p);
+            });
+        if bi != ir.entry.0 as usize {
+            let params = lw.blocks[bi].phi_params.clone();
+            for (p, cv) in ir.blocks[bi].phis.iter().zip(params) {
+                lw.vals.insert(p.dst, cv);
+            }
+        }
+        for inst in &ir.blocks[bi].insts.clone() {
+            translate_inst(&mut builder, &mut lw, inst)?;
+        }
+        if !arrays_bound {
+            // Entry instructions done: record the fat pointers now.
+            for (local, pv, lv) in prebind {
+                let data = lw.vals.get(pv).copied().ok_or_else(|| {
+                    format!("array prebind v{} used before its defining call", pv.0)
+                })?;
+                let len = lw.vals.get(lv).copied().ok_or_else(|| {
+                    format!("array prebind v{} used before its defining call", lv.0)
+                })?;
+                lw.arrays.insert(*local, FatPtr { data, len });
+            }
+            arrays_bound = true;
+        }
+        translate_term(&mut builder, &mut lw, bi)?;
+    }
+
+    // Shared panic block: guards inside the body use it like any function; a
+    // body has no results, so the fallback return carries no values.
+    if let Some((pb, params)) = lw.panic {
+        let fref = lw.funcs.get(PANIC_SYM).copied();
+        let Some(fref) = fref else {
+            return Err(format!("internal: {PANIC_SYM} was never imported"));
+        };
+        builder.switch_to_block(pb);
+        builder.ins().call(fref, &params);
+        builder.ins().return_(&[]);
+    }
+
+    builder.seal_all_blocks();
+    builder.finalize(module.target_config());
+    Ok(())
+}

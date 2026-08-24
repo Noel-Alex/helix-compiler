@@ -22,7 +22,44 @@ fn compile_ir(src: &str) -> Vec<helix_ir::FuncIr> {
     irs
 }
 
-/// Compiles `src` all the way to a live JIT engine.
+/// Analysis pipeline: loops → reports → ParallelPlan.
+fn analyze_plan(irs: &[helix_ir::FuncIr]) -> helix_analysis::ParallelPlan {
+    let li: Vec<_> = irs.iter().map(helix_analysis::find_loops).collect();
+    let reps: Vec<_> = irs
+        .iter()
+        .zip(&li)
+        .map(|(f, l)| helix_analysis::analyze(f, l))
+        .collect();
+    helix_analysis::build_plan(irs, &li, &reps)
+}
+
+/// Maps an analysis plan onto the backend's seam type (same 1:1 shape the
+/// CLI uses; M10 unifies them).
+fn to_backend_plan(p: &helix_analysis::ParallelPlan) -> helix_backend::ParallelPlan {
+    use helix_backend::engine::helix_analysis_stub::ReductionOp as BOp;
+    let mut out = helix_backend::ParallelPlan::default();
+    for r in &p.regions {
+        out.regions.push(helix_backend::RegionDesc {
+            func_idx: r.func_idx,
+            header: r.header,
+            kind: match r.kind {
+                helix_analysis::RegionKind::DoAll => helix_backend::RegionKind::DoAll,
+                helix_analysis::RegionKind::Reduction(op) => {
+                    helix_backend::RegionKind::Reduction(match op {
+                        helix_analysis::ReductionOp::Add => BOp::Add,
+                        helix_analysis::ReductionOp::Mul => BOp::Mul,
+                        helix_analysis::ReductionOp::Min => BOp::Min,
+                        helix_analysis::ReductionOp::Max => BOp::Max,
+                    })
+                }
+            },
+            body_fn_name: r.body_fn_name.clone(),
+        });
+    }
+    out
+}
+
+/// Compiles `src` all the way to a live JIT engine (sequential plan).
 fn jit(src: &str) -> JitEngine {
     let irs = compile_ir(src);
     let plan = helix_backend::ParallelPlan::default();
@@ -471,20 +508,193 @@ fn oob_index_in_range_stays_safe_under_checked_mode() {
 // Engine-level contracts
 // ---------------------------------------------------------------------------
 
-#[test]
-fn nonempty_plan_is_rejected_until_m10() {
-    let src = "fn main() {}";
+// ---------------------------------------------------------------------------
+// Parallel regions (M10): plan-driven fork/join through the runtime
+// ---------------------------------------------------------------------------
+
+/// Runs `src` on the JIT with its ANALYSIS-DERIVED plan and returns prints.
+fn jit_lines_with_plan(src: &str) -> (Vec<String>, usize) {
+    let _guard = helix_backend::testutil::serial_lock();
     let irs = compile_ir(src);
-    let plan = helix_backend::ParallelPlan {
-        regions: vec![helix_backend::RegionDesc {
-            func_idx: 0,
-            header: helix_ir::BlockId(0),
-            kind: helix_backend::RegionKind::DoAll,
-            body_fn_name: "main.loop0.body".into(),
-        }],
-    };
-    let err = JitEngine::compile(&irs, &plan, false).expect_err("must reject");
-    assert!(err.contains("parallel"), "{err}");
+    let plan = analyze_plan(&irs);
+    let n_regions = plan.regions.len();
+    let engine =
+        JitEngine::compile(&irs, &to_backend_plan(&plan), false).expect("JIT compile (plan)");
+    let (lines, result) = helix_backend::engine::capture_prints(|| engine.run_main());
+    result.expect("JIT run (plan)");
+    (lines, n_regions)
+}
+
+/// Differential harness for planned runs: JIT-with-plan vs sequential-JIT vs
+/// interpreter — all three must print identical lines.
+fn assert_parallel_parity(src: &str, expect_regions: usize) -> Vec<String> {
+    let ast = helix_syntax::parse_str(src).expect("parse");
+    let typed = helix_sema::check(&ast).expect("sema");
+    let interp = helix_engine::run_with_source(src, &typed)
+        .expect("interp run")
+        .printed;
+    let seq = jit_lines(src);
+    let (par, regions) = jit_lines_with_plan(src);
+    assert_eq!(regions, expect_regions, "plan region count");
+    assert_eq!(par, seq, "planned JIT vs sequential JIT");
+    assert_eq!(par, interp, "planned JIT vs interpreter");
+    par
+}
+
+#[test]
+fn parallel_saxpy_small_matches_interpreter_checksum() {
+    // Small-N saxpy through the FULL pipeline WITH a plan: the DoAll region
+    // dispatches on threads (or inline under the cost gate) and results must
+    // equal the interpreter's exactly.
+    let src = r#"
+        fn main() {
+            let n = 50000;
+            let x: [f64] = zeros(n);
+            let y: [f64] = zeros(n);
+            let s = 2.5;
+            for i in 0..n {
+                x[i] = i as f64;
+                y[i] = 1.0;
+            }
+            for i in 0..n {
+                y[i] = s * x[i] + y[i];
+            }
+            print(y[7]);
+            print(y[n - 1]);
+        }
+    "#;
+    let out = assert_parallel_parity(src, 2); // init loop + saxpy loop
+    assert_eq!(out[0], "18.5");
+}
+
+#[test]
+fn parallel_dot_reduction_int_exact() {
+    // Integer +-reduction: exact match vs sequential sum (associativity is
+    // exact over wrapping integers).
+    let src = r#"
+        fn main() {
+            let n = 100000;
+            let a: [i64] = zeros(n);
+            for i in 0..n {
+                a[i] = i + 1;
+            }
+            let total = 0;
+            for i in 0..n {
+                total = total + a[i];
+            }
+            print(total);
+        }
+    "#;
+    let out = assert_parallel_parity(src, 2);
+    // sum 1..=100000 = n*(n+1)/2
+    let expected = 100000i64 * 100001 / 2;
+    assert_eq!(out[0], expected.to_string());
+}
+
+#[test]
+fn parallel_dot_reduction_f64_within_eps() {
+    // FP reduction: parallel combination may reassociate, so compare against
+    // the sequential sum within a tight relative epsilon.
+    let _guard = helix_backend::testutil::serial_lock();
+    let src = r#"
+        fn main() {
+            let n = 100000;
+            let a: [f64] = zeros(n);
+            let b: [f64] = zeros(n);
+            for i in 0..n {
+                a[i] = 1.0;
+                b[i] = 2.0;
+            }
+            let dot = 0.0;
+            for i in 0..n {
+                dot = dot + a[i] * b[i];
+            }
+            print(dot);
+        }
+    "#;
+    let (par, regions) = jit_lines_with_plan(src);
+    assert_eq!(regions, 2);
+    let got: f64 = par[0].parse().expect("f64 parse of dot output");
+    let want = 200_000.0f64;
+    let rel = ((got - want) / want).abs();
+    assert!(rel < 1e-9, "dot {got} vs {want} (rel {rel})");
+}
+
+#[test]
+fn recurrence_reject_plan_has_zero_regions() {
+    // RAW distance-1 recurrence: analysis must reject it and the pipeline
+    // must stay on the unchanged sequential path.
+    let src = include_str!("../../../examples/recurrence_reject.hx");
+    let irs = compile_ir(src);
+    let plan = analyze_plan(&irs);
+    assert!(
+        plan.regions.is_empty(),
+        "recurrence must not enter the plan: {:?}",
+        plan.regions
+    );
+    // And the plain differential still holds (sequential path untouched).
+    let ast = helix_syntax::parse_str(src).expect("parse");
+    let typed = helix_sema::check(&ast).expect("sema");
+    let interp = helix_engine::run_with_source(src, &typed)
+        .expect("interp")
+        .printed;
+    let got = jit_lines(src);
+    assert_eq!(got, interp);
+}
+
+#[test]
+fn helix_nthreads_1_and_8_identical_integer_output() {
+    // The env override selects participant counts; integer semantics must be
+    // bit-identical either way.
+    let src = r#"
+        fn main() {
+            let n = 100000;
+            let a: [i64] = zeros(n);
+            for i in 0..n {
+                a[i] = i * 3 - 7;
+            }
+            let total = 0;
+            for i in 0..n {
+                total = total + a[i];
+            }
+            let lo = 0;
+            for i in 0..n {
+                if i == 41 { lo = a[i]; }
+            }
+            print(total);
+            print(lo);
+            print(a[99999]);
+        }
+    "#;
+    let _guard = helix_backend::testutil::serial_lock();
+    unsafe { std::env::set_var("HELIX_NTHREADS", "1") };
+    let one = jit_lines_with_plan(src).0;
+    unsafe { std::env::set_var("HELIX_NTHREADS", "8") };
+    let eight = jit_lines_with_plan(src).0;
+    unsafe { std::env::remove_var("HELIX_NTHREADS") };
+    assert_eq!(one, eight, "NTHREADS override must not change results");
+}
+
+#[test]
+fn minmax_reduction_matches_interpreter() {
+    // min-reduction kernel: per-thread partials combined with the ordered
+    // IEEE minNum rule must equal the interpreter's minimum exactly.
+    let src = r#"
+        fn main() {
+            let n = 100000;
+            let a: [f64] = zeros(n);
+            for i in 0..n {
+                a[i] = (n - i) as f64;
+            }
+            let lo = 1.0e300;
+            for i in 0..n {
+                lo = min(lo, a[i]);
+            }
+            print(lo);
+        }
+    "#;
+    let out = assert_parallel_parity(src, 2);
+    assert_eq!(out[0], "1.0");
 }
 
 #[test]
@@ -541,4 +751,60 @@ fn large_loop_completes_quickly_native() {
     let got = jit_lines(src);
     assert!(started.elapsed().as_secs() < 10, "native run was slow");
     assert_eq!(got, vec!["2.0", "50000000"]);
+}
+
+// ---------------------------------------------------------------------------
+// Regression: forward phi reference across the latch (if-in-loop assignment)
+// ---------------------------------------------------------------------------
+
+/// `count` is carried around the loop through TWO phis; the latch's edge value
+/// for the outer header names a phi defined in a merge block that appears LATER
+/// in block-id order than the latch itself. A lowering bug pre-bound such
+/// forward references as constant 0 (JIT printed 0 where the interpreter
+/// printed 6). This test pins the fix.
+#[test]
+fn if_in_loop_carried_assignment_matches_interpreter() {
+    let src = r#"
+        fn main() {
+            let count = 0;
+            for i in 0..10 {
+                if i > 3 {
+                    count = count + 1;
+                }
+            }
+            print(count);
+        }
+    "#;
+    let ast = helix_syntax::parse_str(src).unwrap();
+    let typed = helix_sema::check(&ast).expect("sema");
+    let expected = helix_engine::run_with_source(src, &typed)
+        .expect("interp run")
+        .printed;
+    assert_eq!(expected, vec!["6"]);
+    assert_eq!(jit_lines(src), expected);
+}
+
+/// Same shape with the merge feeding an accumulator used after the loop, plus
+/// an else arm — exercises both edges of the inner diamond carrying values.
+#[test]
+fn if_else_in_loop_accumulator_matches_interpreter() {
+    let src = r#"
+        fn main() {
+            let acc = 0;
+            for i in 1..8 {
+                if i % 2 == 0 {
+                    acc = acc + i;
+                } else {
+                    acc = acc + 10 * i;
+                }
+            }
+            print(acc);
+        }
+    "#;
+    let ast = helix_syntax::parse_str(src).unwrap();
+    let typed = helix_sema::check(&ast).expect("sema");
+    let expected = helix_engine::run_with_source(src, &typed)
+        .expect("interp run")
+        .printed;
+    assert_eq!(jit_lines(src), expected);
 }

@@ -136,7 +136,7 @@ fn cmd_run(rest: &[String]) -> i32 {
 }
 
 /// JIT execution path: lower -> analyze -> plan -> compile -> run.
-fn run_jit(src: &str, program: &TypedProgram, unchecked: bool) -> i32 {
+fn run_jit(_src: &str, program: &TypedProgram, unchecked: bool) -> i32 {
     let mut funcs = helix_ir::build(program);
     for f in &mut funcs {
         helix_ir::to_ssa(f);
@@ -474,9 +474,11 @@ fn cmd_selftest() -> i32 {
     if fail > 0 { 1 } else { 0 }
 }
 
-/// Convert an analysis plan to the backend's seam type. M10 unifies these;
-/// until then the region fields map 1:1 (both are the same shape).
+/// Convert an analysis plan to the backend's seam type (M10: the fields map
+/// 1:1 and reduction operators pass through so min/max regions combine with
+/// the right monoid).
 fn to_backend_plan(p: &helix_analysis::ParallelPlan) -> helix_backend::ParallelPlan {
+    use helix_backend::engine::helix_analysis_stub::ReductionOp as BOp;
     let mut out = helix_backend::ParallelPlan::default();
     for r in &p.regions {
         out.regions.push(helix_backend::RegionDesc {
@@ -484,9 +486,14 @@ fn to_backend_plan(p: &helix_analysis::ParallelPlan) -> helix_backend::ParallelP
             header: r.header,
             kind: match r.kind {
                 helix_analysis::RegionKind::DoAll => helix_backend::RegionKind::DoAll,
-                helix_analysis::RegionKind::Reduction(_) => helix_backend::RegionKind::Reduction(
-                    helix_backend::engine::helix_analysis_stub::ReductionOp::Add,
-                ),
+                helix_analysis::RegionKind::Reduction(op) => {
+                    helix_backend::RegionKind::Reduction(match op {
+                        helix_analysis::ReductionOp::Add => BOp::Add,
+                        helix_analysis::ReductionOp::Mul => BOp::Mul,
+                        helix_analysis::ReductionOp::Min => BOp::Min,
+                        helix_analysis::ReductionOp::Max => BOp::Max,
+                    })
+                }
             },
             body_fn_name: r.body_fn_name.clone(),
         });
