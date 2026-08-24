@@ -480,6 +480,7 @@ dependencies = [
  "helix-sema",
  "helix-syntax",
  "serde_json",
+ "tokio",
  "webbrowser",
  "windows-sys 0.59.0",
 ]
