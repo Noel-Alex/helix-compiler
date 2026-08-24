@@ -3,8 +3,8 @@
 //! Subcommands:
 //! - `run <file.hx>`          — parse → check → interpret (reference backend)
 //! - `check <file.hx>`        — frontend only; prints diagnostics with carets
-//! - `dump <stage> <file.hx>` — print a pipeline stage (tokens|ast|ir|ssa) for
-//!                              eyeballing and golden tests
+//! - `dump <stage> <file.hx>` — print a pipeline stage (tokens|ast|ir|ssa)
+//!   for eyeballing and golden tests
 //!
 //! The JIT backend (`--backend jit`) and the Observatory server live in later
 //! milestones; the argument surface already reserves them.
