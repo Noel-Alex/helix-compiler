@@ -507,6 +507,11 @@ impl Builder {
         }
     }
 
+    /// Evaluate typed argument subtrees into SSA values for a call.
+    fn eval_args(&mut self, args: &[helix_sema::TypedExpr]) -> Vec<ValueId> {
+        args.iter().map(|a| self.expr(a)).collect()
+    }
+
     /// Calls. See the module-level note about the missing argument list.
     fn call_expr(&mut self, target: &CallTarget, ret: Ty, dst: Option<ValueId>) {
         match target {
@@ -526,19 +531,21 @@ impl Builder {
                     arr_refs: vec![out_local],
                 }));
             }
-            CallTarget::Builtin { which: b, .. } => {
+            CallTarget::Builtin { which: b, args } => {
+                let vals = self.eval_args(args);
                 self.emit(Inst::Call(Call {
                     dst,
                     callee: b.name().into(),
-                    args: Vec::new(),
+                    args: vals,
                     arr_refs: Vec::new(),
                 }));
             }
-            CallTarget::User { name, .. } => {
+            CallTarget::User { name, args, .. } => {
+                let vals = self.eval_args(args);
                 self.emit(Inst::Call(Call {
                     dst,
                     callee: name.clone(),
-                    args: Vec::new(),
+                    args: vals,
                     arr_refs: Vec::new(),
                 }));
             }

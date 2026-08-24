@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use helix_ir::print::print_ir;
-use helix_sema::{SemDiag, TypedProgram};
+use helix_sema::TypedProgram;
 use helix_syntax::Span;
 
 fn main() {
@@ -58,11 +58,10 @@ USAGE:
 
 /// Shared frontend: source string → checked program, printing diags on failure.
 fn frontend(path: &str) -> Result<TypedProgram, i32> {
-    let src = std::fs::read_to_string(PathBuf::from(path))
-        .map_err(|e| {
-            eprintln!("error: cannot read {path}: {e}");
-            1
-        })?;
+    let src = std::fs::read_to_string(PathBuf::from(path)).map_err(|e| {
+        eprintln!("error: cannot read {path}: {e}");
+        1
+    })?;
     let program = match helix_syntax::parse_str(&src) {
         Ok(p) => p,
         Err(e) => {
@@ -84,7 +83,9 @@ fn frontend(path: &str) -> Result<TypedProgram, i32> {
 }
 
 fn cmd_run(path: Option<&String>) -> i32 {
-    let Some(path) = path else { return usage("run requires <file>") };
+    let Some(path) = path else {
+        return usage("run requires <file>");
+    };
     let src = std::fs::read_to_string(PathBuf::from(path)).unwrap_or_default();
     let program = match frontend(path) {
         Ok(p) => p,
@@ -105,7 +106,9 @@ fn cmd_run(path: Option<&String>) -> i32 {
 }
 
 fn cmd_check(path: Option<&String>) -> i32 {
-    let Some(path) = path else { return usage("check requires <file>") };
+    let Some(path) = path else {
+        return usage("check requires <file>");
+    };
     match frontend(path) {
         Ok(_) => {
             println!("ok");
@@ -129,26 +132,27 @@ fn cmd_dump(stage: &str, path: &str) -> i32 {
         "tokens" => {
             for tok in &tokens {
                 let text = &src[tok.span.start as usize..tok.span.end as usize];
-                println!("{:>4}..{:<4} {:?} {text:?}", tok.span.start, tok.span.end, tok.kind);
+                println!(
+                    "{:>4}..{:<4} {:?} {text:?}",
+                    tok.span.start, tok.span.end, tok.kind
+                );
             }
             0
         }
-        "ast" => {
-            match helix_syntax::parse_str(&src) {
-                Ok(p) => {
-                    println!("{}", p.print_tree());
-                    0
-                }
-                Err(e) => {
-                    let span = match &e {
-                        helix_syntax::SyntaxError::Lex(x) => x.span,
-                        helix_syntax::SyntaxError::Parse(x) => x.span,
-                    };
-                    print_diag(&src, span, &e.to_string());
-                    1
-                }
+        "ast" => match helix_syntax::parse_str(&src) {
+            Ok(p) => {
+                println!("{}", p.print_tree());
+                0
             }
-        }
+            Err(e) => {
+                let span = match &e {
+                    helix_syntax::SyntaxError::Lex(x) => x.span,
+                    helix_syntax::SyntaxError::Parse(x) => x.span,
+                };
+                print_diag(&src, span, &e.to_string());
+                1
+            }
+        },
         "ir" | "ssa" => {
             let want_ssa = stage == "ssa";
             let program = match frontend(path) {

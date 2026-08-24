@@ -68,8 +68,9 @@ pub fn const_prop(ir: &mut FuncIr) -> ChangeFlag {
             _ => None,
         };
         if let Some(b) = cond_const {
-            let term = std::mem::replace(&mut ir.blocks[bi].term, Term::Return(None));
-            if let Term::Branch { t, f, .. } = term {
+            // Clone first: set_term repairs edges based on the CURRENT terminator,
+            // so pre-replacing it (e.g. with Return) would skip pred-list updates.
+            if let Term::Branch { t, f, .. } = ir.blocks[bi].term.clone() {
                 let target = if b { t } else { f };
                 let args = phi_args_for(ir, BlockId(bi as u32), target);
                 ir.set_term(BlockId(bi as u32), Term::Jump(target, args));

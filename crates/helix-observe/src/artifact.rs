@@ -584,15 +584,14 @@ mod tests {
 
     #[test]
     fn verdict_labels_serialize_screaming() {
+        assert_eq!(serde_json::to_string(&VerdictLabel::Safe).unwrap(), "\"SAFE\"");
         assert_eq!(
-            serde_json::to_string(&VerdictLabel::SafeParallelAlias()).unwrap(),
-            "\"SAFE\""
+            serde_json::to_string(&VerdictLabel::Reduction).unwrap(),
+            "\"REDUCTION\""
         );
-    }
-
-    impl VerdictLabel {
-        fn SafeParallelAlias() -> Self {
-            VerdictLabel::Safe
-        }
+        assert_eq!(
+            serde_json::to_string(&VerdictLabel::Sequential).unwrap(),
+            "\"SEQUENTIAL\""
+        );
     }
 }
