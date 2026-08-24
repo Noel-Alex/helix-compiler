@@ -510,7 +510,10 @@ impl Builder {
     /// Calls. See the module-level note about the missing argument list.
     fn call_expr(&mut self, target: &CallTarget, ret: Ty, dst: Option<ValueId>) {
         match target {
-            CallTarget::Builtin { which: Builtin::Zeros, .. } => {
+            CallTarget::Builtin {
+                which: Builtin::Zeros,
+                ..
+            } => {
                 // The array lands in the destination cell directly (arrays are
                 // referenced by local slot, never moved as values).
                 let out_local = dst
@@ -523,7 +526,7 @@ impl Builder {
                     arr_refs: vec![out_local],
                 }));
             }
-            CallTarget::Builtin { which: b, args } => {
+            CallTarget::Builtin { which: b, .. } => {
                 self.emit(Inst::Call(Call {
                     dst,
                     callee: b.name().into(),

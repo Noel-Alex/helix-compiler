@@ -1,3 +1,5 @@
 //! helix-backend: CLIF lowering + JIT execution.
 
-pub mod jit_spike;
+/// Spike tests live under cfg(test) — the production lowering replaces this module.
+#[cfg(test)]
+mod jit_spike;

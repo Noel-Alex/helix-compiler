@@ -60,7 +60,13 @@ pub fn find_loops(func: &FuncIr) -> LoopInfo {
             .map(|(ci, _)| ci)
             .max();
         let depth = parent.map_or(1, |p| out[p].depth + 1);
-        out.push(Loop { id: i, header, blocks: body, depth, parent });
+        out.push(Loop {
+            id: i,
+            header,
+            blocks: body,
+            depth,
+            parent,
+        });
     }
     LoopInfo { loops: out }
 }

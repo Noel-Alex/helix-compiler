@@ -112,13 +112,16 @@ pub fn find_reductions(func: &FuncIr, loop_blocks: &[BlockId]) -> Vec<Recognized
         }
 
         // One accumulation site per iteration: the single defining binop.
-        out.push(Recognized { var: phi.var, op: red_op });
+        out.push(Recognized {
+            var: phi.var,
+            op: red_op,
+        });
     }
     out.sort_by_key(|r| r.var.0);
     out
 }
 
-fn def_inst<'f>(func: &'f FuncIr, v: ValueId) -> Option<&'f Inst> {
+fn def_inst(func: &FuncIr, v: ValueId) -> Option<&Inst> {
     for bd in &func.blocks {
         if let Some(i) = bd.insts.iter().find(|i| i.dst() == Some(v)) {
             return Some(i);
@@ -128,12 +131,7 @@ fn def_inst<'f>(func: &'f FuncIr, v: ValueId) -> Option<&'f Inst> {
 }
 
 /// Does `v`'s computation (within the loop) transitively involve `target`?
-fn depends_on(
-    func: &FuncIr,
-    v: ValueId,
-    target: ValueId,
-    loop_blocks: &[BlockId],
-) -> bool {
+fn depends_on(func: &FuncIr, v: ValueId, target: ValueId, loop_blocks: &[BlockId]) -> bool {
     let mut seen = HashMap::new();
     let _ = loop_blocks;
     dep_walk(func, v, target, &mut seen, 0)
@@ -157,7 +155,10 @@ fn dep_walk(
     }
     seen.insert(v, false);
     let result = match def_inst(func, v) {
-        Some(inst) => inst.uses().iter().any(|&u| dep_walk(func, u, target, seen, depth + 1)),
+        Some(inst) => inst
+            .uses()
+            .iter()
+            .any(|&u| dep_walk(func, u, target, seen, depth + 1)),
         None => false, // defined outside the loop or a slot cell — no dependency path here
     };
     seen.insert(v, result);

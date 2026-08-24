@@ -9,13 +9,12 @@
 
 use std::mem;
 
-use cranelift::codegen::ir::{types, AbiParam, Signature};
+use cranelift::codegen::ir::{AbiParam, BlockArg, Signature, types};
+use cranelift::codegen::isa::CallConv;
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift::prelude::*;
-use cranelift::codegen::ir::BlockArg;
-use cranelift::codegen::isa::CallConv;
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
+use cranelift_module::{Linkage, Module, default_libcall_names};
 
 fn new_jit() -> JITModule {
     let flag_builder = settings::builder();
@@ -55,7 +54,9 @@ fn build_and_finalize(
         builder.finalize(module.target_config());
     }
 
-    module.define_function(fid, &mut ctx).expect("define function");
+    module
+        .define_function(fid, &mut ctx)
+        .expect("define function");
     module.clear_context(&mut ctx);
     module.finalize_definitions().expect("finalize definitions");
     module.get_finalized_function(fid)
@@ -117,7 +118,9 @@ fn jit_calls_host_symbol() {
     // Host symbols must be registered on the JITBuilder before the module exists.
     let flag_builder = settings::builder();
     let isa_builder = cranelift_native::builder().unwrap();
-    let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
+    let isa = isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .unwrap();
     let mut jb = JITBuilder::with_isa(isa, default_libcall_names());
     jb.symbol("record", record as extern "C" fn(i64) as *const u8);
     let mut module = JITModule::new(jb);
@@ -135,7 +138,7 @@ fn jit_calls_host_symbol() {
         let arg = b.block_params(b.current_block().unwrap())[0];
         let two = b.ins().iconst(types::I64, 2);
         let v = b.ins().imul(arg, two);
-        let func_ref = m.declare_func_in_func(host_fid, &mut b.func);
+        let func_ref = m.declare_func_in_func(host_fid, b.func);
         b.ins().call(func_ref, &[arg]);
         b.ins().call(func_ref, &[v]);
         b.ins().return_(&[]);

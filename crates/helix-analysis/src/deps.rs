@@ -33,14 +33,30 @@ pub struct DirVec {
 
 impl DirVec {
     pub fn star() -> Self {
-        DirVec { lt: true, eq: true, gt: true }
+        DirVec {
+            lt: true,
+            eq: true,
+            gt: true,
+        }
     }
 
     pub fn exact(dir: Dir) -> Self {
         match dir {
-            Dir::Lt => DirVec { lt: true, eq: false, gt: false },
-            Dir::Eq => DirVec { lt: false, eq: true, gt: false },
-            Dir::Gt => DirVec { lt: false, eq: false, gt: true },
+            Dir::Lt => DirVec {
+                lt: true,
+                eq: false,
+                gt: false,
+            },
+            Dir::Eq => DirVec {
+                lt: false,
+                eq: true,
+                gt: false,
+            },
+            Dir::Gt => DirVec {
+                lt: false,
+                eq: false,
+                gt: true,
+            },
         }
     }
 
@@ -107,7 +123,10 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
     // ---- ZIV: no index variable on either side ------------------------------
     if src.a == 0 && dst.a == 0 {
         return if src.b == dst.b {
-            DepOutcome::Dependence { distance: Some(0), dirs: vec![DirVec::exact(Dir::Eq)] }
+            DepOutcome::Dependence {
+                distance: Some(0),
+                dirs: vec![DirVec::exact(Dir::Eq)],
+            }
         } else {
             DepOutcome::Independent
         };
@@ -135,12 +154,15 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
             std::cmp::Ordering::Equal => DirVec::exact(Dir::Eq),
             std::cmp::Ordering::Greater => DirVec::exact(Dir::Gt),
         };
-        return DepOutcome::Dependence { distance: Some(dv), dirs: vec![dir] };
+        return DepOutcome::Dependence {
+            distance: Some(dv),
+            dirs: vec![dir],
+        };
     }
 
     // ---- Weak-Zero SIV: one side has zero coefficient ------------------------
     if src.a == 0 || dst.a == 0 {
-        let (a, p, c, swap) = if dst.a == 0 {
+        let (a, p, c, _swap) = if dst.a == 0 {
             // dst constant c = src(i): single point i = (c - b_src)/a_src
             (src.a, src.b, dst.b, false)
         } else {
@@ -162,7 +184,11 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
         // which they do by construction.
         return DepOutcome::Dependence {
             distance: None,
-            dirs: vec![DirVec { lt: true, eq: true, gt: true }],
+            dirs: vec![DirVec {
+                lt: true,
+                eq: true,
+                gt: true,
+            }],
         };
     }
 
@@ -203,7 +229,10 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
         let si = rhs_a / g;
         let sj = lhs_a / g;
         if box_has_solution(range, i0, j0, si, sj) {
-            return DepOutcome::Dependence { distance: None, dirs: vec![DirVec::star()] };
+            return DepOutcome::Dependence {
+                distance: None,
+                dirs: vec![DirVec::star()],
+            };
         }
         return DepOutcome::Independent;
     }
@@ -269,7 +298,11 @@ fn box_has_solution(range: IterRange, i0: i128, j0: i128, si: i128, sj: i128) ->
         } else {
             ceil_div(hi - c, step)
         };
-        if lower <= upper { Some((lower, upper)) } else { None }
+        if lower <= upper {
+            Some((lower, upper))
+        } else {
+            None
+        }
     };
 
     match (iv(si, i0), iv(sj, j0)) {
@@ -307,7 +340,11 @@ fn pairs_feasible(range: IterRange, d: i128) -> bool {
 
 /// Test all dimensions; combine per the conjoin rule: ANY dimension proving
 /// independence kills the dependence; surviving dimensions intersect directions.
-pub fn test_pair(subscripts_src: &[Affine], subscripts_dst: &[Affine], range: IterRange) -> DepOutcome {
+pub fn test_pair(
+    subscripts_src: &[Affine],
+    subscripts_dst: &[Affine],
+    range: IterRange,
+) -> DepOutcome {
     debug_assert_eq!(subscripts_src.len(), subscripts_dst.len());
     let mut combined_dirs: Vec<DirVec> = Vec::new();
     let mut distance: Option<i64> = Some(0);
@@ -315,7 +352,10 @@ pub fn test_pair(subscripts_src: &[Affine], subscripts_dst: &[Affine], range: It
     for (s, d) in subscripts_src.iter().zip(subscripts_dst.iter()) {
         match test_dimension(*s, *d, range) {
             DepOutcome::Independent => return DepOutcome::Independent,
-            DepOutcome::Dependence { distance: dist, dirs } => {
+            DepOutcome::Dependence {
+                distance: dist,
+                dirs,
+            } => {
                 if combined_dirs.is_empty() {
                     combined_dirs = dirs;
                 } else {
@@ -334,9 +374,15 @@ pub fn test_pair(subscripts_src: &[Affine], subscripts_dst: &[Affine], range: It
     if combined_dirs.iter().all(|d| d.lt || d.eq || d.gt) && combined_dirs.is_empty() {
         // No dimensions at all — treat as dependent conservatively? Empty subscript
         // lists never reach here (access pairing guarantees >= 1).
-        return DepOutcome::Dependence { distance: None, dirs: vec![DirVec::star()] };
+        return DepOutcome::Dependence {
+            distance: None,
+            dirs: vec![DirVec::star()],
+        };
     }
-    DepOutcome::Dependence { distance, dirs: combined_dirs }
+    DepOutcome::Dependence {
+        distance,
+        dirs: combined_dirs,
+    }
 }
 
 #[cfg(test)]
@@ -351,15 +397,24 @@ mod tests {
 
     #[test]
     fn ziv_cases() {
-        assert!(outcome_is_independent(Affine { a: 0, b: 3 }, Affine { a: 0, b: 5 }));
-        assert!(!outcome_is_independent(Affine { a: 0, b: 3 }, Affine { a: 0, b: 3 }));
+        assert!(outcome_is_independent(
+            Affine { a: 0, b: 3 },
+            Affine { a: 0, b: 5 }
+        ));
+        assert!(!outcome_is_independent(
+            Affine { a: 0, b: 3 },
+            Affine { a: 0, b: 3 }
+        ));
     }
 
     #[test]
     fn strong_siv_distance_one() {
         // a[i-1] vs a[i]: src coeff 1 b -1; dst coeff 1 b 0 => distance = (0-(-1))/1 = 1
         match test_dimension(Affine { a: 1, b: -1 }, Affine { a: 1, b: 0 }, R) {
-            DepOutcome::Dependence { distance: Some(1), dirs } => {
+            DepOutcome::Dependence {
+                distance: Some(1),
+                dirs,
+            } => {
                 assert!(dirs[0].gt && !dirs[0].lt && !dirs[0].eq);
             }
             other => panic!("expected distance-1 dependence, got {other:?}"),
@@ -369,50 +424,75 @@ mod tests {
     #[test]
     fn strong_siv_proves_independence_on_nondivisible() {
         // 2i vs 2i+1: delta = 1 not divisible by 2 -> independent
-        assert!(outcome_is_independent(Affine { a: 2, b: 0 }, Affine { a: 2, b: 1 }));
+        assert!(outcome_is_independent(
+            Affine { a: 2, b: 0 },
+            Affine { a: 2, b: 1 }
+        ));
     }
 
     #[test]
     fn weak_zero_hits_single_point() {
         // src a[i], dst a[7]: single point i=7 in range -> dependence exists
-        assert!(!outcome_is_independent(Affine { a: 1, b: 0 }, Affine { a: 0, b: 7 }));
+        assert!(!outcome_is_independent(
+            Affine { a: 1, b: 0 },
+            Affine { a: 0, b: 7 }
+        ));
         // but a[200] out of range -> independent
-        assert!(outcome_is_independent(Affine { a: 1, b: 0 }, Affine { a: 0, b: 200 }));
+        assert!(outcome_is_independent(
+            Affine { a: 1, b: 0 },
+            Affine { a: 0, b: 200 }
+        ));
     }
 
     #[test]
     fn weak_crossing() {
         // src a[i], dst a[-i + 100]: crossing at i=50 in range
-        assert!(!outcome_is_independent(Affine { a: 1, b: 0 }, Affine { a: -1, b: 100 }));
+        assert!(!outcome_is_independent(
+            Affine { a: 1, b: 0 },
+            Affine { a: -1, b: 100 }
+        ));
         // a[i] vs a[-i + 300]: crossing at 150 out of [0,99]
-        assert!(outcome_is_independent(Affine { a: 1, b: 0 }, Affine { a: -1, b: 300 }));
+        assert!(outcome_is_independent(
+            Affine { a: 1, b: 0 },
+            Affine { a: -1, b: 300 }
+        ));
     }
 
     #[test]
     fn gcd_box_general_case() {
         // a[2i] vs a[i]: 2i - j = 0, gcd(2,1)=1 divides 0 -> solutions exist (i=j even)
-        assert!(!outcome_is_independent(Affine { a: 2, b: 0 }, Affine { a: 1, b: 0 }));
+        assert!(!outcome_is_independent(
+            Affine { a: 2, b: 0 },
+            Affine { a: 1, b: 0 }
+        ));
         // a[2i] vs a[2j+1]: 2i - 2j = 1, gcd 2 does not divide 1 -> independent
-        assert!(outcome_is_independent(Affine { a: 2, b: 0 }, Affine { a: 2, b: 1 }));
+        assert!(outcome_is_independent(
+            Affine { a: 2, b: 0 },
+            Affine { a: 2, b: 1 }
+        ));
     }
 
     #[test]
     fn negative_range_guards() {
-        // Distance beyond trip count: a[i-100] vs a[i] with only 100 trips
+        // a[i-100] vs a[i] over 200 trips: distance-100 pairs exist (i >= 100)
         match test_dimension(
             Affine { a: 1, b: -100 },
             Affine { a: 1, b: 0 },
-            IterRange { lo: 0, hi: 99 },
+            IterRange { lo: 0, hi: 199 },
         ) {
-            DepOutcome::Dependence { distance: Some(100), .. } => {}
+            DepOutcome::Dependence {
+                distance: Some(100),
+                ..
+            } => {}
             other => panic!("expected distance 100, got {other:?}"),
         }
-        // But with only 10 trips the pair is unreachable -> independent
+        // Over exactly 100 trips [0,99] the reader needs iteration >= 100:
+        // unreachable -> independent (bounds-awareness catches off-by-one bugs)
         assert!(matches!(
             test_dimension(
                 Affine { a: 1, b: -100 },
                 Affine { a: 1, b: 0 },
-                IterRange { lo: 0, hi: 9 }
+                IterRange { lo: 0, hi: 99 }
             ),
             DepOutcome::Independent
         ));

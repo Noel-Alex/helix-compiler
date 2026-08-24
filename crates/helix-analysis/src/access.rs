@@ -80,11 +80,16 @@ fn classify_rec(
             if let Some(inst) = bd.insts.iter().find(|i| i.dst() == Some(v)) {
                 def = match inst {
                     Inst::Const { c, .. } => const_i128(c).map(|x| Affine { a: 0, b: x }),
-                    Inst::Bin { op, a, b, .. } => bin_affine(func, loop_, iv, *op, *a, *b, memo, depth),
+                    Inst::Bin { op, a, b, .. } => {
+                        bin_affine(func, loop_, iv, *op, *a, *b, memo, depth)
+                    }
                     Inst::Unary { op, a, .. } => {
                         let inner = classify_rec(func, loop_, iv, *a, memo, depth + 1)?;
                         match op {
-                            helix_ir::UnOp::Neg => Some(Affine { a: -inner.a, b: -inner.b }),
+                            helix_ir::UnOp::Neg => Some(Affine {
+                                a: -inner.a,
+                                b: -inner.b,
+                            }),
                             helix_ir::UnOp::Not => None,
                         }
                     }
@@ -121,6 +126,7 @@ fn phi_affine(
     first
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bin_affine(
     func: &FuncIr,
     loop_: &Loop,
@@ -135,11 +141,23 @@ fn bin_affine(
     let l = classify_rec(func, loop_, iv, a, memo, depth + 1);
     let r = classify_rec(func, loop_, iv, b, memo, depth + 1);
     match (op, l?, r?) {
-        (B::Add, x, y) => Some(Affine { a: x.a + y.a, b: x.b + y.b }),
-        (B::Sub, x, y) => Some(Affine { a: x.a - y.a, b: x.b - y.b }),
+        (B::Add, x, y) => Some(Affine {
+            a: x.a + y.a,
+            b: x.b + y.b,
+        }),
+        (B::Sub, x, y) => Some(Affine {
+            a: x.a - y.a,
+            b: x.b - y.b,
+        }),
         (B::Mul, x, y) if x.a == 0 && y.a == 0 => Some(Affine { a: 0, b: x.b * y.b }),
-        (B::Mul, x, y) if x.a == 0 && y.a != 0 => Some(Affine { a: x.b * y.a, b: x.b * y.b }),
-        (B::Mul, x, y) if x.a != 0 && y.a == 0 => Some(Affine { a: x.a * y.b, b: x.b * y.b }),
+        (B::Mul, x, y) if x.a == 0 && y.a != 0 => Some(Affine {
+            a: x.b * y.a,
+            b: x.b * y.b,
+        }),
+        (B::Mul, x, y) if x.a != 0 && y.a == 0 => Some(Affine {
+            a: x.a * y.b,
+            b: x.b * y.b,
+        }),
         _ => None,
     }
 }

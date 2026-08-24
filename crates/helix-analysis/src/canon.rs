@@ -2,8 +2,8 @@
 //! and the header comparison — turning the IR shape of a `for` back into
 //! (iv, start, end) for analysis and reporting.
 
-use crate::loops::Loop;
 use crate::Bound;
+use crate::loops::Loop;
 use helix_ir::{BinOp, BlockId, Constant, FuncIr, Inst, LocalId, Term, ValueId};
 
 /// A recognized canonical counting loop.
@@ -50,7 +50,12 @@ pub fn canon(func: &FuncIr, lp: &Loop) -> Option<CanonicalLoop> {
 
         // Back-edge def must be phi.dst + const (or const + phi.dst).
         let step = match find_def(func, back) {
-            Some(Inst::Bin { op: BinOp::Add, a, b, .. }) => {
+            Some(Inst::Bin {
+                op: BinOp::Add,
+                a,
+                b,
+                ..
+            }) => {
                 if *a == phi.dst {
                     const_i64(func, *b)
                 } else if *b == phi.dst {
@@ -97,7 +102,7 @@ pub fn canon(func: &FuncIr, lp: &Loop) -> Option<CanonicalLoop> {
 }
 
 /// Locate the instruction defining `v` anywhere in the function.
-pub fn find_def<'f>(func: &'f FuncIr, v: ValueId) -> Option<&'f Inst> {
+pub fn find_def(func: &FuncIr, v: ValueId) -> Option<&Inst> {
     for bd in &func.blocks {
         if let Some(i) = bd.insts.iter().find(|i| i.dst() == Some(v)) {
             return Some(i);

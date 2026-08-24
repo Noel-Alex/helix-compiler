@@ -18,7 +18,7 @@ pub mod plan;
 pub mod reduce;
 
 pub use loops::{Loop, LoopInfo};
-pub use plan::{analyze, DepEdge, LoopReport, Reduction, ReductionOp, Verdict};
+pub use plan::{DepEdge, LoopReport, Reduction, ReductionOp, Verdict, analyze};
 
 use serde::{Deserialize, Serialize};
 

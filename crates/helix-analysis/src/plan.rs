@@ -2,12 +2,12 @@
 //! exempt recognized reductions, and produce the polished [`LoopReport`] that
 //! feeds both the parallelizer backend and the Observatory UI.
 
+use crate::Bound;
 use crate::access;
 use crate::canon::{self, CanonicalLoop};
 use crate::deps::{self, DepOutcome, IterRange};
 use crate::loops::LoopInfo;
 use crate::reduce;
-use crate::Bound;
 use helix_ir::FuncIr;
 use serde::{Deserialize, Serialize};
 
@@ -120,19 +120,26 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
         // Reduction recognition first — an approved reduction exempts its own
         // distance-1 RAW self-dependence on the accumulator.
         let reductions = reduce::find_reductions(func, &lp.blocks);
-        let reduction_report = reductions
-            .first()
-            .map(|r| Reduction { op: r.op, var: local_name(func, r.var) });
+        let reduction_report = reductions.first().map(|r| Reduction {
+            op: r.op,
+            var: local_name(func, r.var),
+        });
 
         // Iteration range for bound-aware testing (half-open [start, end)).
         let range = canonical.as_ref().map_or(
-            IterRange { lo: i128::MIN / 4, hi: i128::MAX / 4 },
+            IterRange {
+                lo: i128::MIN / 4,
+                hi: i128::MAX / 4,
+            },
             |c| match (&c.start, &c.end) {
                 (Bound::Const(lo), Bound::Const(hi)) => IterRange {
                     lo: *lo as i128,
                     hi: hi.saturating_sub(1) as i128,
                 },
-                _ => IterRange { lo: -1 << 40, hi: 1 << 40 }, // symbolic bounds: wide box
+                _ => IterRange {
+                    lo: -1 << 40,
+                    hi: 1 << 40,
+                }, // symbolic bounds: wide box
             },
         );
 
@@ -140,8 +147,7 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
         let mut raw_deps = Vec::new();
         let mut war_deps = Vec::new();
         let mut waw_deps = Vec::new();
-        let arr_name =
-            |l: helix_ir::LocalId| local_name(func, l);
+        let arr_name = |l: helix_ir::LocalId| local_name(func, l);
 
         for (i, src) in accesses.iter().enumerate() {
             for dst in accesses.iter().skip(i + 1) {
@@ -283,14 +289,22 @@ fn sink_for<'s>(
 fn has_print(func: &FuncIr, lp: &crate::loops::Loop) -> bool {
     lp.blocks
         .iter()
-        .any(|b| func.block(*b).insts.iter().any(|i| is_print_call(i)))
+        .any(|b| func.block(*b).insts.iter().any(is_print_call))
 }
 
 fn is_print_call(i: &helix_ir::Inst) -> bool {
     matches!(i, helix_ir::Inst::Call(c) if c.callee == "print")
 }
 
-fn push_edge(sink: &mut Vec<DepEdge>, kind: &str, array: &str, distance: Option<i64>, dir: &str, level: u32, explain: &str) {
+fn push_edge(
+    sink: &mut Vec<DepEdge>,
+    kind: &str,
+    array: &str,
+    distance: Option<i64>,
+    dir: &str,
+    level: u32,
+    explain: &str,
+) {
     sink.push(DepEdge {
         kind_label: format!("{kind} on '{array}'"),
         array: array.to_string(),
@@ -312,7 +326,6 @@ fn render_affine(a: deps::Affine, iv: &str) -> String {
         (k, 0) => format!("{k}*{iv}"),
         (k, c) if c > 0 => format!("{k}*{iv} + {c}"),
         (k, c) => format!("{k}*{iv} - {}", -c),
-        _ => "?".to_string(),
     }
 }
 
