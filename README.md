@@ -1,7 +1,15 @@
-# HELIX Lite — an automatic parallelizing compiler
+<div align="center">
 
-Write ordinary sequential numerical code. HELIX proves which loops are safe to run on
-all your cores — and *shows you the proof*.
+# HELIX Lite
+
+**An automatic parallelizing compiler that shows you the proof.**
+
+Write ordinary sequential numerical code. HELIX proves which loops are safe to run
+on all your cores — and shows you the dependence analysis behind every verdict.
+
+![saxpy speedup](docs/benchmarks/figs/saxpy_16777216_speedup.svg)
+
+</div>
 
 ```helix
 fn main() {
@@ -28,6 +36,24 @@ Loop #1: RAW 1 / WAR 0 / WAW 0 => SEQUENTIAL (RAW a[i] <- a[i - 1] (carried by i
     WRITE a[i]
 ```
 
+A loop that *can* be proven independent is parallelized across every core.
+A loop that carries a dependence — like the recurrence above — is **refused,
+with the exact distance and direction printed as evidence**.
+
+---
+
+## The pipeline
+
+![HELIX pipeline](docs/pipeline.svg)
+
+source → lexer → Pratt parser → AST → type checker → CFG IR → SSA (semi-pruned,
+CHK dominators) → constant folding/propagation · copy-prop · DCE · CSE · LICM →
+loop detection → **dependence battery (ZIV · SIV family · gcd+bounded-box)** →
+parallelization (DOALL + reduction recognition) → Cranelift → x86-64 machine code.
+
+Every stage is inspectable: `helix dump tokens|ast|ir|ssa`, or the whole pipeline
+stepped through visually in the Observatory (`helix observe`).
+
 ## Measured results (laptop, 2026-08-25)
 
 | Claim | Number |
@@ -38,14 +64,15 @@ Loop #1: RAW 1 / WAR 0 / WAW 0 => SEQUENTIAL (RAW a[i] <- a[i - 1] (carried by i
 | recurrence loop | **refused** — RAW distance-1 proven, runs sequential |
 | cross-backend correctness | every example bit-identical interp ≡ JIT |
 
-Full tables + figures: [docs/benchmarks/results.md](docs/benchmarks/results.md).
+Full tables + methodology: [docs/benchmarks/results.md](docs/benchmarks/results.md).
 
-## The pipeline
+### Speedups at a glance
 
-source → lexer → Pratt parser → AST → type checker → CFG IR → SSA (semi-pruned,
-CHK dominators) → constant folding/propagation · copy-prop · DCE · CSE · LICM →
-loop detection → **dependence battery (ZIV · SIV family · gcd+bounded-box)** →
-parallelization (DOALL + reduction recognition) → Cranelift → x86-64 machine code
+| dot product @4.2M | jacobi stencil @1024² |
+|---|---|
+| ![dot](docs/benchmarks/figs/dot_reduction_4194304_speedup.svg) | ![jacobi](docs/benchmarks/figs/jacobi_2d_1024_speedup.svg) |
+
+*(15 measured kernels × sizes live in [`docs/benchmarks/figs/`](docs/benchmarks/figs).)*
 
 ## Try it
 
@@ -54,6 +81,14 @@ cargo run --release -p helix-cli -- observe     # the Observatory web UI
 helix run examples/saxpy.hx                     # interpreter
 helix run --backend jit examples/saxpy.hx       # JIT (identical output)
 helix selftest                                  # differential gauntlet
+```
+
+Handy controls:
+
+```bash
+helix run --backend jit --threads 4 examples/saxpy.hx   # pin the thread count
+helix bench --quick                                     # fast benchmark pass
+HELIX_SCHEDULE=guided helix run --backend jit f.hx      # pick the schedule
 ```
 
 ## Layout

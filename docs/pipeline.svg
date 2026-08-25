@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" font-family="Segoe UI, system-ui, sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5b6673"/>
+    </marker>
+    <linearGradient id="gSafe" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00c896"/><stop offset="1" stop-color="#00a377"/>
+    </linearGradient>
+    <linearGradient id="gSeq" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e5a13c"/><stop offset="1" stop-color="#c9822a"/>
+    </linearGradient>
+  </defs>
+
+  <style>
+    .stage { fill:#161b22; stroke:#2d3642; rx:10; }
+    .slabel{ fill:#e6edf3; font-size:14px; font-weight:600; }
+    .ssub  { fill:#8b98a9; font-size:10.5px; }
+    .flow  { stroke:#5b6673; stroke-width:1.6; fill:none; marker-end:url(#arr); }
+    .crate { fill:#0d1117; stroke:#30363d; }
+    .cname { fill:#7ee2b8; font-size:11px; font-family:Consolas,monospace; }
+    .branch{ fill:none; stroke-width:1.6; marker-end:url(#arr); }
+  </style>
+
+  <!-- row 1: frontend -->
+  <rect class="stage" x="20" y="30" width="150" height="64" rx="10"/>
+  <text class="slabel" x="95" y="57" text-anchor="middle">source .hx</text>
+  <text class="ssub"  x="95" y="74" text-anchor="middle">sequential numerical code</text>
+
+  <rect class="stage" x="210" y="30" width="170" height="64" rx="10"/>
+  <text class="slabel" x="295" y="57" text-anchor="middle">lexer + Pratt parser</text>
+  <text class="ssub"  x="295" y="74" text-anchor="middle">AST · caret diagnostics</text>
+
+  <rect class="stage" x="420" y="30" width="170" height="64" rx="10"/>
+  <text class="slabel" x="505" y="57" text-anchor="middle">type checker</text>
+  <text class="ssub"  x="505" y="74" text-anchor="middle">typed tree · definite assign</text>
+
+  <rect class="stage" x="630" y="30" width="160" height="64" rx="10"/>
+  <text class="slabel" x="710" y="57" text-anchor="middle">CFG → SSA</text>
+  <text class="ssub"  x="710" y="74" text-anchor="middle">φ placement + verifier</text>
+
+  <path class="flow" d="M170,62 L206,62"/>
+  <path class="flow" d="M380,62 L416,62"/>
+  <path class="flow" d="M590,62 L626,62"/>
+
+  <!-- passes band under SSA -->
+  <rect class="stage" x="630" y="120" width="160" height="46" rx="10"/>
+  <text class="slabel" x="710" y="140" text-anchor="middle" font-size="12">optimization passes</text>
+  <text class="ssub"  x="710" y="156" text-anchor="middle">fold·prop·DCE·CSE·LICM</text>
+  <path class="flow" d="M710,94 L710,116"/>
+
+  <!-- analysis -->
+  <rect class="stage" x="420" y="120" width="170" height="46" rx="10"/>
+  <text class="slabel" x="505" y="140" text-anchor="middle" font-size="12">dependence battery</text>
+  <text class="ssub"  x="505" y="156" text-anchor="middle">ZIV·SIV·gcd+box</text>
+  <path class="flow" d="M626,152 L594,143"/>
+
+  <!-- verdict branch -->
+  <rect x="180" y="108" width="190" height="34" rx="17" fill="url(#gSafe)"/>
+  <text x="275" y="130" text-anchor="middle" fill="#04140f" font-size="12.5" font-weight="700">SAFE / REDUCTION → DOALL</text>
+  <rect x="180" y="148" width="190" height="26" rx="13" fill="url(#gSeq)"/>
+  <text x="275" y="165" text-anchor="middle" fill="#241703" font-size="11.5" font-weight="600">SEQUENTIAL (with proof)</text>
+  <path class="branch" d="M416,136 L374,125" stroke="#00c896"/>
+  <path class="branch" d="M416,152 L374,161" stroke="#e5a13c"/>
+
+  <!-- runtime + codegen row -->
+  <rect class="stage" x="20" y="216" width="220" height="56" rx="10"/>
+  <text class="slabel" x="130" y="240" text-anchor="middle">worker-pool runtime</text>
+  <text class="ssub"  x="130" y="257" text-anchor="middle">fork/join · reductions · schedules</text>
+
+  <rect class="stage" x="290" y="216" width="230" height="56" rx="10"/>
+  <text class="slabel" x="405" y="240" text-anchor="middle">Cranelift JIT</text>
+  <text class="ssub"  x="405" y="257" text-anchor="middle">bounds guards · IEEE floats · checked ops</text>
+
+  <rect class="stage" x="580" y="216" width="180" height="56" rx="10"/>
+  <text class="slabel" x="670" y="240" text-anchor="middle">x86-64 machine code</text>
+  <text class="ssub"  x="670" y="257" text-anchor="middle">bit-identical to interpreter</text>
+
+  <path class="flow" d="M240,236 L286,240"/>
+  <path class="flow" d="M520,244 L576,244"/>
+
+  <!-- parallel region path from verdicts into runtime+codegen -->
+  <path class="branch" d="M275,182 L275,212" stroke="#00c896"/>
+
+  <!-- observatory note -->
+  <rect class="crate" x="800" y="216" width="140" height="56" rx="10"/>
+  <text class="cname" x="870" y="240" text-anchor="middle">helix-observe</text>
+  <text class="ssub" x="870" y="257" text-anchor="middle">every stage visualized</text>
+  <path class="flow" d="M790,244 L796,244" stroke="#30363d"/>
+
+  <!-- crate labels along bottom -->
+  <text class="cname" x="95"  y="106" text-anchor="middle">helix-syntax</text>
+  <text class="cname" x="295" y="106" text-anchor="middle">helix-syntax</text>
+  <text class="cname" x="505" y="106" text-anchor="middle">helix-sema</text>
+  <text class="cname" x="710" y="106" text-anchor="middle">helix-ir</text>
+  <text class="cname" x="505" y="185" text-anchor="middle">helix-analysis</text>
+  <text class="cname" x="130" y="290" text-anchor="middle">helix-runtime</text>
+  <text class="cname" x="405" y="290" text-anchor="middle">helix-backend</text>
+  <text class="cname" x="275" y="196" text-anchor="end">parallel plan</text>
+</svg>
