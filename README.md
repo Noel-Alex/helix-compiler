@@ -91,6 +91,8 @@ helix bench --quick                                     # fast benchmark pass
 HELIX_SCHEDULE=guided helix run --backend jit f.hx      # pick the schedule
 ```
 
+New to the project? The five-minute tour is in [docs/guide.md](docs/guide.md).
+
 ## Layout
 
 | Path | What |
