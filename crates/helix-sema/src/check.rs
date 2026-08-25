@@ -178,6 +178,11 @@ pub enum TypedStmt {
         value: Option<TypedExpr>,
         span: Span,
     },
+    /// Bare nested `{ .. }` block statement: a real scope whose statements
+    /// execute in order. Kept structurally so every consumer of the typed tree
+    /// (IR lowering, all-paths-return, definite assignment) sees the same
+    /// statements the reference interpreter runs.
+    Nested(TypedBlock),
     /// Expression evaluated for effects only (calls, short-circuit operands).
     Effect(TypedExpr),
 }
@@ -279,6 +284,9 @@ impl TypedStmt {
                 }
                 None => f.cond.lit_true() && block_always_returns(&f.then_blk),
             },
+            // A nested block guarantees a return exactly when one of its own
+            // statements does.
+            TypedStmt::Nested(b) => block_always_returns(b),
             _ => false,
         }
     }
@@ -765,14 +773,7 @@ impl FnCtx<'_> {
                 span: Span { start: 0, end: 0 },
                 kind: TypedExprKind::Error,
             }),
-            Stmt::Block(b) => {
-                let _ = self.check_block(b);
-                TypedStmt::Effect(TypedExpr {
-                    ty: Ty::Unit,
-                    span: b.span,
-                    kind: TypedExprKind::Error,
-                })
-            }
+            Stmt::Block(b) => TypedStmt::Nested(self.check_block(b)),
         }
     }
 
@@ -804,14 +805,23 @@ impl FnCtx<'_> {
         };
         let base_ty = self.ty_of(base_sym);
 
-        if matches!(self.kind_of(base_sym), crate::SymKind::LoopVar) {
-            self.diags.push(diag(
-                target.base.span,
-                format!(
-                    "cannot assign to loop variable '{}' (loops must stay affine)",
-                    target.base.name
-                ),
-            ));
+        match self.kind_of(base_sym) {
+            crate::SymKind::LoopVar => {
+                self.diags.push(diag(
+                    target.base.span,
+                    format!(
+                        "cannot assign to loop variable '{}' (loops must stay affine)",
+                        target.base.name
+                    ),
+                ));
+            }
+            crate::SymKind::Const => {
+                self.diags.push(diag(
+                    target.base.span,
+                    format!("cannot assign to constant '{}'", target.base.name),
+                ));
+            }
+            _ => {}
         }
 
         let lv = match &target.index {
@@ -1502,6 +1512,9 @@ impl InitCx<'_, '_> {
                 self.expr(e, &init);
                 init
             }
+            // A bare nested block is a scoped sequence: assignments inside it
+            // persist (scoping of *names* was resolved during checking).
+            TypedStmt::Nested(b) => self.block(b, init),
         }
     }
 

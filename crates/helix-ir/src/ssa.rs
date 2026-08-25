@@ -170,17 +170,32 @@ fn place_phis(ir: &mut FuncIr, names: &GlobalNames, df: &[Vec<BlockId>]) {
         let mut queued: Vec<bool> = vec![false; n];
         let mut work: Vec<usize> = Vec::new();
 
+        // The builder may have placed phis of its own before SSA construction
+        // (the shared exit block's `$ret` merge). Those are real definitions
+        // of `var` and must participate in the iterated-DF dedup: without this
+        // seeding, placement pushes a SECOND identical phi at such a block and
+        // renaming mints two fresh dsts for it — an SSA violation.
+        for (bi, block) in ir.blocks.iter().enumerate() {
+            if block
+                .phis
+                .iter()
+                .any(|p| p.var == *var && !p.args.is_empty())
+            {
+                has_phi.insert(BlockId(bi as u32));
+            }
+        }
+
         // Seed with every block that defines `var` (dst == var's cell id), or
-        // that defines it as a parameter phi (zero args).
+        // that already hosts a phi over it — parameter phis (zero args) AND
+        // merge phis the builder created itself (the shared exit block's `$ret`
+        // accumulator). A pre-existing phi is a real definition of `var`, so
+        // its block joins the worklist exactly like an instruction def.
         for (bi, block) in ir.blocks.iter().enumerate() {
             let defines = block
                 .insts
                 .iter()
                 .any(|i| i.dst().is_some_and(|d| d.0 == var.0))
-                || block
-                    .phis
-                    .iter()
-                    .any(|p| p.var == *var && p.args.is_empty());
+                || block.phis.iter().any(|p| p.var == *var);
             if defines {
                 work.push(bi);
                 queued[bi] = true;
@@ -462,6 +477,54 @@ fn apply_renamings(
         for (i, col) in columns.into_iter().enumerate() {
             ir.blocks[pi].phis[i].args = col;
             ir.blocks[pi].phis[i].args.sort_unstable_by_key(|(b, _)| *b);
+        }
+    }
+
+    // 2.5 Drop spurious phis. Semi-pruned placement has no liveness data, so
+    //     it can push a phi into an enclosing join (loop header, outer merge)
+    //     that no definition of the variable dominates. Renaming then fills
+    //     that column from an empty stack — the version-0 cell spelling of the
+    //     variable itself, which has no definition once SSA renaming is done
+    //     (fresh names always start strictly above every pre-existing id). A
+    //     phi carrying such a column merges an undefined value; every consumer
+    //     of it would read garbage on some path, so such consumers do not exist
+    //     in well-typed programs and the phi is dead. Prune those phis (and,
+    //     transitively, phis fed by them) BEFORE jump args are rebuilt from the
+    //     surviving phi rows, which restores the arity contract automatically.
+    //
+    //     Zero-arg entry phis are exempt: their `dst` IS the version-0 cell by
+    //     design (parameters), not a stale column.
+    let mut bad_dsts: HashSet<u32> = HashSet::new();
+    loop {
+        let mut grew = false;
+        for b in &ir.blocks {
+            for p in &b.phis {
+                if bad_dsts.contains(&p.dst.0)
+                    || p.args.is_empty()
+                    || p.args.iter().any(|(from, _)| !b.preds.contains(from))
+                {
+                    // Already condemned, a parameter definition, or holding an
+                    // edge that no longer exists — the last means some earlier
+                    // pruning removed its pred; it cannot execute meaningfully.
+                    continue;
+                }
+                let bad = p.args.len() != b.preds.len()
+                    || p.args
+                        .iter()
+                        .any(|(_, v)| v.0 == p.var.0 || bad_dsts.contains(&v.0));
+                if bad {
+                    bad_dsts.insert(p.dst.0);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    if !bad_dsts.is_empty() {
+        for b in &mut ir.blocks {
+            b.phis.retain(|p| !bad_dsts.contains(&p.dst.0));
         }
     }
 

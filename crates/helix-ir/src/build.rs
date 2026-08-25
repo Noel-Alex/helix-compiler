@@ -120,6 +120,7 @@ fn scan_stmt(s: &TypedStmt, r: &mut Reservations) {
                 scan_expr(v, r);
             }
         }
+        TypedStmt::Nested(b) => scan_stmts(&b.stmts, r),
     }
 }
 
@@ -598,6 +599,17 @@ impl Builder {
             TypedStmt::Effect(e) => {
                 self.effect_expr(e);
             }
+            // A bare `{ .. }` block introduces no control flow: its statements
+            // lower inline into the current block, exactly as the reference
+            // interpreter executes them in order.
+            TypedStmt::Nested(blk) => {
+                for s in &blk.stmts {
+                    if self.terminated() {
+                        break;
+                    }
+                    self.stmt(s);
+                }
+            }
         }
     }
 
@@ -619,8 +631,12 @@ impl Builder {
     fn assign(&mut self, target: &TypedLValue, value: &TypedExpr) {
         match &target.index {
             Some(idx) => {
-                let v = self.expr(value);
+                // Evaluation order matches the reference interpreter (the
+                // normative semantics): index first, then the stored value.
+                // Both operands may carry side-effecting calls, so emission
+                // order is observable output.
                 let i = self.expr(idx);
+                let v = self.expr(value);
                 self.emit(Inst::Store {
                     arr: LocalId(target.base.0),
                     idx: i,

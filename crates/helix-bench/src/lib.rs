@@ -234,6 +234,11 @@ impl NativeVariant {
     /// # Errors
     /// Any pipeline stage or backend compile failure, as text.
     pub fn new(src: &str, unchecked: bool) -> Result<Self, String> {
+        // Honor the feature gate: without `bench-native` no build may construct
+        // a JIT variant (meta.jit_available would otherwise lie).
+        if let NativeAvailability::Unavailable(why) = native_availability() {
+            return Err(format!("native variants unavailable: {why}"));
+        }
         let ast = helix_syntax::parse_str(src).map_err(|e| format!("syntax error: {e}"))?;
         let typed = helix_sema::check(&ast).map_err(|ds| format!("{ds:#?}"))?;
         let mut funcs = helix_ir::build(&typed);
@@ -442,6 +447,13 @@ pub fn read_json(path: &Path) -> Result<CampaignReport, String> {
 /// becomes available.
 #[must_use]
 pub fn run_campaign(config: &BenchConfig) -> CampaignReport {
+    // Whole-campaign serialization. reset_host_heap, the HELIX_NTHREADS
+    // EnvGuard, and the trap recorder are PROCESS-GLOBAL; two concurrent
+    // campaigns would free each other's live arrays (heap corruption,
+    // reproduced as 0xc0000374) and race env writes. Tests that exercise
+    // run_campaign concurrently therefore queue here.
+    static CAMPAIGN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _campaign_guard = CAMPAIGN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
@@ -623,10 +635,20 @@ fn sweep_efficiency(src: &str, config: &BenchConfig) -> Vec<EfficiencyRow> {
     // baked-in hint (8) would run, and since the env override CAPS the hint,
     // every p >= 8 would tie the baseline at ~1.0x — exactly the flat-sweep
     // bug this replaces.
+    // Without the native feature the interpreter stands in (it ignores thread
+    // hints, so rows honestly report ~1.0x — no fabricated scaling).
+    let native_ready = matches!(native_availability(), NativeAvailability::Ready);
+    let make_variant = |p: usize| -> Result<Box<dyn ExecVariant>, String> {
+        if native_ready {
+            NativeVariant::new_parallel(src, p).map(|v| Box::new(v) as Box<dyn ExecVariant>)
+        } else {
+            interp_variant(src).map(|v| Box::new(v) as Box<dyn ExecVariant>)
+        }
+    };
     let mut rows = Vec::with_capacity(ps.len());
     let mut base = f64::NAN;
     for &p in &ps {
-        let Ok(variant) = NativeVariant::new_parallel(src, p) else {
+        let Ok(variant) = make_variant(p) else {
             return Vec::new();
         };
         let med = timing::measure_with_reps(|r| variant.time_batch(r)).median_ms;

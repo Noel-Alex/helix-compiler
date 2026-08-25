@@ -155,18 +155,31 @@ pub fn copy_prop(ir: &mut FuncIr) -> ChangeFlag {
             continue;
         }
         if is_phi {
-            let before = ir.blocks[bi as usize].phis.len();
+            // Filter positionally against the keep-mask of surviving phis: a
+            // join may host several phis of which only some are deleted, so
+            // the removed column is not necessarily the LAST one. Popping the
+            // tail would leave the surviving phi reading another phi's edge
+            // value (miscompile) and trip the verifier in-tree.
+            let keep_mask: Vec<bool> = ir.blocks[bi as usize]
+                .phis
+                .iter()
+                .map(|p| p.dst != *dst)
+                .collect();
+            if keep_mask.iter().all(|k| *k) {
+                continue; // nothing will be deleted here
+            }
             ir.blocks[bi as usize].phis.retain(|p| p.dst != *dst);
-            if ir.blocks[bi as usize].phis.len() != before {
-                flag.changed = true;
-                // The phi list shrank: every predecessor's jump argument list
-                // must shrink by the same entry or the arity contract breaks.
-                for p in ir.blocks[bi as usize].preds.clone() {
-                    if let Term::Jump(t, args) = &mut ir.blocks[p.0 as usize].term
-                        && t.0 == bi
-                    {
-                        args.pop();
-                    }
+            flag.changed = true;
+            for p in ir.blocks[bi as usize].preds.clone() {
+                if let Term::Jump(t, args) = &mut ir.blocks[p.0 as usize].term
+                    && t.0 == bi
+                {
+                    *args = args
+                        .iter()
+                        .zip(keep_mask.iter())
+                        .filter(|(_, k)| **k)
+                        .map(|(v, _)| *v)
+                        .collect();
                 }
             }
         }
