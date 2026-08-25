@@ -16,11 +16,16 @@ fn main() {
 
 ```
 $ helix loops examples/scale.hx
-Loop #1: RAW 0 / WAR 0 / WAW 0 => SAFE          ✓ parallelized × N threads
+==== main loop analysis ====
+Loop #1: RAW 0 / WAR 0 / WAW 0 => SAFE
+    READ a[i]
+    WRITE out[i]
 
 $ helix loops examples/recurrence_reject.hx
-Loop #1: RAW 1 / WAR 0 / WAW 0 => SEQUENTIAL
-    RAW a[i] <- a[i - 1] (carried by iteration distance 1, level 1)
+==== main loop analysis ====
+Loop #1: RAW 1 / WAR 0 / WAW 0 => SEQUENTIAL (RAW a[i] <- a[i - 1] (carried by iteration distance 1, level 1))
+    READ a[i - 1]
+    WRITE a[i]
 ```
 
 ## Measured results (laptop, 2026-08-25)

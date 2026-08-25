@@ -53,7 +53,7 @@ impl std::error::Error for LexError {}
 /// # Errors
 ///
 /// Returns the first [`LexError`] encountered (comments, characters,
-/// integer overflow).
+/// integer/float overflow).
 pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
     Lexer { src, pos: 0 }.tokenize()
 }
@@ -212,9 +212,21 @@ impl Lexer<'_> {
 
         let text = &self.src[start..self.pos];
         if is_float {
-            // The grammar above guarantees `text` parses; INFINITY is the
-            // documented fallback for literals like `1e999` that overflow f64.
-            Ok(TokKind::Float(text.parse::<f64>().unwrap_or(f64::INFINITY)))
+            // The grammar above guarantees `text` parses; overflow yields
+            // INFINITY (never an error), so literals like `1e999` are
+            // rejected here — INFINITY would otherwise reach the AST and
+            // serialise as JSON `null` in Observatory artifacts.
+            let value = text.parse::<f64>().unwrap_or(f64::INFINITY);
+            if value.is_infinite() {
+                return Err(LexError {
+                    span: Span::new(
+                        u32::try_from(start).unwrap_or(u32::MAX),
+                        self.here(),
+                    ),
+                    msg: format!("float literal `{text}` is too large"),
+                });
+            }
+            Ok(TokKind::Float(value))
         } else {
             text.parse::<i64>().map(TokKind::Int).map_err(|_| LexError {
                 span: Span::new(u32::try_from(start).unwrap_or(u32::MAX), self.here()),
@@ -446,8 +458,14 @@ mod tests {
     }
 
     #[test]
-    fn huge_float_overflowing_f64_becomes_infinity() {
-        assert_eq!(kinds("1e999"), vec![TokKind::Float(f64::INFINITY)]);
+    fn huge_float_overflowing_f64_is_rejected() {
+        // INFINITY would reach the AST and serialise as JSON null in
+        // Observatory artifacts, so overflow is a lex error instead.
+        let err = lex("1e999").expect_err("float overflow");
+        assert!(err.msg.contains("too large"), "{}", err.msg);
+        assert_eq!(err.span, Span::new(0, 5));
+        // Underflow to zero is still fine.
+        assert_eq!(kinds("1e-999"), vec![TokKind::Float(0.0)]);
     }
 
     #[test]

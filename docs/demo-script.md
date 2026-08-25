@@ -63,15 +63,16 @@ helix selftest
 > *"Every example runs through BOTH the interpreter I wrote as a reference and the JIT
 > — outputs must match bit-for-bit."*
 
-Then run the campaign numbers (BENCH phase in the UI): interpreter vs native vs parallel,
-with efficiency columns and the honest small-N case where threading loses.
+Then show the campaign numbers from `docs/benchmarks/results.md` (tables + speedup
+figures in `docs/benchmarks/figs/`): interpreter vs native vs parallel, with efficiency
+columns and the honest small-N case where threading loses.
 
 ## Beat 5 — Architecture tour for questions (1 min)
 
 - `docs/research/` — verified Aug-2026 research digests (Cranelift APIs, dependence theory)
 - `docs/decisions/` — every design decision recorded
 - `docs/notes/` — course notes per topic (SSA, dependence theory, passes, runtime)
-- 393+ tests across 10 crates
+- 425+ workspace tests across 10 crates
 
 ## Anticipated questions
 

@@ -13,6 +13,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+// Prefix check must include the separator, or a sibling like ROOT + "foo"
+// would pass a bare-ROOT startsWith guard (traversal via /../webfoo).
+const ROOT_WITH_SEP = ROOT.endsWith(path.sep) ? ROOT : ROOT + path.sep;
 const PORT = Number(process.argv[2] ?? 8137);
 
 const MIME = {
@@ -72,7 +75,7 @@ const server = http.createServer(async (req, res) => {
     let p = decodeURIComponent(url.pathname);
     if (p === '/' || p === '') p = '/index.html';
     const abs = path.normalize(path.join(ROOT, p));
-    if (!abs.startsWith(ROOT)) { res.writeHead(403); return res.end('forbidden'); }
+    if (!abs.startsWith(ROOT_WITH_SEP) && abs !== ROOT) { res.writeHead(403); return res.end('forbidden'); }
     const data = await readFile(abs).catch(() => null);
     if (!data) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('404: ' + p); }
     res.writeHead(200, { 'Content-Type': MIME[path.extname(abs)] ?? 'application/octet-stream',

@@ -70,7 +70,7 @@
   matmul@128 251× end-to-end.
 - The honest sections: minmax demoted (two accumulators), small-N overhead,
   jacobi conservative verdict on flattened subscripts.
-- Correctness: 450+ tests, selftest gauntlet interp≡JIT across all examples.
+- Correctness: 425+ workspace tests, selftest gauntlet interp≡JIT across all examples.
 
 ### 9. The Observatory (≈2 pages)
 - Screenshots: pipeline stepper, CFG with amber backedges, loop cards (green/hazard/blue).

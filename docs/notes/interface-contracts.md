@@ -55,11 +55,11 @@ Enforces EVERY static rule in lang-spec.md (incl. f(a,a), loop-var assign, defin
 ## helix-ir (CFG + SSA + passes)
 
 ```rust
-pub struct FuncIr { pub name: String, pub blocks: IndexMap<BlockId,BlockData>,
-                    pub entry: BlockId, pub n_locals: usize }
+pub struct FuncIr { pub name: String, pub blocks: Vec<BlockData>,
+                    pub entry: BlockId, pub n_locals: usize,
+                    pub next_value: u32, /* + typed side tables (types) */ }
 pub struct BlockId(pub u32);                                 // dense 0..n
-pub struct BlockData { pub phis: Vec<Phi>, pub insts: Vec<Inst>, pub term: Term,
-                       pub preds: Vec<BlockId>, pub succs: Vec<BlockId> }
+pub struct BlockData { pub phis: Vec<Phi>, pub insts: Vec<Inst>, pub term: Term }
 pub struct Phi   { pub dst: ValueId, pub var: LocalId, pub args: Vec<(BlockId,ValueId)> } // arg per pred, aligned
 pub struct ValueId(pub u32);  // SSA values; also covers constants via Inst::Const defs
 pub struct LocalId(pub u32);  // source-level variables
@@ -98,7 +98,7 @@ pub enum Verdict { SafeParallel, ReductionParallel(ReductionOp), Sequential(Stri
 pub enum ReductionOp { Add, Mul, Min, Max }                // '-' folds into Add(negate) at lowering
 ```
 APIs: `find_loops(&FuncIr)->LoopInfo` · `analyze(func:&FuncIr, loops:&LoopInfo)->Vec<LoopReport>`.
-Battery order per dim: ZIV→StrongSIV→WeakZeroSIV→WeakCrossingSIV→gcd/box(Diophantine)→Banerjee→'*'.
+Battery order per dim: ZIV→StrongSIV→WeakZeroSIV→WeakCrossingSIV→gcd+bounded-box(Diophantine); anything unproven → '*' (conservative).
 ALL arithmetic i128. RAR never a dependence. Report strings polished (this is the demo's star).
 
 ## helix-backend (JIT)

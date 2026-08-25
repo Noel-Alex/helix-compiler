@@ -30,10 +30,11 @@ The Stage-A → Stage-B overhead delta is one of the project's most instructive 
   iteration costs the same (our streaming kernels). Chunk boundaries are snapped to 64-byte
   element multiples so adjacent threads never straddle a cache line in the output array.
 - **dynamic** — one padded atomic counter; each worker does `fetch_add(chunk)` to claim its
-  next block, `chunk = max(min_chunk, remaining/P)`. ~15 lines, mirrors libgomp. Best when
-  iteration cost varies (e.g. sieve inner loops).
-- **guided** — same counter but chunk shrinks as remaining shrinks: self-tuning tail.
-- **cost gate** — below `max(K_MIN, GRAIN·P)` iterations (~GRAIN=1024), run serially:
+  next block at the flat floor size (`chunk = min_chunk`, default 8). ~15 lines, mirrors
+  libgomp. Best when iteration cost varies (e.g. sieve inner loops).
+- **guided** — same counter but the claim decays with remaining work,
+  `chunk = max(min_chunk, remaining/P)`: self-tuning tail.
+- **cost gate** — below `max(SERIAL_FLOOR, GRAIN·P)` iterations (both 1024), run serially:
   fork/join overhead would dominate anyway. This is why [small_n.hx](../../examples/small_n.hx)
   honestly *loses* nothing by staying serial — and the benchmark suite includes such cases.
 

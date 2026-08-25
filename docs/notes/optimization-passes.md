@@ -61,5 +61,6 @@ Safety requires dominance reasoning from the same domtree SSA construction built
 ## Measuring the passes
 
 The Observatory shows insts_before/insts_after per pass plus full IR text after each —
-optimization becomes something you can *see*. The benchmark tier "native optimized vs
-native unoptimized" quantifies their runtime value end-to-end.
+optimization becomes something you can *see*. The benchmark tier "interpreter vs native
+parallel" quantifies the pipeline's end-to-end runtime value (the passes run on the
+JIT's input IR; there is deliberately no separate optimized/unoptimized native pair).

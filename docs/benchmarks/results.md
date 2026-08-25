@@ -1,6 +1,6 @@
 # Benchmark Campaign Results (2026-08-25, laptop run)
 
-Machine: user's Windows 11 laptop · rustc 1.93 · Cranelift 0.135 · measured STREAM-triad
+Machine: user's Windows 11 laptop · rustc 1.98.0 · Cranelift 0.135 · measured STREAM-triad
 ceiling **23.1 GB/s** (single-threaded, in-process). Raw JSON:
 [data/campaign.json](data/campaign.json) · figures: [figs/](figs/) · protocol:
 [ methodology.md](methodology.md).

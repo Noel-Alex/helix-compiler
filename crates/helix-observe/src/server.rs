@@ -210,11 +210,23 @@ async fn api_run(State(_state): State<AppState>, body: String) -> Response {
         );
     }
     // The raw-body variant keeps malformed JSON from blocking compiles: any
-    // text is treated as source unless it is a JSON object carrying `source`.
+    // text is treated as source unless it is a JSON object, which must carry
+    // a usable `source` — silently compiling `{}` helps nobody.
     let src = match serde_json::from_str::<RunBody>(&body) {
         Ok(b) => b.source,
+        Err(_) if serde_json::from_str::<serde_json::Value>(&body)
+            .is_ok_and(|v| v.is_object()) =>
+        {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                "JSON body must carry a non-empty `source` string",
+            );
+        }
         Err(_) => body.clone(),
     };
+    if src.trim().is_empty() {
+        return error_json(StatusCode::BAD_REQUEST, "source must not be empty");
+    }
     AxJson(build_artifact("<adhoc>", &src)).into_response()
 }
 
