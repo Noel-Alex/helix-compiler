@@ -104,6 +104,11 @@ fn cmd_run(rest: &[String]) -> i32 {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--backend" | "-b" => backend = it.next().map(String::as_str).unwrap_or("interp"),
+            // Combined `--backend=jit` form: silently ignoring it ran the
+            // INTERPRETER while the user believed they tested the JIT.
+            flag if flag.starts_with("--backend=") || flag.starts_with("-b=") => {
+                backend = &flag[flag.find('=').expect("prefix checked") + 1..];
+            }
             "jit" | "interp" => backend = a,
             "--unchecked" => unchecked = true,
             other if path.is_none() => path = Some(other),
@@ -113,6 +118,10 @@ fn cmd_run(rest: &[String]) -> i32 {
     let Some(path) = path else {
         return usage("run requires <file>");
     };
+    if backend != "interp" && backend != "jit" {
+        eprintln!("error: unknown backend '{backend}' (expected 'interp' or 'jit')");
+        return 2;
+    }
     let src = std::fs::read_to_string(PathBuf::from(path)).unwrap_or_default();
     let program = match frontend(path) {
         Ok(p) => p,
@@ -152,7 +161,11 @@ fn run_jit(_src: &str, program: &TypedProgram, unchecked: bool) -> i32 {
     }
     let plan = helix_analysis::build_plan(&funcs, &loops_per_fn, &reports_per_fn);
 
-    helix_backend::engine::arm_trap_recorder();
+    // Production JIT runs use the engine's normal error path: the first
+    // runtime guard prints `runtime error: ...` and exits with status 1
+    // (helix_panic). The test-only trap recorder must stay disarmed here —
+    // arming it made guards record-and-RESUME, so a trapping program kept
+    // executing on dummy values and printed garbage after the error.
     let engine = match helix_backend::JitEngine::compile(&funcs, &to_backend_plan(&plan), unchecked)
     {
         Ok(e) => e,
@@ -166,19 +179,10 @@ fn run_jit(_src: &str, program: &TypedProgram, unchecked: bool) -> i32 {
         println!("{line}");
     }
     if let Err(msg) = result {
-        disarm_noop();
         eprintln!("{msg}");
         return 1;
     }
-    if let Some((code, line, col)) = helix_backend::engine::take_last_trap() {
-        eprintln!("runtime error (code {code}) at source position {line}:{col}");
-        return 1;
-    }
     0
-}
-
-fn disarm_noop() {
-    helix_backend::engine::disarm_trap_recorder();
 }
 
 fn cmd_check(path: Option<&String>) -> i32 {
@@ -256,21 +260,29 @@ fn cmd_dump(stage: &str, path: &str) -> i32 {
 }
 
 /// Print one diagnostic with a caret line under the offending span.
+///
+/// Columns count CHARS, not bytes (UTF-8 sources get correct carets), and
+/// `\r` is excluded from the rendered line so CRLF files don't drift the
+/// caret right by one per preceding line break.
 fn print_diag(src: &str, span: Span, msg: &str) {
     let line_no = src[..span.start as usize].matches('\n').count() + 1;
     let line_start = src[..span.start as usize].rfind('\n').map_or(0, |i| i + 1);
     let line_end = src[span.start as usize..]
         .find('\n')
         .map_or(src.len(), |i| span.start as usize + i);
-    let line = &src[line_start..line_end];
-    let caret_col = span.start.saturating_sub(line_start as u32);
+    let line_raw = &src[line_start..line_end];
+    let line = line_raw.trim_end_matches('\r');
+    // Char distance from line start to the span start (tabs render as one
+    // column; matches how terminals with tabstop=8 would still misalign less
+    // than byte-counting does for any non-ASCII source).
+    let caret_col = src[line_start..span.start as usize].chars().count();
     let caret_len = (span.end.saturating_sub(span.start)).max(1);
 
     eprintln!("--> line {line_no}: {msg}");
     eprintln!("{line}");
     eprintln!(
         "{}{}",
-        " ".repeat(caret_col as usize),
+        " ".repeat(caret_col),
         "^".repeat(caret_len as usize)
     );
 }
@@ -426,7 +438,14 @@ fn cmd_selftest() -> i32 {
             .collect();
         let plan = helix_analysis::build_plan(&funcs, &li, &reps);
 
-        helix_backend::engine::arm_trap_recorder();
+        // The recorder stays DISARMED in selftest too: with it armed, a JIT
+        // run that hits a runtime guard records-and-resumes and reports Ok,
+        // so the "both backends reject" comparison could never fire (every
+        // trap looked like success). Without it, helix_panic exits the
+        // process — but examples/*.hx are all guard-clean by construction
+        // (the deliberately-trapping ones are frontend rejects), so no
+        // example should ever reach a guard. If one does, the abort IS the
+        // signal; the harness treats a missing exit as a failure upstream.
         let engine = match helix_backend::JitEngine::compile(&funcs, &to_backend_plan(&plan), false)
         {
             Ok(e) => e,
@@ -437,7 +456,6 @@ fn cmd_selftest() -> i32 {
             }
         };
         let (jit_prints, jit_res) = helix_backend::engine::capture_prints(|| engine.run_main());
-        let _ = helix_backend::engine::take_last_trap();
 
         match (&interp, &jit_res) {
             (Ok(i), Ok(())) => {

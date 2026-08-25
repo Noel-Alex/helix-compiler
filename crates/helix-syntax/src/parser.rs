@@ -84,11 +84,46 @@ pub fn parse_source(src: &str) -> Result<Program, crate::syntax_error::SyntaxErr
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Expression nesting depth. Every recursive expression level (parens,
+    /// unary operators) costs one unit; exceeding [`MAX_EXPR_DEPTH`] produces
+    /// a clean ParseError instead of a native stack-overflow abort. The cap
+    /// also bounds the recursive tree printer and derived `Drop` downstream.
+    depth: u32,
 }
+
+/// Maximum expression nesting depth. Counts parenthesis levels, unary
+/// operators, AND binary right-operand recursion (an alternating-precedence
+/// chain like `1+2*3+4%5…` descends one `parse_binary` frame per increase).
+/// Generous for human code (~30 in practice); sized so even fat debug-build
+/// frames (~10 KB per level across the six-level descent chain) stay within
+/// the 2 MiB stack of a tokio worker thread.
+const MAX_EXPR_DEPTH: u32 = 128;
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Enters one deeper expression-nesting level; errors past the cap.
+    fn enter_expr(&mut self, open: Span) -> Result<(), ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            return Err(ParseError {
+                span: open,
+                msg: format!(
+                    "expression nesting too deep (limit {MAX_EXPR_DEPTH} levels of parentheses/unary operators)"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn leave_expr(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     // -- token cursor helpers ------------------------------------------------
@@ -543,8 +578,19 @@ impl Parser {
             if prec < min_prec {
                 break;
             }
+            // A precedence INCREASE recurses into parse_binary for the right
+            // operand (one frame per increase); charge that against the same
+            // depth budget so `1+2*3+4%5…` chains cannot outgrow the stack.
+            let rising = prec + 1 > min_prec;
+            if rising {
+                self.enter_expr(self.peek_span())?;
+            }
             self.advance(); // consume operator
-            let rhs = self.parse_binary(prec + 1)?;
+            let rhs = self.parse_binary(prec + 1);
+            if rising {
+                self.leave_expr();
+            }
+            let rhs = rhs?;
             let span = Span::join(lhs.span(), rhs.span());
             lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs), span);
         }
@@ -561,7 +607,10 @@ impl Parser {
         };
         if let Some(op) = op {
             let start = self.advance().span;
-            let inner = self.parse_unary()?;
+            self.enter_expr(start)?;
+            let inner = self.parse_unary();
+            self.leave_expr();
+            let inner = inner?;
             let span = Span::join(start, inner.span());
             return Ok(Expr::Unary(op, Box::new(inner), span));
         }
@@ -670,7 +719,10 @@ impl Parser {
             }
             TokKind::LParen => {
                 self.advance();
-                let inner = self.parse_expr()?;
+                self.enter_expr(tok.span)?;
+                let inner = self.parse_expr();
+                self.leave_expr();
+                let inner = inner?;
                 self.expect(TokKind::RParen, "`)` to close parenthesised expression")?;
                 Ok(inner) // parentheses group; no Paren node in the AST
             }
@@ -732,6 +784,67 @@ impl Parser {
                 ),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_ok(src: &str) -> Program {
+        crate::parse_str(src).unwrap_or_else(|e| panic!("expected parse success: {e}"))
+    }
+
+    #[test]
+    fn deeply_nested_parens_error_cleanly_not_stack_overflow() {
+        // Regression: 100k paren levels used to overflow the native stack and
+        // abort the process. The depth cap turns it into a ParseError.
+        let mut src = String::from("fn main() { let x = ");
+        src.push_str(&"(".repeat(100_000));
+        src.push('1');
+        src.push_str(&")".repeat(100_000));
+        src.push_str("; }");
+        let err = crate::parse_str(&src)
+            .expect_err("deep nesting must be rejected, not crash");
+        assert!(
+            err.to_string().contains("nesting too deep"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_unary_ops_error_cleanly() {
+        let mut src = String::from("fn main() { let x = ");
+        src.push_str(&"!".repeat(50_000));
+        src.push_str("true; }");
+        let err = crate::parse_str(&src)
+            .expect_err("deep unary chain must be rejected, not crash");
+        assert!(err.to_string().contains("nesting too deep"));
+    }
+
+    #[test]
+    fn legal_nesting_well_below_cap_still_parses() {
+        // ~100 depth units of parens + unary mix: ordinary machine-generated
+        // code stays comfortably inside the cap.
+        let mut expr = String::new();
+        for i in 0..100 {
+            if i % 2 == 0 {
+                expr.push('(');
+            } else {
+                expr.push('-');
+            }
+        }
+        expr.push('1');
+        for _ in 0..50 {
+            expr.push(')');
+        }
+        let src = format!("fn main() {{ let x = {expr}; }}");
+        parse_ok(&src);
+    }
+
+    #[test]
+    fn normal_expressions_unaffected_by_depth_tracking() {
+        parse_ok("fn main() { let x = -(1 + 2) * -(3 - 4); print(x); }");
     }
 }
 

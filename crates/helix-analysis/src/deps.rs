@@ -194,23 +194,25 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
 
     // ---- Weak-Crossing SIV: coefficients are negatives of each other ----------
     if src.a == -dst.a {
-        // a*i + p = -a*i' + q => a*(i + i') = q - p => crossing x = (q-p)/(2a)
+        // src(i) = a*i + p, dst(j) = -a*j + q  =>  a*(i + j) = q - p.
+        let a = src.a;
+        debug_assert!(a != 0);
         let num = dst.b - src.b;
-        let den = 2 * src.a;
-        if den == 0 || num % den != 0 {
+        if num % a != 0 {
             return DepOutcome::Independent;
         }
-        let cross = num / den;
-        if cross < range.lo || cross > range.hi {
-            return DepOutcome::Independent;
+        let sum = num / a; // i + j must equal `sum`
+        // Feasible when the box admits two values adding to `sum`:
+        // max(lo, sum - hi) <= min(hi, sum - lo).
+        if range.lo.max(sum - range.hi) <= range.hi.min(sum - range.lo) {
+            // '<' and '>' possible; '=' only when sum is even and sum/2 in
+            // range. Conservative: allow all three directions.
+            return DepOutcome::Dependence {
+                distance: None,
+                dirs: vec![DirVec::star()],
+            };
         }
-        // Crossing exists: '<' and '>' possible; '=' only if i == i' == cross,
-        // i.e. 2*i == cross... only when cross is even relative to a==±1 forms.
-        // Conservative: allow all three directions.
-        return DepOutcome::Dependence {
-            distance: None,
-            dirs: vec![DirVec::star()],
-        };
+        return DepOutcome::Independent;
     }
 
     // ---- General case: gcd test + bounded box intersection --------------------
@@ -278,7 +280,10 @@ fn box_has_solution(range: IterRange, i0: i128, j0: i128, si: i128, sj: i128) ->
     // Need t with lo <= i0 + si*t <= hi and lo <= j0 + sj*t <= hi.
     let lo = range.lo;
     let hi = range.hi;
-    // Simpler robust approach: iterate interval intersection numerically.
+    // Feasible-t interval per dimension. A negative step flips the inequality
+    // directions; normalizing the sign BEFORE dividing keeps the bounds ordered
+    // (the previous sign-branch produced [upper, lower] pairs and reported
+    // genuinely dependent pairs as independent — see the negative_step tests).
     let iv = |step: i128, c: i128| -> Option<(i128, i128)> {
         if step == 0 {
             return if c >= lo && c <= hi {
@@ -287,17 +292,15 @@ fn box_has_solution(range: IterRange, i0: i128, j0: i128, si: i128, sj: i128) ->
                 None
             };
         }
-        // t >= (lo - c)/step and t <= (hi - c)/step with correct rounding per sign.
-        let lower = if step > 0 {
-            ceil_div(lo - c, step)
+        // lo <= c + step*t <= hi  ⇔  tmin_raw/|step| <= t <= tmax_raw/|step|
+        // with the raw numerator endpoints swapped when step < 0.
+        let (tmin_raw, tmax, s) = if step > 0 {
+            (lo - c, hi - c, step)
         } else {
-            floor_div(lo - c, step)
+            (c - hi, c - lo, -step)
         };
-        let upper = if step > 0 {
-            floor_div(hi - c, step)
-        } else {
-            ceil_div(hi - c, step)
-        };
+        let lower = ceil_div(tmin_raw, s);
+        let upper = floor_div(tmax, s);
         if lower <= upper {
             Some((lower, upper))
         } else {
@@ -317,6 +320,20 @@ fn floor_div(a: i128, b: i128) -> i128 {
 
 fn ceil_div(a: i128, b: i128) -> i128 {
     -(-a).div_euclid(b)
+}
+
+/// Brute-force ground truth for small boxes: does ANY (i,j) in [lo,hi]^2 with
+/// src(i) == dst(j) exist? Used by property tests against the algebra.
+#[cfg(test)]
+fn box_brute_force(range: IterRange, src: Affine, dst: Affine) -> bool {
+    for i in range.lo..=range.hi {
+        for j in range.lo..=range.hi {
+            if src.a * i + src.b == dst.a * j + dst.b {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn pairs_feasible(range: IterRange, d: i128) -> bool {
@@ -459,6 +476,25 @@ mod tests {
     }
 
     #[test]
+    fn weak_crossing_even_coefficient_solutions() {
+        // Regression: the old crossing test divided by 2a instead of a, so
+        // |a| > 1 pairs with even sums were wrongly declared independent.
+        // src = -2i - 1, dst = 2j - 3 over [0,12]: sum i+j = (-3+1)/-2 = 1,
+        // solutions (0,1),(1,0) — dependent.
+        assert!(!outcome_is_independent(
+            Affine { a: -2, b: -1 },
+            Affine { a: 2, b: -3 }
+        ));
+        // Same coefficients but no in-range pair adds to the sum:
+        // src = -2i (a=-2,b=0), dst = 2j + 50 over [0,12]: i+j = 25 needs
+        // one side >= 13 — out of range. Independent.
+        assert!(outcome_is_independent(
+            Affine { a: -2, b: 0 },
+            Affine { a: 2, b: 50 }
+        ));
+    }
+
+    #[test]
     fn gcd_box_general_case() {
         // a[2i] vs a[i]: 2i - j = 0, gcd(2,1)=1 divides 0 -> solutions exist (i=j even)
         assert!(!outcome_is_independent(
@@ -509,5 +545,88 @@ mod tests {
             ),
             DepOutcome::Independent
         ));
+    }
+
+    // ---- negative-coefficient regression tests --------------------------------
+    //
+    // box_has_solution previously flipped the feasible-t interval whenever the
+    // parametric step was negative (a negative subscript coefficient reaches
+    // the general gcd/box path via Unary::Neg, `n - i` invariant collapse, or a
+    // literal like `5 - 3*i`), reporting truly dependent pairs as Independent —
+    // an unsound SAFE verdict. These cases all have real in-range solutions.
+
+    #[test]
+    fn negative_step_dependent_pairs_are_never_independent() {
+        // src = 5 - 2i (a[5-2i]), dst = i (a[i]) over [0,9]:
+        // solutions at (i=0,j=5),(1,3),(2,1). Old code said Independent.
+        let src = Affine { a: -2, b: 5 };
+        let dst = Affine { a: 1, b: 0 };
+        let r = IterRange { lo: 0, hi: 9 };
+        assert!(
+            matches!(test_dimension(src, dst, r), DepOutcome::Dependence { .. }),
+            "a[5-2i] vs a[i] has real dependences at i=0..2"
+        );
+        // Cross-check against brute force.
+        assert!(box_brute_force(r, src, dst));
+    }
+
+    #[test]
+    fn negative_step_both_sides_still_detected() {
+        // src = 2i (write a[2i]), dst = 5 - i (read a[5-i]) over [0,9]:
+        // equation 2i + j = 5; solutions (0,5),(1,3),(2,1).
+        let src = Affine { a: 2, b: 0 };
+        let dst = Affine { a: -1, b: 5 };
+        let r = IterRange { lo: 0, hi: 9 };
+        assert!(matches!(
+            test_dimension(src, dst, r),
+            DepOutcome::Dependence { .. }
+        ));
+        assert!(box_brute_force(r, src, dst));
+    }
+
+    #[test]
+    fn negative_coefficient_out_of_range_is_still_independent() {
+        // Same shapes but the crossing points fall outside the range.
+        let r = IterRange { lo: 100, hi: 199 };
+        // src = 5 - 2i vs dst = i over [100,199]: lhs <= -195, rhs >= 100.
+        assert!(matches!(
+            test_dimension(
+                Affine { a: -2, b: 5 },
+                Affine { a: 1, b: 0 },
+                r
+            ),
+            DepOutcome::Independent
+        ));
+        assert!(!box_brute_force(r, Affine { a: -2, b: 5 }, Affine { a: 1, b: 0 }));
+    }
+
+    #[test]
+    fn box_agrees_with_brute_force_over_sign_grid() {
+        // Property sweep: every coefficient-sign combination and offset over a
+        // small box must agree with brute force. This is the net that catches
+        // any future sign-handling regression in the general-case path.
+        let r = IterRange { lo: 0, hi: 12 };
+        for sa in [-3i128, -2, -1, 1, 2, 3] {
+            for sb in [-4i128, -1, 0, 3, 7] {
+                for da in [-2i128, -1, 1, 2] {
+                    for db in [-3i128, 0, 2, 6] {
+                        let src = Affine { a: sa, b: sb };
+                        let dst = Affine { a: da, b: db };
+                        // Skip pairs routed to earlier battery stages? No:
+                        // brute force must agree with the WHOLE test_dimension,
+                        // which is exactly what production runs.
+                        let algebra = matches!(
+                            test_dimension(src, dst, r),
+                            DepOutcome::Dependence { .. }
+                        );
+                        let truth = box_brute_force(r, src, dst);
+                        assert_eq!(
+                            algebra, truth,
+                            "src={sa}*i{sb:+} dst={da}*j{db:+} range=[0,12]"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

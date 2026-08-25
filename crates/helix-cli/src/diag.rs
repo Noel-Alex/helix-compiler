@@ -12,18 +12,24 @@ use helix_syntax::Span;
 ///    |                       ^
 /// ```
 pub fn render(source: &str, filename: &str, span: Span, msg: &str) -> String {
-    let (line_no, col, line_start, line_text) = locate(source, span.start);
-    let caret_len = (span.end.saturating_sub(span.start)).max(1);
+    let (line_no, col, _line_start, line_text) = locate(source, span.start);
+    // Caret run length in CHARS within this line (the old clamp mixed bytes
+    // and chars, collapsing multi-byte spans to a single caret).
+    let chars_on_line = line_text.chars().count();
+    let caret_len = ((span.end.saturating_sub(span.start)) as usize)
+        .min(chars_on_line.saturating_sub(col - 1) + 1)
+        .max(1);
     let prefix = format!("{line_no:>4} | ");
     let mut out = String::new();
     out.push_str(&format!("error: {msg}\n"));
     out.push_str(&format!("  --> {filename}:{line_no}:{col}\n"));
     out.push_str("   |\n");
     out.push_str(&format!("{prefix}{line_text}\n"));
-    let visible = (caret_len as usize)
-        .min(line_text.len().saturating_sub(col - 1) + 1)
-        .max(1);
-    out.push_str(&format!("   | {}{}\n", " ".repeat(col - 1), "^".repeat(visible)));
+    out.push_str(&format!(
+        "   | {}{}\n",
+        " ".repeat(col - 1),
+        "^".repeat(caret_len)
+    ));
     out
 }
 

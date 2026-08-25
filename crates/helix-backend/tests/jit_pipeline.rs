@@ -808,3 +808,77 @@ fn if_else_in_loop_accumulator_matches_interpreter() {
         .printed;
     assert_eq!(jit_lines(src), expected);
 }
+
+// ---------------------------------------------------------------------------
+// Empty statement `;` — regression for the poison-node fix (2026-08-25 wave 2)
+// ---------------------------------------------------------------------------
+
+/// A legal bare `;` must survive the whole pipeline as a no-op on BOTH
+/// backends. It used to be typed as a poison `TypedExprKind::Error` node in
+/// sema, which the IR builder lowered to a dead `const 0` — harmless by luck,
+/// but a legal production masquerading as an error-recovery sentinel.
+#[test]
+fn empty_statement_is_a_noop_on_both_backends() {
+    let src = r#"
+        fn main() {
+            let x = 1;
+            ;
+            ;
+            print(x);
+        }
+    "#;
+    // Frontend accepts and produces no poison Error nodes: the typed tree is
+    // Serialize, so a poison node would appear as an "Error" variant tag.
+    let ast = helix_syntax::parse_str(src).expect("parse");
+    let typed = helix_sema::check(&ast).expect("sema");
+    let rendered = format!("{typed:?}");
+    assert!(
+        !rendered.contains("Error"),
+        "poison Error node in typed tree for legal `;`"
+    );
+    // Differential: interp and JIT agree, and the value survives.
+    let (jitd, interp) = assert_parity(src);
+    assert_eq!(interp, vec!["1"]);
+    assert_eq!(jitd, vec!["1"]);
+}
+
+// ---------------------------------------------------------------------------
+// Array-only region ctx — regression for the len_bytes truncation fix
+// ---------------------------------------------------------------------------
+
+/// A parallel loop whose body touches arrays but captures NO outside scalars
+/// (only the iv and in-loop defs) used to pack a 16-byte shared context: the
+/// dispatcher's guard silently dropped the array fat-pointer stashes and the
+/// body dereferenced garbage (fabricated bounds errors, or heap corruption
+/// under --unchecked). The layout must now reserve 16 bytes per array slot.
+#[test]
+fn array_only_parallel_region_writes_correctly() {
+    let src = r#"
+        fn main() {
+            let n = 100;
+            let a: [i64] = zeros(n);
+            for i in 0..n {
+                a[i] = i * 2;
+            }
+            print(a[0]);
+            print(a[50]);
+            print(a[99]);
+        }
+    "#;
+    // Differential: the JIT's parallel path must produce the interpreter's
+    // exact values (0, 100, 198).
+    let expected = vec!["0".to_string(), "100".to_string(), "198".to_string()];
+    assert_eq!(jit_lines(src), expected);
+
+    // And through the actual plan (this loop is canonical + safe => region).
+    let irs = compile_ir(src);
+    let plan = analyze_plan(&irs);
+    assert!(
+        !plan.regions.is_empty(),
+        "array-only DOALL loop must be approved as a region"
+    );
+    let engine = JitEngine::compile(&irs, &to_backend_plan(&plan), false).expect("compile");
+    let (lines, result) = helix_backend::engine::capture_prints(|| engine.run_main());
+    result.expect("run");
+    assert_eq!(lines, expected);
+}

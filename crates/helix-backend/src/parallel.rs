@@ -276,16 +276,24 @@ pub(crate) struct CtxLayout {
 
 impl CtxLayout {
     /// Total packed size in bytes (always a positive multiple of 8).
+    ///
+    /// Arrays live at [CTX_ARRAY_BASE, CTX_ARRAY_BASE + 16*arrays) and scalars
+    /// after them; the true end is whichever landed last. (The old version
+    /// considered only scalars, so an array-only region packed a 16-byte ctx,
+    /// the dispatcher's guard silently dropped every array stash, and the body
+    /// dereferenced garbage fat pointers.)
     pub(crate) fn len_bytes(&self) -> i64 {
-        self.scalars
-            .last()
-            .map_or(CTX_ARRAY_BASE, |s| s.3 + 8)
-            .max(CTX_ARRAY_BASE)
+        let arrays_end = CTX_ARRAY_BASE + 16 * self.arrays.len() as i64;
+        let scalars_end = self.scalars.last().map_or(0, |s| s.3 + 8);
+        arrays_end.max(scalars_end).max(CTX_ARRAY_BASE)
     }
 
-    /// Word position of scalar `k` (relative to the start of the ctx).
-    fn scalar_word(k: usize) -> usize {
-        (CTX_ARRAY_BASE / 8) as usize + k
+    /// Word position of the scalar whose byte offset is `off` — derived FROM
+    /// the offset itself (`off / 8`), the same convention the emitter's stash
+    /// keys use. (The old index-arithmetic version ignored array slots, so a
+    /// region with arrays read its reduction seed from the wrong word.)
+    pub(crate) fn seed_word_at(&self, off: i64) -> usize {
+        (off / 8) as usize
     }
 }
 
@@ -585,7 +593,7 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
         RKind::DoAll => None,
         RKind::Reduction(s) => Some(s),
     };
-    let acc: Option<(ValueId, LocalId, ValueId)> = if spec.is_none() {
+    let acc: Option<(ValueId, LocalId, ValueId, ValueId)> = if spec.is_none() {
         // DoAll: no carried scalar other than the iv may survive.
         if header
             .phis
@@ -647,7 +655,17 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
             width,
             float,
         });
-        Some((phi.dst, phi.var, entry_arg))
+        Some((phi.dst, phi.var, entry_arg, back_arg))
+    };
+    // Split view: the first three fields feed seed/capture bookkeeping; the
+    // fourth is the chain result the latch must store back to the private cell.
+    let acc3: Option<(ValueId, LocalId, ValueId)> = match &acc {
+        Some((d, v, e, _)) => Some((*d, *v, *e)),
+        None => None,
+    };
+    let acc_back: Option<ValueId> = match &acc {
+        Some((_, _, _, b)) => Some(*b),
+        None => None,
     };
 
     // ---- arrays + scalar uses inside the loop ----------------------------------
@@ -683,7 +701,7 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
     arrs.retain(|l| seen_arr.insert(l.0));
 
     // ---- classify scalar uses: internal vs captured ----------------------------
-    let acc_names: Vec<ValueId> = acc.as_ref().map(|&(d, _, _)| vec![d]).unwrap_or_default();
+    let acc_names: Vec<ValueId> = acc3.as_ref().map(|&(d, _, _)| vec![d]).unwrap_or_default();
     let mut captures: Vec<ValueId> = Vec::new();
     let mut seen_cap = HashSet::new();
     for v in uses {
@@ -708,7 +726,7 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
         captures.push(v);
     }
     // Reduction seed: the accumulator's initial value rides along too.
-    if let Some((_, _, entry_arg)) = acc
+    if let Some((_, _, entry_arg, _)) = acc
         && seen_cap.insert(entry_arg)
     {
         if matches!(ir.val_ty(entry_arg), Some(helix_sema::Ty::Bool)) {
@@ -744,14 +762,14 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
     }
 
     // Reduction seed bookkeeping: which scalar word holds the seed.
-    let seed = acc.and_then(|(_, _, entry_arg)| {
+    let seed = acc3.and_then(|(_, _, entry_arg)| {
         layout
             .scalars
             .iter()
             .position(|(sid, _, _, _)| *sid == entry_arg.0)
             .map(|k| {
-                let (_, w, f, _) = layout.scalars[k];
-                (CtxLayout::scalar_word(k), w, f)
+                let (_, w, f, off) = layout.scalars[k];
+                (layout.seed_word_at(off), w, f)
             })
     });
 
@@ -764,7 +782,8 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
     let (end_ssa, end_const) = bound_of(end_val);
 
     // ---- build the body IR ---------------------------------------------------------
-    let (body, prebind) = build_body_ir(ir, hdr, &loop_set, latch, iv_phi, &acc, spec, &layout)?;
+    let (body, prebind) =
+        build_body_ir(ir, hdr, &loop_set, latch, iv_phi, &acc3, acc_back, spec, &layout)?;
 
     planned.exit = exit_b;
     planned.body = Some(body);
@@ -778,7 +797,7 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
     planned.end_ssa = end_ssa;
     planned.start_const = start_const;
     planned.end_const = end_const;
-    planned.acc_dst = acc.map(|(d, _, _)| d.0);
+    planned.acc_dst = acc3.map(|(d, _, _)| d.0);
     planned.seed = seed;
     planned.covers = loop_set;
     Some(())
@@ -823,6 +842,7 @@ fn build_body_ir(
     latch: BlockId,
     iv_phi: &Phi,
     acc: &Option<(ValueId, LocalId, ValueId)>,
+    acc_back: Option<ValueId>,
     spec: Option<RSpec>,
     layout: &CtxLayout,
 ) -> Option<(FuncIr, Prebind)> {
@@ -910,17 +930,15 @@ fn build_body_ir(
         }));
     }
 
-    // Latch preamble: store the chain result back into the private cell.
-    let mut latch_store: Vec<Inst> = Vec::new();
-    if let (Some((_, _, back)), Some(s)) = (acc, spec.map(|s| (s.width, s.float))) {
-        let sym = acc_store_sym(s.0, s.1);
-        latch_store.push(Inst::Call(helix_ir::Call {
-            dst: None,
-            callee: sym.into(),
-            args: vec![ctx_v, *back],
-            arr_refs: Vec::new(),
-        }));
-    }
+    // Latch preamble: store the CHAIN RESULT back into the private cell.
+    // `acc_back` is the accumulator φ's back-edge argument — the value the
+    // chain (`acc + term` / min / max) produced this iteration. Built LAZILY
+    // at the latch site below, after that chain's defining instruction has
+    // been cloned and remapped. (Two earlier bugs lived here: an eager store
+    // baked the pre-clone id, and grabbing field 2 of `acc` took the SEED
+    // instead of the chain result — participants then re-stored their seed
+    // every iteration and every dispatched reduction returned it unchanged.)
+    let latch_store_spec = acc_back.zip(spec).map(|(back, s)| (back, s.width, s.float));
 
     // ---- assemble the FuncIR ----------------------------------------------------
     let mut body = FuncIr::new("__extracted__", helix_sema::Ty::Unit, ir.n_source_locals);
@@ -1013,7 +1031,18 @@ fn build_body_ir(
             }
             if *b == latch {
                 // Top of the latch: publish this iteration's chain result.
-                insts_out.append(&mut latch_store);
+                // `back` is remapped HERE (after its defining chain was
+                // cloned), so the store reads the body's own value.
+                if let Some((back, width, float)) = latch_store_spec {
+                    let back_mapped = vmap.get(&back).copied().unwrap_or(back);
+                    let sym = acc_store_sym(width, float);
+                    insts_out.push(Inst::Call(helix_ir::Call {
+                        dst: None,
+                        callee: sym.into(),
+                        args: vec![ctx_v, back_mapped],
+                        arr_refs: Vec::new(),
+                    }));
+                }
             }
         }
 
@@ -1114,6 +1143,9 @@ fn build_body_ir(
             eprintln!("{}", helix_ir::print_ir(&body, true));
         }
         return None; // body IR failed verification
+    }
+    if std::env::var_os("HELIX_DUMP_BODY").is_some() {
+        eprintln!("=== extracted body ===\n{}", helix_ir::print_ir(&body, true));
     }
     Some((body, prebind))
 }
@@ -1350,18 +1382,30 @@ pub extern "C" fn helix_dispatch(start: i64, end: i64, region_id: i64, nthreads:
     // ---- pack the shared ctx --------------------------------------------------
     // Scalar stash keys are ABSOLUTE packed-word positions (`off / 8`, baked
     // by the parent emitter) — the same convention `meta.seed` uses — so they
-    // land directly at their layout slots.
+    // land directly at their layout slots. A key that does not fit is a
+    // compiler/dispatcher layout mismatch: fail loudly rather than silently
+    // dropping the value (the old silent-skip masked ctx-truncation bugs as
+    // garbage-pointer dereferences at runtime).
     for (slot, &(ptr, len)) in &arrs {
         let off = CTX_ARRAY_BASE as usize + slot * 16;
-        if off + 8 <= meta.len_bytes as usize {
-            mem[off / 8] = ptr as u64;
-            mem[off / 8 + 1] = len as u64;
+        if off + 16 > meta.len_bytes as usize {
+            eprintln!(
+                "runtime error: helix-backend: array slot {slot} offset {off} exceeds ctx size {}",
+                meta.len_bytes
+            );
+            std::process::abort();
         }
+        mem[off / 8] = ptr as u64;
+        mem[off / 8 + 1] = len as u64;
     }
     for (word, bits) in &caps {
-        if *word < ctx_words {
-            mem[*word] = *bits;
+        if *word >= ctx_words {
+            eprintln!(
+                "runtime error: helix-backend: capture word {word} exceeds ctx size {ctx_words} words"
+            );
+            std::process::abort();
         }
+        mem[*word] = *bits;
     }
 
     // ---- participant cells: word 0 = shared-ctx pointer -----------------------
@@ -1676,6 +1720,7 @@ macro_rules! fp_minmax_combiner {
 fp_minmax_combiner!(combine_min_f64, f64, true);
 fp_minmax_combiner!(combine_max_f64, f64, false);
 fp_minmax_combiner!(combine_min_f32, f32, true);
+fp_minmax_combiner!(combine_max_f32, f32, false);
 
 /// The registered combine fn for a region kind.
 pub(crate) fn combine_for(kind: RKind) -> helix_runtime::CombineFn {

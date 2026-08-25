@@ -20,6 +20,12 @@ use crate::registry::CombineFn;
 /// `CachePadded`'s N on x86-64/aarch64.
 pub const CELL_STRIDE: usize = 128;
 
+/// Byte offset of the accumulator field INSIDE a participant cell (word 0 of
+/// the cell holds the shared-context pointer). The backend's emitter bakes
+/// the same constant (`CELL_ACC_OFF` in helix-backend/src/parallel.rs); the
+/// two must stay in sync — a layout drift here would fold the wrong words.
+pub(crate) const ACC_OFFSET: usize = 8;
+
 /// A region of `participants` private accumulator cells.
 ///
 /// Invariant: cell `p` occupies bytes `[p * CELL_STRIDE, (p+1) * CELL_STRIDE)`
@@ -79,11 +85,20 @@ impl CellArea {
 pub(crate) unsafe fn fold(base: *mut u8, participants: usize, combine: CombineFn) {
     for p in 1..participants.max(1) {
         // SAFETY: p < participants keeps each cell inside the area; combine is
-        // trusted compiler output registered by the backend.
+        // trusted compiler output registered by the backend. Both pointers
+        // target the ACCUMULATOR FIELD at +ACC_OFFSET — passing raw cell bases
+        // would combine word 0 (the shared-ctx pointer) instead and corrupt it.
         combine(
-            base, // dst: cell 0
+            // SAFETY: cell 0's accumulator field, inside the area.
+            unsafe { base.add(ACC_OFFSET) }, // dst: cell 0 acc
             // SAFETY: p < participants keeps the cell inside the area.
-            unsafe { base.add(p.checked_mul(CELL_STRIDE).expect("cell offset overflow")) }, // src: cell p
+            unsafe {
+                base.add(
+                    p.checked_mul(CELL_STRIDE)
+                        .expect("cell offset overflow")
+                        + ACC_OFFSET,
+                )
+            }, // src: cell p acc
         );
     }
 }
@@ -117,25 +132,31 @@ mod tests {
         const P: usize = 9;
         let mut area = CellArea::new(P);
         let base = area.base_ptr();
-        // Write each cell's partial (its index + 1).
+        // Write each cell's partial into its ACCUMULATOR FIELD (offset 8 —
+        // the same layout the backend's dispatcher and JIT body use).
         for p in 0..P {
             // SAFETY: p < P keeps the write inside the allocated area.
             unsafe {
-                *(base.add(p * CELL_STRIDE) as *mut i64) = p as i64 + 1;
+                *(base.add(p * CELL_STRIDE + ACC_OFFSET) as *mut i64) = p as i64 + 1;
             }
         }
         // SAFETY: test-owned area + registered-safe combine.
         unsafe { fold(base, P, add_i64) };
         let total: i64 = (1..=P as i64).sum();
-        // SAFETY: cell 0 readback.
+        // SAFETY: cell 0 accumulator readback.
         unsafe {
-            assert_eq!(*(base as *mut i64), total);
+            assert_eq!(*(base.add(ACC_OFFSET) as *mut i64), total);
+            // Word 0 (the shared-ctx slot) must be untouched by folding.
+            assert_eq!(base.add(ACC_OFFSET - 8).cast::<u64>().read(), 0);
         }
         // Other cells are untouched (fold reads them, never writes).
         for p in 1..P {
             // SAFETY: in-bounds cell read.
             unsafe {
-                assert_eq!(*(base.add(p * CELL_STRIDE) as *mut i64), p as i64 + 1);
+                assert_eq!(
+                    *(base.add(p * CELL_STRIDE + ACC_OFFSET) as *mut i64),
+                    p as i64 + 1
+                );
             }
         }
     }
@@ -144,11 +165,11 @@ mod tests {
     fn single_participant_area_combines_to_itself() {
         let mut area = CellArea::new(1);
         let base = area.base_ptr();
-        // SAFETY: single-cell write/read within the area.
+        // SAFETY: single-cell write/read at the accumulator offset.
         unsafe {
-            *(base as *mut i64) = 5;
+            *(base.add(ACC_OFFSET) as *mut i64) = 5;
             fold(base, 1, add_i64);
-            assert_eq!(*(base as *mut i64), 5);
+            assert_eq!(*(base.add(ACC_OFFSET) as *mut i64), 5);
         }
     }
 

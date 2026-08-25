@@ -121,6 +121,7 @@ fn scan_stmt(s: &TypedStmt, r: &mut Reservations) {
             }
         }
         TypedStmt::Nested(b) => scan_stmts(&b.stmts, r),
+        TypedStmt::Empty => {}
     }
 }
 
@@ -599,6 +600,8 @@ impl Builder {
             TypedStmt::Effect(e) => {
                 self.effect_expr(e);
             }
+            // `;` lowers to nothing.
+            TypedStmt::Empty => {}
             // A bare `{ .. }` block introduces no control flow: its statements
             // lower inline into the current block, exactly as the reference
             // interpreter executes them in order.

@@ -297,8 +297,10 @@ struct Lw<'m> {
     /// (see the module docs, "Same-block self-use repair"). The CLIF param
     /// is appended lazily when the owning block's terminator is translated.
     self_uses: HashMap<ValueId, SelfUse>,
-    /// Parallel-region hook for THIS function (`None` = sequential lowering).
-    rt: Option<crate::parallel::RtHook>,
+    /// Parallel-region hooks for THIS function, keyed by region header block
+    /// (empty = sequential lowering). A function may host several approved
+    /// loops; every one gets its own stash→dispatch→readback replacement.
+    rt: HashMap<usize, crate::parallel::RtHook>,
 }
 
 /// Translates `ir` into the prepared (empty-bodied) CLIF `func`.
@@ -315,7 +317,15 @@ pub fn translate_fn(
     imports: &HashMap<String, FuncId>,
     sigs: &HashMap<String, Signature>,
 ) -> Result<(), String> {
-    translate_fn_rt(ir, unchecked, func, module, imports, sigs, None)
+    translate_fn_rt(
+        ir,
+        unchecked,
+        func,
+        module,
+        imports,
+        sigs,
+        HashMap::new(),
+    )
 }
 
 /// [`translate_fn`] with an optional parallel-region hook (see
@@ -329,7 +339,7 @@ pub(crate) fn translate_fn_rt(
     module: &mut JITModule,
     imports: &HashMap<String, FuncId>,
     sigs: &HashMap<String, Signature>,
-    rt: Option<crate::parallel::RtHook>,
+    rt: HashMap<usize, crate::parallel::RtHook>,
 ) -> Result<(), String> {
     // Snapshot before the builder takes its exclusive borrow of `func`.
     let ret_tys: Vec<Type> = func
@@ -455,23 +465,24 @@ pub(crate) fn translate_fn_rt(
     }
 
     // ---- parallel-region bookkeeping -----------------------------------------
-    // When a region replaces this function's loop: blocks inside the loop span
-    // that are NOT the header become orphans (unreachable after the dispatch
-    // jump) and are skipped entirely below. Orphans are exactly the natural-
-    // loop members minus the header — exact for the canonical `for` shape;
-    // regions with exotic control flow never reach the hook because extraction
-    // demotes them.
-    let rt_header: Option<usize> = lw.rt.as_ref().map(|h| h.header.0 as usize);
+    // Every approved loop of this function replaces its own header with a
+    // dispatch sequence; blocks inside each replaced loop span that are NOT
+    // that loop's header become orphans (unreachable after dispatch) and are
+    // skipped entirely below. Orphans are exactly the natural-loop members
+    // minus the header — exact for the canonical `for` shape; regions with
+    // exotic control flow never reach a hook because extraction demotes them.
     let mut orphans: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    if let Some(hook) = &lw.rt {
+    if !lw.rt.is_empty() {
         let doms = helix_ir::dominators(ir);
-        if let Some((_, body)) = helix_ir::natural_loops(ir, &doms)
-            .into_iter()
-            .find(|(h, _)| *h == hook.header)
-        {
-            for b in body {
-                if b != hook.header {
-                    orphans.insert(b.0 as usize);
+        for hook in lw.rt.values() {
+            if let Some((_, body)) = helix_ir::natural_loops(ir, &doms)
+                .into_iter()
+                .find(|(h, _)| *h == hook.header)
+            {
+                for b in body {
+                    if b != hook.header {
+                        orphans.insert(b.0 as usize);
+                    }
                 }
             }
         }
@@ -527,8 +538,8 @@ pub(crate) fn translate_fn_rt(
         for inst in &ir.blocks[bi].insts.clone() {
             translate_inst(&mut builder, &mut lw, inst)?;
         }
-        if rt_header == Some(bi) {
-            emit_region_dispatch(&mut builder, &mut lw)?;
+        if lw.rt.contains_key(&bi) {
+            emit_region_dispatch(&mut builder, &mut lw, bi)?;
         } else {
             translate_term(&mut builder, &mut lw, bi)?;
         }
@@ -1404,10 +1415,14 @@ pub(crate) fn rt_signature(name: &str) -> Option<Signature> {
 ///
 /// Emission order matters: every stash call happens BEFORE the dispatch call
 /// (evaluation order is program order and Cranelift does not reorder calls).
-fn emit_region_dispatch(b: &mut FunctionBuilder<'_>, lw: &mut Lw<'_>) -> Result<(), String> {
+fn emit_region_dispatch(
+    b: &mut FunctionBuilder<'_>,
+    lw: &mut Lw<'_>,
+    header_idx: usize,
+) -> Result<(), String> {
     // Clone the (small, all-plain-data) hook out of `lw` so the import helper
     // can borrow `lw` mutably while emission reads layout data.
-    let Some(hook) = lw.rt.clone() else {
+    let Some(hook) = lw.rt.get(&header_idx).cloned() else {
         return Err("internal: dispatch emission without a region hook".into());
     };
 
@@ -1551,7 +1566,7 @@ fn emit_region_dispatch(b: &mut FunctionBuilder<'_>, lw: &mut Lw<'_>) -> Result<
     }
 
     // ---- 4. jump to the loop exit, feeding its φs ------------------------------
-    let me = BlockId(lw.rt.as_ref().map(|h| h.header.0).unwrap_or(0));
+    let me = BlockId(hook.header.0);
     let exit = hook.exit;
     let mut cargs: Vec<BlockArg> = Vec::with_capacity(lw.ir.block(exit).phis.len());
     for p in &lw.ir.block(exit).phis {
@@ -1718,7 +1733,7 @@ pub(crate) fn translate_body_fn(
         imports,
         sigs,
         self_uses: collect_self_uses(ir),
-        rt: None,
+        rt: HashMap::new(),
     };
 
     import_in_func(&mut builder, &mut lw, PANIC_SYM)?;

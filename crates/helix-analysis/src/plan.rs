@@ -147,9 +147,14 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
     for lp in &loops.loops {
         let mut notes = Vec::new();
 
-        // Side effects kill parallelization immediately (spec normative).
+        // Side effects kill parallelization immediately (spec normative):
+        // print AND any user-defined call (which may itself print or mutate
+        // shared state). Pure builtins are exempt.
         if has_print(func, lp) {
             notes.push("contains a side effect (print)".to_string());
+        }
+        for name in user_call_names(func, lp) {
+            notes.push(format!("calls non-pure function '{name}' inside the loop"));
         }
 
         // Canonical shape?
@@ -488,6 +493,26 @@ fn has_print(func: &FuncIr, lp: &Loop) -> bool {
     lp.blocks
         .iter()
         .any(|b| func.block(*b).insts.iter().any(is_print_call))
+}
+
+/// Names of every user-defined (non-builtin) function called inside `lp`,
+/// in first-appearance order.
+fn user_call_names(func: &FuncIr, lp: &Loop) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for b in &lp.blocks {
+        for inst in &func.block(*b).insts {
+            if let helix_ir::Inst::Call(c) = inst {
+                let is_user = match c.callee.as_str() {
+                    "min" | "max" | "sqrt" | "abs" | "len" | "zeros" | "print" => false,
+                    _ => true,
+                };
+                if is_user && !out.iter().any(|n| n == &c.callee) {
+                    out.push(c.callee.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 fn is_print_call(i: &helix_ir::Inst) -> bool {

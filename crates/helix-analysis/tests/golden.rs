@@ -353,3 +353,77 @@ fn report_fields_render_for_the_ui() {
     assert_eq!(r.iv.as_deref(), Some("i"));
     assert_eq!(r.bounds.as_ref().map(|b| b.0.as_str()), Some("0"));
 }
+
+// ---------------------------------------------------------------------------
+// 2026-08-25 review wave 2: user-call side-effect gate
+// ---------------------------------------------------------------------------
+
+/// A loop calling a USER function that prints must be SEQUENTIAL. The old
+/// gate recognized only a literal inline `print` call, so `a[i] = tag(i)`
+/// (tag prints) got an unsound SAFE verdict — parallelizing iterations that
+/// each print is wrong regardless of memory independence.
+#[test]
+fn user_call_with_side_effect_vetoes_parallelization() {
+    let src = r#"
+        fn tag(x: i64) -> i64 {
+            print(x);
+            return x;
+        }
+        fn main() {
+            let a: [i64] = zeros(8);
+            for i in 0..8 {
+                a[i] = tag(i);
+            }
+            print(a[3]);
+        }
+    "#;
+    let prog = parse_str(src).unwrap_or_else(|e| panic!("parse: {e}"));
+    let typed = helix_sema::check(&prog).unwrap_or_else(|ds| panic!("check: {:?}", ds.first()));
+    let mut funcs = helix_ir::build(&typed);
+    for f in &mut funcs {
+        helix_ir::to_ssa(f);
+    }
+    let li = find_loops(&funcs[typed.main_idx()]);
+    assert!(!li.loops.is_empty(), "test bug: no loop found");
+    for rep in analyze(&funcs[typed.main_idx()], &li) {
+        assert!(
+            matches!(rep.verdict, Verdict::Sequential(_)),
+            "user-call loop must be SEQUENTIAL, got {:?}",
+            rep.verdict
+        );
+        assert!(
+            rep.notes.iter().any(|n| n.contains("non-pure")),
+            "expected a non-pure-call note, notes: {:?}",
+            rep.notes
+        );
+    }
+}
+
+/// Pure builtins (min/max/sqrt/abs/len/zeros) stay exempt from the gate.
+#[test]
+fn pure_builtin_calls_do_not_veto() {
+    let src = r#"
+        fn main() {
+            let n = 64;
+            let a: [f64] = zeros(n);
+            let out: [f64] = zeros(n);
+            for i in 0..n {
+                out[i] = sqrt(abs(a[i])) + min(1.0, 2.0);
+            }
+            print(out[7]);
+        }
+    "#;
+    let prog = parse_str(src).unwrap_or_else(|e| panic!("parse: {e}"));
+    let typed = helix_sema::check(&prog).unwrap_or_else(|ds| panic!("check: {:?}", ds.first()));
+    let mut funcs = helix_ir::build(&typed);
+    for f in &mut funcs {
+        helix_ir::to_ssa(f);
+    }
+    let li = find_loops(&funcs[typed.main_idx()]);
+    let reps = analyze(&funcs[typed.main_idx()], &li);
+    assert!(
+        reps.iter().any(|r| matches!(r.verdict, Verdict::SafeParallel)),
+        "pure-builtin loop should remain SAFE, got {:?}",
+        reps.iter().map(|r| r.verdict.clone()).collect::<Vec<_>>()
+    );
+}

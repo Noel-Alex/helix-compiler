@@ -242,3 +242,44 @@ fn consts_are_scalar_and_typed() {
     );
     assert!(helix_syntax::parse_str("const A: i64 = -5; fn main() {}").is_err());
 }
+
+// ---------------------------------------------------------------------------
+// 2026-08-25 review wave 2: checker-completeness regressions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn main_with_explicit_unit_return_is_accepted() {
+    // `-> ()` is explicit unit — legal, same as any other fn. The old
+    // syntactic check rejected it while accepting a bare `fn main()`.
+    ok("fn main() -> () { print(1); }");
+    // A genuinely wrong return type stays rejected.
+    assert!(has(
+        &errs("fn main() -> i64 { return 0; }"),
+        "'main' must return unit"
+    ));
+}
+
+#[test]
+fn array_returning_functions_are_rejected() {
+    // Arrays are never copied (spec); a fn returning one has no lowering and
+    // used to pass sema while failing JIT compilation — an accepted-invalid
+    // program. Both spellings must now be rejected at the source.
+    assert!(has(
+        &errs("fn make(n: i64) -> [i64] { return zeros(n); } fn main() { let a = make(3); }"),
+        "cannot return an array"
+    ));
+}
+
+#[test]
+fn builtin_names_cannot_be_redefined_as_functions() {
+    // Every call site resolves to the builtin, so a user definition was
+    // silently uncallable. Reject at the definition instead.
+    assert!(has(
+        &errs("fn len(a: [i64]) -> i64 { return 0; } fn main() {}"),
+        "is a builtin and cannot be redefined"
+    ));
+    assert!(has(
+        &errs("fn print(x: i64) {} fn main() {}"),
+        "is a builtin and cannot be redefined"
+    ));
+}

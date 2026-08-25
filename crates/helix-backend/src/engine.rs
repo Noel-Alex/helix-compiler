@@ -339,16 +339,18 @@ impl JitEngine {
         unchecked: bool,
     ) -> Result<JitEngine, String> {
         // ---- plan preparation -------------------------------------------------
-        // Extract every expressible region up front; parents with at least one
-        // surviving region get the dispatch hook during lowering, everything
-        // else lowers exactly as before.
+        // Extract every expressible region up front. EVERY surviving region of
+        // a function gets its own dispatch hook (keyed by header block) — the
+        // old first-region-wins map silently ran all sibling loops sequential.
         let regions = crate::parallel::prepare(plan, program);
-        let mut hooks: HashMap<usize, crate::parallel::RtHook> = HashMap::new();
+        let mut hooks: HashMap<usize, HashMap<usize, crate::parallel::RtHook>> =
+            HashMap::new();
         let mut bodies: Vec<crate::parallel::BodyArtifact> = Vec::new();
         for r in &regions {
             hooks
                 .entry(r.func_idx)
-                .or_insert_with(|| crate::parallel::RtHook::of(r));
+                .or_default()
+                .insert(r.header.0 as usize, crate::parallel::RtHook::of(r));
             let body = r
                 .body
                 .clone()
@@ -457,7 +459,7 @@ impl JitEngine {
                 &mut module,
                 &funcs,
                 &sigs_by_name,
-                hooks.remove(&fi),
+                hooks.remove(&fi).unwrap_or_default(),
             )?;
             let fid = funcs[&f.name];
             // Verify first so failures carry a precise CLIF location instead

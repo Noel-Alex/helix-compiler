@@ -218,7 +218,6 @@ pub fn native_variant(src: &str) -> Result<Box<dyn ExecVariant>, String> {
 
 /// JIT-backed [`ExecVariant`] — sequential or parallel per the analysis plan.
 pub struct NativeVariant {
-    src: String,
     engine: helix_backend::JitEngine,
     /// "native-seq" or "native-par<P>" — par variants pin HELIX_NTHREADS
     /// around every execution (the runtime reads it at dispatch time).
@@ -282,7 +281,6 @@ impl NativeVariant {
         }
         let engine = helix_backend::JitEngine::compile(&funcs, &bplan, unchecked)?;
         Ok(Self {
-            src: src.to_string(),
             engine,
             label: "native-seq",
             threads: None,
@@ -492,8 +490,73 @@ pub fn run_campaign(config: &BenchConfig) -> CampaignReport {
     }
 }
 
+/// Runs the full analysis pipeline on `src` and returns the first loop's
+/// verdict (`None` when the program has no analyzable loops). This is the
+/// OBSERVED half of the campaign's verdict gate.
+fn analyze_hot_loop_verdict(src: &str) -> Option<helix_analysis::Verdict> {
+    let prog = helix_syntax::parse_str(src).ok()?;
+    let typed = helix_sema::check(&prog).ok()?;
+    let mut funcs = helix_ir::build(&typed);
+    for f in &mut funcs {
+        helix_ir::to_ssa(f);
+    }
+    for f in &funcs {
+        let li = helix_analysis::find_loops(f);
+        if li.loops.is_empty() {
+            continue;
+        }
+        let reports = helix_analysis::analyze(f, &li);
+        return Some(reports.into_iter().next()?.verdict);
+    }
+    None
+}
+
+/// Short verdict label for diagnostics (`"SafeParallel"` etc.).
+fn verdict_label(v: Option<&helix_analysis::Verdict>) -> String {
+    match v {
+        Some(helix_analysis::Verdict::SafeParallel) => "SafeParallel".into(),
+        Some(helix_analysis::Verdict::ReductionParallel(r)) => {
+            format!("ReductionParallel({})", r.op.symbol())
+        }
+        Some(helix_analysis::Verdict::Sequential(_)) => "Sequential".into(),
+        None => "(no analyzable loop)".into(),
+    }
+}
+
 /// Measures one kernel across its size sweep.
 fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> {
+    // Verdict gate: the analyzer's actual verdict on this kernel's source must
+    // match what the registry EXPECTED, or the campaign aborts. Without this a
+    // silent analyzer regression would drain the parallel numbers while every
+    // row still claimed SafeParallel (the numbers would look real).
+    let observed = if kernel.expected_verdict != kernels::ExpectedVerdict::NotApplicable {
+        let observed = analyze_hot_loop_verdict(&kernel.perf_source);
+        let matches = if let Some(v) = &observed {
+            match kernel.expected_verdict {
+                ExpectedVerdict::SafeParallel => {
+                    matches!(v, helix_analysis::Verdict::SafeParallel)
+                }
+                ExpectedVerdict::ReductionParallel => {
+                    matches!(v, helix_analysis::Verdict::ReductionParallel(_))
+                }
+                _ => matches!(v, helix_analysis::Verdict::Sequential(_)),
+            }
+        } else {
+            false
+        };
+        assert!(
+            matches,
+            "{}: analyzer verdict {} does not match expected {:?} — \
+             analysis regressed or the kernel source drifted",
+            kernel.name,
+            verdict_label(observed.as_ref()),
+            kernel.expected_verdict
+        );
+        Some(verdict_label(observed.as_ref()))
+    } else {
+        None
+    };
+
     let mut out = Vec::new();
     for size in kernel.sizes {
         // Parity gate first: all variants must agree at the tiny size before
@@ -582,7 +645,7 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
                 .map(|m| baseline / m.median_ms.max(f64::MIN_POSITIVE))
                 .collect(),
             efficiency,
-            observed_verdict: None, // wired when analysis joins the pipeline
+            observed_verdict: observed.clone(),
             expected_verdict: format!("{:?}", kernel.expected_verdict),
         });
     }

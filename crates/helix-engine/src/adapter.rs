@@ -503,7 +503,8 @@ impl<'p> Adapter<'p> {
                 Some(EStmt::Return { value, span: *span })
             }
             Stmt::Expr(e) => Some(EStmt::Effect(self.expr(e, None)?)),
-            // `;` contributes nothing.
+            // `;` contributes nothing. Kept as an inert effect (never
+            // evaluated as a value): `None` would signal adapter FAILURE.
             Stmt::Empty => Some(EStmt::Effect(inert(Span { start: 0, end: 0 }))),
             // Nested `{ .. }` statement: a real scope whose statements run.
             Stmt::Block(b) => {

@@ -185,6 +185,11 @@ pub enum TypedStmt {
     Nested(TypedBlock),
     /// Expression evaluated for effects only (calls, short-circuit operands).
     Effect(TypedExpr),
+    /// A bare `;`. Contributes nothing — kept as its own variant so the
+    /// poison `TypedExprKind::Error` sentinel is reserved for actual
+    /// error-recovery nodes (a legal production must never masquerade as one;
+    /// see the 2026-08-25 review wave's "bare blocks" lesson).
+    Empty,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -392,6 +397,17 @@ pub fn check(program: &Program) -> Result<TypedProgram, Vec<SemDiag>> {
                         format!("duplicate function '{}'", f.name.name),
                     ));
                 }
+                // A builtin name is reserved: every call site resolves to the
+                // builtin, so a user definition would be silently uncallable.
+                if Builtin::from_name(&f.name.name).is_some() {
+                    diags.push(diag(
+                        f.name.span,
+                        format!(
+                            "'{}' is a builtin and cannot be redefined as a function",
+                            f.name.name
+                        ),
+                    ));
+                }
                 fns.push(f);
             }
             Item::Const(c) => {
@@ -409,10 +425,27 @@ pub fn check(program: &Program) -> Result<TypedProgram, Vec<SemDiag>> {
     // ---- Function signatures (pass 1: enables recursion / call-before-def) ----
     let sigs: Vec<FnSig> = fns
         .iter()
-        .map(|f| FnSig {
-            name: f.name.name.clone(),
-            params: f.params.iter().map(|p| conv_type(&p.ty)).collect(),
-            ret: f.ret.as_ref().map(conv_type).unwrap_or(Ty::Unit),
+        .map(|f| {
+            let ret = f.ret.as_ref().map(conv_type).unwrap_or(Ty::Unit);
+            // Arrays are second-class by spec ("arrays are never copied"):
+            // they travel by reference through call arguments, so a fn
+            // RETURNING one has no lowering — the JIT fails on such programs.
+            // Reject at the source instead of diverging between backends.
+            if ret.is_array() {
+                diags.push(diag(
+                    f.span,
+                    format!(
+                        "function '{}' cannot return an array (arrays are never copied; \
+                         write into a caller-provided array parameter instead)",
+                        f.name.name
+                    ),
+                ));
+            }
+            FnSig {
+                name: f.name.name.clone(),
+                params: f.params.iter().map(|p| conv_type(&p.ty)).collect(),
+                ret,
+            }
         })
         .collect();
 
@@ -486,8 +519,16 @@ pub fn check(program: &Program) -> Result<TypedProgram, Vec<SemDiag>> {
             if !f.params.is_empty() {
                 diags.push(diag(f.span, "'main' must take no parameters"));
             }
-            if f.ret.is_some() {
-                diags.push(diag(f.span, "'main' must return unit (no '-> type')"));
+            // `-> ()` is EXPLICIT unit and legal (same as any other fn); only
+            // a non-unit return type is an error. The old syntactic check
+            // rejected the explicit form while accepting bare main.
+            if let Some(rt) = &f.ret
+                && conv_type(rt) != Ty::Unit
+            {
+                diags.push(diag(
+                    f.span,
+                    format!("'main' must return unit, found '{}'", conv_type(rt).name()),
+                ));
             }
         }
 
@@ -768,11 +809,7 @@ impl FnCtx<'_> {
                 }
             },
             Stmt::Expr(e) => TypedStmt::Effect(self.expr(e, None)),
-            Stmt::Empty => TypedStmt::Effect(TypedExpr {
-                ty: Ty::Unit,
-                span: Span { start: 0, end: 0 },
-                kind: TypedExprKind::Error,
-            }),
+            Stmt::Empty => TypedStmt::Empty,
             Stmt::Block(b) => TypedStmt::Nested(self.check_block(b)),
         }
     }
@@ -1512,6 +1549,8 @@ impl InitCx<'_, '_> {
                 self.expr(e, &init);
                 init
             }
+            // `;` touches nothing.
+            TypedStmt::Empty => init,
             // A bare nested block is a scoped sequence: assignments inside it
             // persist (scoping of *names* was resolved during checking).
             TypedStmt::Nested(b) => self.block(b, init),
