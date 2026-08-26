@@ -60,6 +60,10 @@ dot@65K 21.5→1.4 ms, matmul@128 1412.6→5.6 ms.
 ## Reproduce
 
 ```bash
-cargo run --release -p helix-cli --features bench-native -- bench --out docs/benchmarks/data
+cargo run --release -p helix-cli -- bench --out docs/benchmarks/data
 python tools/plot_bench.py docs/benchmarks/data/campaign.json -o docs/benchmarks/figs
 ```
+
+(The campaign no longer needs a feature flag: helix-backend is an unconditional
+dependency and native variants are always available. Triad ceilings are measured
+at 1 thread and full hardware width; `triad_ceilings` in the JSON carries both rows.)
