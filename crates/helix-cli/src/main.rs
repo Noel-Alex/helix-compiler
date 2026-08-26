@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 
+mod diag;
+
 use helix_ir::print::print_ir;
 use helix_sema::TypedProgram;
 use helix_syntax::Span;
@@ -22,6 +24,19 @@ fn main() {
 }
 
 fn dispatch(args: &[String]) -> i32 {
+    // Per-subcommand help: `helix <cmd> --help` explains that command.
+    if matches!(args.get(1).map(String::as_str), Some("--help" | "-h")) {
+        match args.first().map(String::as_str) {
+            Some("run" | "check" | "dump" | "loops" | "bench" | "observe" | "selftest") => {
+                print_subcommand_help(args.first().expect("matched above").as_str());
+                return 0;
+            }
+            _ => {
+                print_help();
+                return 0;
+            }
+        }
+    }
     match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
         Some("check") => cmd_check(args.get(1)),
@@ -30,18 +45,37 @@ fn dispatch(args: &[String]) -> i32 {
             _ => usage("dump requires <stage> <file>"),
         },
         Some("loops") => match args.get(1) {
-            Some(file) => cmd_loops(file),
-            None => usage("loops requires <file>"),
+            Some(file) if file != "--help" && file != "-h" => cmd_loops(file),
+            _ => usage("loops requires <file>"),
         },
         Some("bench") => cmd_bench(&args[1..]),
         Some("observe") => cmd_observe(&args[1..]),
         Some("selftest") => cmd_selftest(),
+        Some("--version" | "-V" | "version") => {
+            println!("helix {} (HELIX Lite)", env!("CARGO_PKG_VERSION"));
+            0
+        }
         Some("--help" | "-h" | "help") | None => {
             print_help();
             0
         }
         Some(other) => usage(&format!("unknown subcommand '{other}'")),
     }
+}
+
+/// One-screen help per subcommand (the happy path to discovery).
+fn print_subcommand_help(cmd: &str) {
+    let text = match cmd {
+        "run" => "helix run <file.hx> [options]\n\nExecutes a HELIX program.\n\n  --backend <interp|jit>   backend choice; default interp.\n                           --backend=jit also accepted. The JIT compiles\n                           through Cranelift and parallelizes approved loops.\n  --threads <n> (-t)       cap parallel loops at n threads for this run.\n  --unchecked              strip array bounds checks (JIT only).\n\nExit codes: 0 ok · 1 runtime/compile error · 2 bad arguments.",
+        "check" => "helix check <file.hx>\n\nType-checks only; prints diagnostics with source carets.\nExit codes: 0 ok · 1 diagnostics found.",
+        "dump" => "helix dump <stage> <file.hx>\n\nPrints one pipeline stage for inspection or golden tests.\nStages: tokens | ast | ir | ssa",
+        "loops" => "helix loops <file.hx>\n\nRuns loop detection + the dependence battery and prints one verdict\nper loop:\n  SAFE         iterations proven independent -> DOALL parallel\n  REDUCTION(op) associative accumulation -> private partials + combine\n  SEQUENTIAL   refused; the reason line names the carrying access pair",
+        "bench" => "helix bench [--quick] [--out <dir>]\n\nRuns the benchmark campaign: interleaved sampling, CV-gated reruns,\nchecksummed parity gates, and analyzer-verdict assertions.\n  --quick     smaller sizes for fast turnaround\n  --out <dir> output directory (default docs/benchmarks/data)",
+        "observe" => "helix observe [--port <n>] [--no-open]\n\nLaunches the Observatory web UI at http://127.0.0.1:<port> (default 8931)\nand opens a browser tab unless --no-open is given.",
+        "selftest" => "helix selftest\n\nDifferential gauntlet: every examples/*.hx runs through BOTH backends;\nprinted output must be byte-identical. Exit 1 on any mismatch.",
+        _ => return,
+    };
+    println!("{text}");
 }
 
 fn usage(msg: &str) -> i32 {
@@ -54,19 +88,46 @@ fn print_help() {
     println!(
         "HELIX Lite — automatic parallelizing compiler
 
+Write ordinary sequential numerical code; HELIX proves which loops are safe to
+run on every core, and shows you the proof.
+
 USAGE:
-    helix run <file.hx>              run via the reference interpreter
+    helix run <file.hx> [options]    execute a program (interpreter by default)
     helix check <file.hx>            type-check only, print diagnostics
-    helix dump <stage> <file.hx>     print a pipeline stage
+    helix dump <stage> <file.hx>     print a pipeline stage for inspection
                                      stages: tokens | ast | ir | ssa
-    helix loops <file.hx>            loop detection + dependence verdicts
-    helix run --backend jit <f.hx>   run through the Cranelift JIT
-                                     [--unchecked] strips bounds checks
-    helix bench [--quick] [--out D]  benchmark campaign (JSON into docs/benchmarks/data)
-    helix observe [--port N] [--no-open]
-                                     the Observatory web UI
-    helix selftest                   interp-vs-JIT differential gauntlet
-    helix help                       this message"
+    helix loops <file.hx>            loop detection + dependence verdicts:
+                                     SAFE / REDUCTION / SEQUENTIAL per loop
+    helix bench [options]            benchmark campaign (writes JSON reports)
+    helix observe [options]          launch the Observatory web UI
+    helix selftest                   interp-vs-JIT differential gauntlet over
+                                     every example — all outputs must match
+    helix help                       this message
+
+RUN OPTIONS:
+    --backend <interp|jit>   execution backend (default: interp).
+                             `--backend=jit` also accepted. The JIT compiles
+                             through Cranelift and parallelizes approved loops.
+    --unchecked              strip array bounds checks (JIT only); division
+                             guards always remain.
+
+BENCH OPTIONS:
+    --quick                  smaller sizes, faster turnaround
+    --out <dir>              output directory (default: docs/benchmarks/data)
+
+OBSERVE OPTIONS:
+    --port <n>               port to bind (default: 8931)
+    --no-open                do not open a browser tab automatically
+
+ENVIRONMENT (all optional):
+    HELIX_NTHREADS=<n>       cap the threads used by parallel loops
+    HELIX_SCHEDULE=<name>    static | dynamic | guided
+    HELIX_RUNTIME=scope|pool execution stage (pool is the fast default)
+
+EXAMPLES:
+    helix run examples/saxpy.hx                 # interpret it
+    helix run --backend jit examples/saxpy.hx   # compile + run natively
+    helix loops examples/recurrence_reject.hx   # see a rejection with proof"
     );
 }
 
@@ -83,13 +144,13 @@ fn frontend(path: &str) -> Result<TypedProgram, i32> {
                 helix_syntax::SyntaxError::Lex(x) => x.span,
                 helix_syntax::SyntaxError::Parse(x) => x.span,
             };
-            print_diag(&src, span, &e.to_string());
+            print_diag_src(&src, path, span, &e.to_string());
             return Err(1);
         }
     };
     helix_sema::check(&program).map_err(|diags| {
         for d in &diags {
-            print_diag(&src, d.span, &d.msg);
+            print_diag_src(&src, path, d.span, &d.msg);
         }
         eprintln!("{} error(s)", diags.len());
         1
@@ -100,20 +161,36 @@ fn cmd_run(rest: &[String]) -> i32 {
     let mut path: Option<&str> = None;
     let mut backend = "interp";
     let mut unchecked = false;
-    let mut it = rest.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--backend" | "-b" => backend = it.next().map(String::as_str).unwrap_or("interp"),
-            // Combined `--backend=jit` form: silently ignoring it ran the
-            // INTERPRETER while the user believed they tested the JIT.
-            flag if flag.starts_with("--backend=") || flag.starts_with("-b=") => {
-                backend = &flag[flag.find('=').expect("prefix checked") + 1..];
+    let mut threads_env: Option<String> = None;
+    let mut i = 0usize;
+    while i < rest.len() {
+        let flag = rest[i].as_str();
+        match flag {
+            "--backend" | "-b" => {
+                backend = rest.get(i + 1).map(String::as_str).unwrap_or("interp");
+                i += 1;
             }
-            "jit" | "interp" => backend = a,
+            // Combined `--backend=jit` form: silently ignoring it used to run
+            // the INTERPRETER while the user believed they tested the JIT.
+            f if f.starts_with("--backend=") || f.starts_with("-b=") => {
+                backend = &f[f.find('=').expect("prefix checked") + 1..];
+            }
+            "jit" | "interp" => backend = flag,
             "--unchecked" => unchecked = true,
+            // Convenience control: pin thread count for this run without
+            // touching env vars in the shell.
+            "--threads" | "-t" => {
+                threads_env = Some(format!("HELIX_NTHREADS={}", rest.get(i + 1).map(String::as_str).unwrap_or("")));
+                i += 1;
+            }
+            f if f.starts_with("--threads=") || f.starts_with("-t=") => {
+                threads_env =
+                    Some(format!("HELIX_NTHREADS={}", &f[f.find('=').expect("prefix checked") + 1..]));
+            }
             other if path.is_none() => path = Some(other),
             _ => {}
         }
+        i += 1;
     }
     let Some(path) = path else {
         return usage("run requires <file>");
@@ -122,6 +199,12 @@ fn cmd_run(rest: &[String]) -> i32 {
         eprintln!("error: unknown backend '{backend}' (expected 'interp' or 'jit')");
         return 2;
     }
+    let set_threads = threads_env.map(|kv| {
+        let (k, v) = kv.split_once('=').expect("built as K=V");
+        // SAFETY: single-threaded CLI startup; process-global by contract.
+        unsafe { std::env::set_var(k, v) };
+    });
+    let _guard_scope = set_threads.is_some();
     let src = std::fs::read_to_string(PathBuf::from(path)).unwrap_or_default();
     let program = match frontend(path) {
         Ok(p) => p,
@@ -137,7 +220,12 @@ fn cmd_run(rest: &[String]) -> i32 {
             }
             0
         }
+        // Buffered lines go to stdout BEFORE the error (stderr), exactly as
+        // the JIT streams prints then reports the trap — identical stdout.
         Err(e) => {
+            for line in &e.printed_so_far {
+                println!("{line}");
+            }
             eprintln!("{e}");
             1
         }
@@ -174,10 +262,12 @@ fn run_jit(_src: &str, program: &TypedProgram, unchecked: bool) -> i32 {
             return 1;
         }
     };
-    let (prints, result) = helix_backend::engine::capture_prints(|| engine.run_main());
-    for line in prints {
-        println!("{line}");
-    }
+    // Prints stream straight to stdout as the JITed code runs (the engine's
+    // default sink). Capturing them and replaying after run_main would LOSE
+    // every line on a trap: helix_panic exits the process inside run_main,
+    // before the replay loop. Streaming keeps stdout identical to the
+    // interpreter on trapping programs.
+    let result = engine.run_main();
     if let Err(msg) = result {
         eprintln!("{msg}");
         return 1;
@@ -203,7 +293,7 @@ fn cmd_dump(stage: &str, path: &str) -> i32 {
     let tokens = match helix_syntax::lex(&src) {
         Ok(t) => t,
         Err(e) => {
-            print_diag(&src, e.span, &e.msg);
+            print_diag_src(&src, path, e.span, &e.msg);
             return 1;
         }
     };
@@ -229,7 +319,7 @@ fn cmd_dump(stage: &str, path: &str) -> i32 {
                     helix_syntax::SyntaxError::Lex(x) => x.span,
                     helix_syntax::SyntaxError::Parse(x) => x.span,
                 };
-                print_diag(&src, span, &e.to_string());
+                print_diag_src(&src, path, span, &e.to_string());
                 1
             }
         },
@@ -261,30 +351,11 @@ fn cmd_dump(stage: &str, path: &str) -> i32 {
 
 /// Print one diagnostic with a caret line under the offending span.
 ///
-/// Columns count CHARS, not bytes (UTF-8 sources get correct carets), and
-/// `\r` is excluded from the rendered line so CRLF files don't drift the
-/// caret right by one per preceding line break.
-fn print_diag(src: &str, span: Span, msg: &str) {
-    let line_no = src[..span.start as usize].matches('\n').count() + 1;
-    let line_start = src[..span.start as usize].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = src[span.start as usize..]
-        .find('\n')
-        .map_or(src.len(), |i| span.start as usize + i);
-    let line_raw = &src[line_start..line_end];
-    let line = line_raw.trim_end_matches('\r');
-    // Char distance from line start to the span start (tabs render as one
-    // column; matches how terminals with tabstop=8 would still misalign less
-    // than byte-counting does for any non-ASCII source).
-    let caret_col = src[line_start..span.start as usize].chars().count();
-    let caret_len = (span.end.saturating_sub(span.start)).max(1);
-
-    eprintln!("--> line {line_no}: {msg}");
-    eprintln!("{line}");
-    eprintln!(
-        "{}{}",
-        " ".repeat(caret_col),
-        "^".repeat(caret_len as usize)
-    );
+/// Delegates to the rustc-style renderer in `diag` (file:line:col header,
+/// char-accurate columns, CRLF-safe). Kept as a thin wrapper so every call
+/// site passes its file path in one place.
+fn print_diag_src(src: &str, filename: &str, span: Span, msg: &str) {
+    eprint!("{}", diag::render(src, filename, span, msg));
 }
 
 // ---------------------------------------------------------------------------
