@@ -94,6 +94,7 @@ body {
 .btn:hover { border-color: #4b5560; background: #1d232c; }
 .btn:active { transform: translateY(1px); }
 .btn:focus-visible { outline: 2px solid var(--sky); outline-offset: 2px; }
+a.btn { text-decoration: none; display: inline-flex; align-items: center; }
 .btn-primary { background: linear-gradient(180deg, #0e3d33, #0c2f28); border-color: rgba(0, 200, 150, .55); color: #d7fff2; }
 .btn-primary:hover { background: linear-gradient(180deg, #115043, #0e3d33); box-shadow: 0 0 0 3px rgba(0, 200, 150, .08); }
 .btn-primary:disabled { opacity: .55; cursor: default; }
@@ -236,6 +237,16 @@ body {
 .hl-tok { background: rgba(230, 159, 0, .30); outline: 1px solid rgba(230, 159, 0, .55); border-radius: 2px; color: #ffe3ad !important; }
 .diag-u { border-bottom: 2px dashed var(--vermillion); background: rgba(232, 99, 10, .13); cursor: help; }
 .diag-u.hot { background: rgba(232, 99, 10, .30); }
+.diag-hover-tip {
+  position: fixed; z-index: 50; pointer-events: none;
+  max-width: min(520px, calc(100vw - 16px)); padding: 7px 11px; border-radius: 8px;
+  background: #10151bee; border: 1px solid rgba(232, 99, 10, .55);
+  color: var(--text); font: 11.5px/1.55 var(--mono);
+  box-shadow: 0 8px 24px rgba(1, 4, 9, .6);
+  opacity: 0; transition: opacity .12s ease;
+}
+.diag-hover-tip.show { opacity: 1; }
+.diag-hover-tip > div + div { margin-top: 3px; padding-top: 3px; border-top: 1px solid var(--border-soft); }
 
 /* ---------------- TOKENS phase ---------------- */
 .tok-table { border-collapse: collapse; font: 12.5px/1.5 var(--mono); width: 100%; min-width: 720px; }

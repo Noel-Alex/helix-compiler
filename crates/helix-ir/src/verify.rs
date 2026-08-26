@@ -22,7 +22,7 @@
 //! Pre-SSA IR (cell ids reused across blocks) cannot satisfy check 5, which
 //! is why it is gated on the function being SSA-shaped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use helix_sema::Ty;
 
@@ -115,16 +115,44 @@ pub fn verify(ir: &FuncIr) -> Result<(), String> {
     }
 
     // ---- definitions ---------------------------------------------------------
+    // `multi_defs` collects every value defined more than once. Multiple defs
+    // are legal ONLY while cell spellings remain (pre-SSA: source variables
+    // and `$ret`/`$sc` temporaries are all re-assignable cells); there is no
+    // structural marker for the pipeline stage, so plain `verify` records the
+    // signal, gates dominance on it, and lets the SSA seams enforce it via
+    // [`verify_strict`]. Entry-parameter phis are exempt — their zero-arg
+    // form IS the definition.
     let mut def_block: HashMap<u32, usize> = HashMap::new();
     let mut def_order: HashMap<u32, usize> = HashMap::new(); // inst index within block
+    let mut multi_defs: HashSet<u32> = HashSet::new();
 
     for (bi, b) in ir.blocks.iter().enumerate() {
         for p in &b.phis {
-            insert_def(&mut def_block, &mut def_order, p.dst, bi, 0, name)?;
+            // Entry-parameter phis (zero-arg form at bb0) ARE definitions —
+            // they must land in def_block so dominance checks resolve their
+            // uses — but they are exempt from the DUPLICATE signal.
+            let is_entry_param_phi = bi == 0 && p.args.is_empty();
+            insert_def(
+                &mut def_block,
+                &mut def_order,
+                &mut multi_defs,
+                p.dst,
+                bi,
+                0,
+                is_entry_param_phi,
+            );
         }
         for (ii, inst) in b.insts.iter().enumerate() {
             if let Some(d) = inst.dst() {
-                insert_def(&mut def_block, &mut def_order, d, bi, ii + 1, name)?;
+                insert_def(
+                    &mut def_block,
+                    &mut def_order,
+                    &mut multi_defs,
+                    d,
+                    bi,
+                    ii + 1,
+                    false,
+                );
             }
         }
     }
@@ -199,6 +227,10 @@ pub fn verify(ir: &FuncIr) -> Result<(), String> {
             )?;
         }
         for (ii, inst) in b.insts.iter().enumerate() {
+            // Builtin call arity/scalar checks run once per instruction — a
+            // wrong-arity call may have too few operands to reach the per-use
+            // walk below.
+            check_call(ir, inst, name, bi, ii)?;
             for u in inst.uses() {
                 check_use_not_void(ir, u, name, bi, ii)?;
                 check_val_ty(
@@ -243,7 +275,7 @@ pub fn verify(ir: &FuncIr) -> Result<(), String> {
     }
 
     // ---- dominance (SSA-shaped functions only) -------------------------------
-    if is_ssa_shaped(ir) {
+    if multi_defs.is_empty() {
         let doms = dominators(ir);
         let cx = DomCx {
             ir,
@@ -300,19 +332,18 @@ fn check_range(t: BlockId, n: usize, ctx: String) -> Result<(), String> {
 fn insert_def(
     def_block: &mut HashMap<u32, usize>,
     def_order: &mut HashMap<u32, usize>,
+    multi_defs: &mut HashSet<u32>,
     dst: ValueId,
     block: usize,
     order: usize,
-    name: &str,
-) -> Result<(), String> {
-    if def_block.insert(dst.0, block).is_some() {
-        // Multiple defs are legal pre-SSA; SSA verification rejects them
-        // separately (`verify_ssa_unique_defs`). Record first occurrence.
-        let _ = def_order;
-        let _ = name;
+    is_entry_param_phi: bool,
+) {
+    if def_block.insert(dst.0, block).is_some() && !is_entry_param_phi {
+        // Second definition of the same value id. Legal only pre-SSA (cell
+        // spellings); the SSA seams reject the function via `verify_strict`.
+        multi_defs.insert(dst.0);
     }
     def_order.entry(dst.0).or_insert(order);
-    Ok(())
 }
 
 fn check_use_not_void(
@@ -423,11 +454,50 @@ fn check_operand_types(
                 return Err(bad("a stored value"));
             }
         }
-        Inst::Call(c) => {
-            let _ = c;
-        }
+        Inst::Call(_) => {}
     }
     let _ = def_block;
+    Ok(())
+}
+
+/// Conservative builtin-call checks, run once per `Inst::Call`. `len`'s
+/// argument is an array spelled as a cell value (arrays travel by reference),
+/// so only `min`, `max`, `abs` and `sqrt` demand scalars; user functions skip
+/// arity here — their signature is checked at lowering time — but their
+/// arguments still need side-table rows via the per-use type walk above.
+fn check_call(ir: &FuncIr, inst: &Inst, name: &str, bi: usize, ii: usize) -> Result<(), String> {
+    let ty = |v: ValueId| ir.types.val_tys.get(v.0 as usize).copied();
+    let Inst::Call(c) = inst else {
+        return Ok(());
+    };
+    let arity = match c.callee.as_str() {
+        "min" | "max" => Some(2),
+        "abs" | "sqrt" | "len" => Some(1),
+        _ => None,
+    };
+    if let Some(want) = arity
+        && c.args.len() != want
+    {
+        return Err(format!(
+            "{name}: bb{bi}#{ii}: call to {} takes {want} arg(s), got {}",
+            c.callee,
+            c.args.len()
+        ));
+    }
+    if matches!(c.callee.as_str(), "min" | "max" | "abs" | "sqrt") {
+        for a in &c.args {
+            if let Some(t) = ty(*a)
+                && !t.is_scalar()
+            {
+                return Err(format!(
+                    "{name}: bb{bi}#{ii}: call to {} takes scalar args, arg {} has type {}",
+                    c.callee,
+                    a.0,
+                    t.name()
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -496,25 +566,6 @@ fn check_dominance_ordered(
         }
     }
     Ok(())
-}
-
-/// Heuristic shape gate: a function counts as SSA when no local cell id is
-/// defined more than once outside entry-parameter phis.
-fn is_ssa_shaped(ir: &FuncIr) -> bool {
-    let mut counts: HashMap<u32, u32> = HashMap::new();
-    for (bi, b) in ir.blocks.iter().enumerate() {
-        for p in &b.phis {
-            if !(bi == 0 && p.args.is_empty()) {
-                *counts.entry(p.dst.0).or_insert(0) += 1;
-            }
-        }
-        for inst in &b.insts {
-            if let Some(d) = inst.dst() {
-                *counts.entry(d.0).or_insert(0) += 1;
-            }
-        }
-    }
-    counts.values().all(|c| *c <= 1)
 }
 
 /// Convenience: verify and additionally assert SSA uniqueness.

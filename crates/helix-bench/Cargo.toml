@@ -15,8 +15,3 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }
 
-[features]
-# Flip on once helix-backend exposes its contracted JitEngine surface
-# (JitEngine::compile/run_main per interface-contracts.md + Addendum 2);
-# native_variant() then joins the campaign's interleaved rounds.
-bench-native = []

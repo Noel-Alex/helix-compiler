@@ -1487,7 +1487,13 @@ fn emit_region_dispatch(
                 b.ins().call(fref, &[idx, arg]);
             }
             (4, false) => {
-                let wide = b.ins().sextend(types::I64, v);
+                // Same widening guard as above: scalars ride canonically as
+                // I64, so only a genuinely narrow operand may be extended.
+                let wide = if b.func.dfg.value_type(v) == types::I32 {
+                    b.ins().sextend(types::I64, v)
+                } else {
+                    v
+                };
                 let idx = b.ins().iconst(types::I64, word);
                 let fref = import_rt(b, lw, STASH_I_SYM)?;
                 b.ins().call(fref, &[idx, wide]);
@@ -1531,11 +1537,14 @@ fn emit_region_dispatch(
             (4, false) => {
                 let rref = import_rt(b, lw, READ_I32_SYM)?;
                 let inst = b.ins().call(rref, &[handle]);
-                let v = *b
-                    .inst_results(inst)
+                // Store the RAW i32: i32-typed names hold native-width CLIF
+                // values everywhere else (iconst/iadd/φs), and consumers
+                // widen per IR type (print marshals, index bounds extend).
+                // Pre-widening here fed an I64 into that I32 web and the
+                // next consumer's sextend failed verification.
+                *b.inst_results(inst)
                     .first()
-                    .ok_or("read returned nothing")?;
-                b.ins().sextend(types::I64, v)
+                    .ok_or("read returned nothing")?
             }
             (8, false) => {
                 let rref = import_rt(b, lw, READ_I64_SYM)?;

@@ -882,3 +882,120 @@ fn array_only_parallel_region_writes_correctly() {
     result.expect("run");
     assert_eq!(lines, expected);
 }
+
+// ---------------------------------------------------------------------------
+// zeros-in-region demotion + f32 reduction seed/readback — wave-3 regressions
+// ---------------------------------------------------------------------------
+
+/// `zeros` inside an approved loop has no parent fat-pointer to stash, so the
+/// region used to fail JIT compilation on a valid program. The extractor now
+/// demotes such regions (sequential lowering), and the program must still run
+/// correctly through the JIT.
+#[test]
+fn zeros_inside_parallel_loop_still_correct() {
+    let src = r#"
+        fn main() {
+            let n = 4;
+            let sums: [i64] = zeros(n);
+            for i in 0..n {
+                let t: [i64] = zeros(8);
+                t[0] = i;
+                sums[i] = t[0];
+            }
+            print(sums[0]);
+            print(sums[3]);
+        }
+    "#;
+    // Analysis may approve the loop (its memory accesses look independent);
+    // the BACKEND must demote it during extraction because a zeros-created
+    // array has no parent binding to stash. Compiling with the plan must
+    // therefore succeed (it used to fail outright) and run correctly.
+    let irs = compile_ir(src);
+    let plan = analyze_plan(&irs);
+    let engine =
+        JitEngine::compile(&irs, &to_backend_plan(&plan), false).expect("compile with plan");
+    let (lines, result) = helix_backend::engine::capture_prints(|| engine.run_main());
+    result.expect("run");
+    assert_eq!(lines, vec!["0".to_string(), "3".to_string()]);
+    // And the sequential path matches the interpreter exactly.
+    let (jitd, interp) = assert_parity(src);
+    assert_eq!(interp, vec!["0", "3"]);
+    assert_eq!(jitd, vec!["0", "3"]);
+}
+
+/// An f32 sum reduction must survive seed → accumulate → fold → readback at
+/// native width. Values are exact binary fractions so reassociation cannot
+/// mask a bit-pattern bug.
+#[test]
+fn f32_sum_reduction_round_trips_native_width() {
+    let _guard = helix_backend::testutil::serial_lock();
+    let src = r#"
+        fn main() {
+            let n = 100;
+            let a: [f32] = zeros(n);
+            for i in 0..n {
+                a[i] = 0.5;
+            }
+            let total: f32 = 0.0 as f32;
+            for i in 0..n {
+                total = total + a[i];
+            }
+            print(total);
+        }
+    "#;
+    let (par, regions) = jit_lines_with_plan(src);
+    assert!(regions >= 1, "expected a planned region");
+    // f32 Debug formatting renders 50 as "50.0".
+    let got: f32 = par[0].trim_end_matches(".0").parse().unwrap_or(f32::NAN);
+    assert_eq!(got, 50.0, "f32 reduction printed {}", par[0]);
+}
+
+/// f32 min reduction: ordered IEEE minNum semantics through the combine.
+#[test]
+fn f32_min_reduction_matches_interpreter() {
+    let src = r#"
+        fn main() {
+            let n = 64;
+            let a: [f32] = zeros(n);
+            for i in 0..n {
+                a[i] = (i % 7) as f32 * 0.25;
+            }
+            let lo = 1.0e30 as f32;
+            for i in 0..n {
+                lo = min(lo, a[i]);
+            }
+            print(lo);
+        }
+    "#;
+    let out = assert_parallel_parity(src, 2);
+    // f32 Debug renders zero as "0.0" on both backends.
+    let got: f32 = out[0].trim_end_matches(".0").parse().unwrap_or(f32::NAN);
+    assert_eq!(got, 0.0, "f32 min reduction printed {}", out[0]);
+}
+
+/// An i32 Add reduction must stay at native 4-byte width through seed →
+/// accumulate → fold → readback. The seed is NONZERO so the dispatcher's
+/// width-bounded copy of the widened stash word is exercised (a zero seed
+/// would pass even if the copy grabbed the wrong bytes), and every element
+/// fits comfortably in i32 so no wraparound can mask a truncation bug.
+#[test]
+fn i32_sum_reduction_matches_interpreter() {
+    let src = r#"
+        fn main() {
+            let n = 1000;
+            let a: [i32] = zeros(n);
+            for i in 0..n {
+                a[i] = (i % 13) as i32;
+            }
+            let total: i32 = 7;
+            for i in 0..n {
+                total = total + a[i];
+            }
+            print(total);
+        }
+    "#;
+    let out = assert_parallel_parity(src, 2);
+    // Hand-computed: 76 full cycles of 0..=12 sum to 76*78, the trailing 12
+    // partials add 66, plus the seed 7.
+    assert_eq!(out[0], "6001", "i32 reduction printed {}", out[0]);
+}

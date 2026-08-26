@@ -680,9 +680,13 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
                 Inst::Call(c) => {
                     // Pure/host-side builtins travel; anything else (user
                     // calls, prints) may touch foreign state — demote.
+                    // `zeros` allocates a NEW array whose fat pointer has no
+                    // parent binding to prebind/stash (see emit_region_dispatch
+                    // in lower.rs), so it can never travel; `len` survives
+                    // only nominally — its Array-typed operand is rejected by
+                    // capture classification below.
                     match c.callee.as_str() {
                         "min" | "max" | "sqrt" | "abs" | "len" => {}
-                        "zeros" if c.arr_refs.len() == 1 && c.dst.is_none() => {}
                         _ => return None,
                     }
                 }
@@ -1415,7 +1419,7 @@ pub extern "C" fn helix_dispatch(start: i64, end: i64, region_id: i64, nthreads:
     }
 
     // ---- seed every private accumulator (reductions) ---------------------------
-    if let Some((word, width, _float)) = meta.seed
+    if let Some((word, width, float)) = meta.seed
         && let Some(bits) = caps.get(&word)
     {
         for p in 0..cells {
@@ -1424,9 +1428,19 @@ pub extern "C" fn helix_dispatch(start: i64, end: i64, region_id: i64, nthreads:
             // within the `width` <= 8 bytes of the accumulator field.
             unsafe {
                 let dst = (mem.as_mut_ptr().cast::<u8>()).add(slot * 8 + CELL_ACC_OFF as usize);
-                // Captures store widened payloads; f32/i32 seeds take the
-                // low 4 bytes, everything else the full word.
-                let bytes: [u8; 8] = bits.to_le_bytes();
+                // Captures store WIDENED payloads: an f32 seed rides as f64
+                // bits and must be demoted to its native 4-byte pattern
+                // before the width-bounded copy (the low half of a promoted
+                // f64 is not the f32 bit pattern). i32 seeds sign-extend, so
+                // their low bytes are already correct.
+                let word = if float && width == 4 {
+                    // Demote the widened seed back to its f32 pattern (`as`
+                    // is round-to-nearest; exact f32 payloads round-trip).
+                    (f64::from_bits(*bits) as f32).to_bits() as u64
+                } else {
+                    *bits
+                };
+                let bytes: [u8; 8] = word.to_le_bytes();
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, width as usize);
             }
         }
@@ -1494,12 +1508,13 @@ pub extern "C" fn helix_read_f64(handle: i64) -> f64 {
     f64::from_bits(read_slot(handle))
 }
 
-/// `helix_read_f32(handle)` (total stored widened; demoted on read).
+/// `helix_read_f32(handle)` (total stored at native width, zero-extended into
+/// the slot word; decoded from the low 4 bytes).
 ///
 /// # Safety (FFI contract)
 /// See [`helix_read_i64`].
 pub extern "C" fn helix_read_f32(handle: i64) -> f32 {
-    f64::from_bits(read_slot(handle)) as f32
+    f32::from_bits(read_slot(handle) as u32)
 }
 
 /// Reads the readback slot of a parked context (zero when unknown).
@@ -1744,6 +1759,7 @@ pub(crate) fn combine_for(kind: RKind) -> helix_runtime::CombineFn {
         (AnOp::Min, true, 8) => combine_min_f64,
         (AnOp::Min, true, 4) => combine_min_f32,
         (AnOp::Max, true, 8) => combine_max_f64,
+        (AnOp::Max, true, 4) => combine_max_f32,
         // Widths other than 4/8 never leave `extract` (it demotes them), so
         // the wildcard is unreachable in practice; DoAll regions never reach
         // this function either (`combine_for` returns early above).

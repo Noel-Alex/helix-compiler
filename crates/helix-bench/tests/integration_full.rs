@@ -36,8 +36,8 @@ fn require_native() -> Result<(), String> {
     match helix_bench::native_availability() {
         NativeAvailability::Ready => Ok(()),
         NativeAvailability::Unavailable(why) => Err(format!(
-            "native backend unavailable ({why}); rebuild with --features bench-native \
-             once helix-backend M10 exposes JitEngine"
+            "native backend unavailable ({why}); helix-backend is a hard dependency, \
+             so this indicates a broken build"
         )),
     }
 }

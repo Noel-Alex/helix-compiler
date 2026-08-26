@@ -427,3 +427,87 @@ fn pure_builtin_calls_do_not_veto() {
         reps.iter().map(|r| r.verdict.clone()).collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Loop-nest forest — regression for the find_loops depth/parent fix
+// ---------------------------------------------------------------------------
+
+/// find_loops sorted bodies ASCENDING while the parent search scanned
+/// already-placed loops, so a nested loop could never find its (larger)
+/// container: every loop of matmul came out depth=1, parent=None, and
+/// build_plan approved mid-nest parallelization. Depths must now reflect
+/// the true nesting, and only innermost loops enter the plan.
+#[test]
+fn matmul_loop_forest_has_real_depths() {
+    let v = analyze_example("matmul");
+    assert!(v.reports.len() >= 4, "4 loops in main: init/i/j/k");
+    let depths: Vec<(usize, u32)> = v
+        .reports
+        .iter()
+        .map(|r| (r.loop_id, r.depth))
+        .collect();
+    // Exactly one outermost nest level-1 chain: init at depth 1, i at 1,
+    // j inside i at 2, k inside j at 3.
+    let mut d1 = 0;
+    let mut has_d2 = false;
+    let mut has_d3 = false;
+    for (_, d) in &depths {
+        match *d {
+            1 => d1 += 1,
+            2 => has_d2 = true,
+            3 => has_d3 = true,
+            other => panic!("unexpected depth {other}: {depths:?}"),
+        }
+    }
+    assert_eq!(d1, 2, "init + i live at depth 1: {depths:?}");
+    assert!(has_d2, "j must sit at depth 2: {depths:?}");
+    assert!(has_d3, "k must sit at depth 3: {depths:?}");
+}
+
+/// The plan approves ONLY innermost (or top-level) loops: the mid-nest j
+/// loop of matmul used to slip through when depths were flat.
+#[test]
+fn matmul_plan_never_approves_midnest_loops() {
+    let v = analyze_example("matmul");
+    let mut per_fn = vec![Vec::new(); v.funcs.len()];
+    for r in &v.reports {
+        let fi = v
+            .loops
+            .iter()
+            .position(|li| li.loops.iter().any(|l| l.id == r.loop_id))
+            .expect("loop belongs to a function");
+        per_fn[fi].push(r.clone());
+    }
+    let plan = build_plan(&v.funcs, &v.loops, &per_fn);
+    // Every planned region's header must belong to an innermost or depth-1
+    // loop; the depth-2 j loop is forbidden.
+    for reg in &plan.regions {
+        let lp = v.loops[reg.func_idx]
+            .loops
+            .iter()
+            .find(|l| l.header == reg.header)
+            .unwrap_or_else(|| panic!("region header bb{} not a known loop", reg.header.0));
+        let rep = v
+            .reports
+            .iter()
+            .find(|r| r.loop_id == lp.id)
+            .expect("report for planned loop");
+        assert!(
+            lp.depth == 1 || lp.depth == rep.depth && is_innermost(&v, reg.func_idx, lp.id),
+            "planned region at depth {} (loop {}) — mid-nest parallelization",
+            lp.depth,
+            lp.id
+        );
+    }
+}
+
+fn is_innermost(v: &LoopVerdicts, fi: usize, id: usize) -> bool {
+    let info = &v.loops[fi];
+    !info.loops.iter().any(|c| {
+        c.id != id
+            && c.blocks.len() < info.loops.iter().find(|l| l.id == id).expect("id").blocks.len()
+            && c.blocks.iter().all(|b| {
+                info.loops.iter().find(|l| l.id == id).expect("id").blocks.contains(b)
+            })
+    })
+}

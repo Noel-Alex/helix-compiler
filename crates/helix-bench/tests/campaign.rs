@@ -121,6 +121,7 @@ fn campaign_json_shape_round_trips() {
 
     assert_eq!(report.schema, "helix-campaign-v1");
     assert!(!report.meta.rustc_version.is_empty());
+    assert!(report.triad_ceilings.is_empty());
     assert!(report.triad_ceiling.is_none());
 
     let point = &report.points[0];
@@ -183,4 +184,73 @@ fn campaign_includes_expected_verdict_labels() {
         .find(|p| p.kernel == "small_n")
         .unwrap();
     assert_eq!(small_n.expected_verdict, "SafeParallel");
+}
+
+// ---------------------------------------------------------------------------
+// Rust-twin differential guarantee (wave-3 regression)
+// ---------------------------------------------------------------------------
+
+/// The module docs advertise `twin_checksum == interpreter_checksum` as a
+/// real differential assertion. This test makes it one: every twin's
+/// independently computed result must hash to the same checksum the HELIX
+/// interpreter prints for the corresponding correctness-size kernel.
+#[test]
+fn rust_twins_match_interpreter_checksums() {
+    use helix_bench::rust_twins;
+    use helix_bench::rust_twins::printed_checksum;
+    use helix_bench::interp_variant;
+
+    // saxpy twin semantics: x[i]=1, y[i]=2, s=2.5 -> y[7] = 4.5.
+    let y = rust_twins::saxpy(8, 2.5);
+    let twin_saxpy = rust_twins::checksum_f64(y[7]);
+    let saxpy_src = r#"
+        fn main() {
+            let n = 8;
+            let x: [f64] = zeros(n);
+            let y: [f64] = zeros(n);
+            let s = 2.5;
+            for i in 0..n {
+                x[i] = 1.0;
+                y[i] = 2.0;
+            }
+            for i in 0..n {
+                y[i] = s * x[i] + y[i];
+            }
+            print(y[7]);
+        }
+    "#;
+    let v = interp_variant(saxpy_src).expect("compile");
+    let out = v.run_once().expect("run");
+    assert_eq!(
+        printed_checksum(&out.printed),
+        twin_saxpy,
+        "saxpy twin vs interpreter checksum"
+    );
+
+    // dot: a[i]=b[i]=1.0 at n=16 -> dot=16.
+    let (a, b) = (vec![1.0; 16], vec![1.0; 16]);
+    let twin_dot = rust_twins::checksum_f64(rust_twins::dot(&a, &b));
+    let dot_src = r#"
+        fn main() {
+            let n = 16;
+            let a: [f64] = zeros(n);
+            let b: [f64] = zeros(n);
+            for i in 0..n {
+                a[i] = 1.0;
+                b[i] = 1.0;
+            }
+            let d = 0.0;
+            for i in 0..n {
+                d = d + a[i] * b[i];
+            }
+            print(d);
+        }
+    "#;
+    let v = interp_variant(dot_src).expect("compile");
+    let out = v.run_once().expect("run");
+    assert_eq!(
+        printed_checksum(&out.printed),
+        twin_dot,
+        "dot twin vs interpreter checksum"
+    );
 }

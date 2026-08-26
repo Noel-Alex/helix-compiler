@@ -108,6 +108,7 @@ fn run_inner(program: &TypedProgram, src: Option<&str>) -> Result<RunOutput, Run
                         "source no longer parses ({e}); cannot build evaluation tree"
                     )),
                     span: Span { start: 0, end: 0 },
+                    printed_so_far: Vec::new(),
                 });
             }
         },
@@ -128,6 +129,7 @@ fn run_inner(program: &TypedProgram, src: Option<&str>) -> Result<RunOutput, Run
                         "source and typed program do not correspond".to_string(),
                     ),
                     span: Span { start: 0, end: 0 },
+                    printed_so_far: Vec::new(),
                 });
             }
         },
@@ -139,10 +141,13 @@ fn run_inner(program: &TypedProgram, src: Option<&str>) -> Result<RunOutput, Run
                         .to_string(),
                 ),
                 span: Span { start: 0, end: 0 },
+                printed_so_far: Vec::new(),
             });
         }
     };
 
+    // On failure the error carries `printed_so_far` (attached by the worker),
+    // so callers can emit buffered stdout before the rendered message.
     interp::execute(adapted).map(|outcome| RunOutput {
         printed: outcome.printed,
         checksum: outcome.checksum,
@@ -288,6 +293,22 @@ mod tests {
             "wrong message: {err}"
         );
         assert!(err.contains("at line 3"), "wrong message: {err}");
+    }
+
+    #[test]
+    fn trap_preserves_printed_lines_for_jit_parity() {
+        // The JIT streams prints as they happen; the interpreter must hand
+        // back everything printed before the trap so drivers emit identical
+        // stdout for both backends.
+        let src = "fn main() {\n    print(1);\n    print(2);\n    let q = 10 / 0;\n}\n";
+        let ast = helix_syntax::parse_str(src).unwrap();
+        let tp = check(&ast).unwrap();
+        let err = run_with_source(src, &tp).expect_err("must trap");
+        assert_eq!(err.printed_so_far, vec!["1", "2"]);
+        assert_eq!(
+            err.render(src),
+            "runtime error: integer division by zero at line 4"
+        );
     }
 
     #[test]

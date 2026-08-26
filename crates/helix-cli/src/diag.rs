@@ -60,9 +60,10 @@ mod tests {
 
     #[test]
     fn caret_lands_under_the_span() {
+        // `y` sits 9 chars into line 2 (byte offset 21): column 10, 1-based.
         let src = "fn main() {\n    let x = y;\n}";
         let out = render(src, "t.hx", Span { start: 21, end: 22 }, "undeclared variable 'y'");
-        assert!(out.contains("t.hx:2:13"), "{out}");
+        assert!(out.contains("t.hx:2:10"), "{out}");
         assert!(out.contains("^"), "{out}");
         assert!(out.contains("undeclared variable 'y'"), "{out}");
     }

@@ -22,8 +22,8 @@
 //!
 //! The JIT side is being built **in parallel**; this crate compiles and tests
 //! without it. All execution paths hide behind [`ExecVariant`] and are
-//! obtained through [`native_variant`], gated by [`native_availability`] and
-//! the `bench-native` cargo feature. The full pipeline integration test lives
+//! obtained through [`native_variant`] (always available — helix-backend is
+//! a hard dependency). The full pipeline integration test lives
 //! behind `#[ignore]` (`tests/integration_full.rs`) and runs later with
 //! `cargo test -p helix-bench -- --ignored`.
 //!
@@ -181,24 +181,15 @@ pub enum NativeAvailability {
 
 /// Probes whether the JIT variant can be built right now.
 ///
-/// This is THE seam between this crate and the in-parallel backend work:
-/// everything downstream only sees [`ExecVariant`]s. The probe is
-/// feature-gated — when `helix-backend` lands its contracted surface
-/// (`JitEngine::compile`/`run_main` per interface-contracts.md + Addendum 2),
-/// enable `bench-native` in this crate's manifest and flip [`native_variant`]
-/// from its stub to the real construction.
+/// The backend is a hard dependency of this crate (helix-backend is linked
+/// unconditionally), so availability is always `Ready`; per-program failures
+/// surface through [`native_variant`]'s error return instead. (A dead
+/// `bench-native` cargo feature used to gate this and made
+/// `meta.jit_available` report Unavailable in every default build — the
+/// opposite of reality.)
 #[must_use]
 pub fn native_availability() -> NativeAvailability {
-    #[cfg(feature = "bench-native")]
-    {
-        NativeAvailability::Ready
-    }
-    #[cfg(not(feature = "bench-native"))]
-    {
-        NativeAvailability::Unavailable(
-            "feature `bench-native` disabled: helix-backend M10 not linked",
-        )
-    }
+    NativeAvailability::Ready
 }
 
 /// Builds the sequential-native variant for one program, if possible.
@@ -233,11 +224,6 @@ impl NativeVariant {
     /// # Errors
     /// Any pipeline stage or backend compile failure, as text.
     pub fn new(src: &str, unchecked: bool) -> Result<Self, String> {
-        // Honor the feature gate: without `bench-native` no build may construct
-        // a JIT variant (meta.jit_available would otherwise lie).
-        if let NativeAvailability::Unavailable(why) = native_availability() {
-            return Err(format!("native variants unavailable: {why}"));
-        }
         let ast = helix_syntax::parse_str(src).map_err(|e| format!("syntax error: {e}"))?;
         let typed = helix_sema::check(&ast).map_err(|ds| format!("{ds:#?}"))?;
         let mut funcs = helix_ir::build(&typed);
@@ -398,7 +384,15 @@ pub struct CampaignReport {
     pub timestamp_utc: String,
     /// Machine/toolchain/environment block.
     pub meta: SystemMeta,
-    /// Measured bandwidth ceiling (absent when skipped).
+    /// Measured bandwidth ceilings, one row per measured thread count
+    /// (1 and hardware width; absent when skipped). A single-thread-only
+    /// number used to masquerade as the machine ceiling — saxpy at 8 threads
+    /// was being divided by a denominator no 8-thread run can approach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triad_ceilings: Vec<TriadGibPerSec>,
+    /// Legacy single-row field (kept for old report readers; always the
+    /// threads=1 measurement when present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triad_ceiling: Option<TriadGibPerSec>,
     /// One entry per measured (kernel, size).
     pub points: Vec<KernelPoint>,
@@ -458,11 +452,24 @@ pub fn run_campaign(config: &BenchConfig) -> CampaignReport {
         .map(Path::to_path_buf);
     let meta = SystemMeta::capture(repo_root.as_deref());
 
-    let triad_ceiling = if config.skip_triad {
-        None
+    // Ceiling at 1 thread AND at full hardware width: memory-bound speedups
+    // must be judged against a denominator measured at the SAME width.
+    let triad_ceilings = if config.skip_triad {
+        Vec::new()
     } else {
-        Some(triad::measure_triad(config.triad_n, 1))
+        let hw = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut rows = vec![triad::measure_triad(config.triad_n, 1)];
+        if hw > 1 {
+            rows.push(triad::measure_triad(config.triad_n, hw));
+        }
+        rows.into_iter()
+            .map(|t| TriadGibPerSec {
+                threads: t.threads,
+                gib_per_sec: t.gib_per_sec,
+            })
+            .collect::<Vec<_>>()
     };
+    let triad_ceiling = triad_ceilings.first().copied();
 
     let mut points = Vec::new();
     for kernel in kernels::registry() {
@@ -481,10 +488,8 @@ pub fn run_campaign(config: &BenchConfig) -> CampaignReport {
     CampaignReport {
         schema: "helix-campaign-v1".to_string(),
         timestamp_utc: meta.timestamp_utc.clone(),
-        triad_ceiling: triad_ceiling.map(|t| TriadGibPerSec {
-            threads: t.threads,
-            gib_per_sec: t.gib_per_sec,
-        }),
+        triad_ceilings,
+        triad_ceiling,
         meta,
         points,
     }

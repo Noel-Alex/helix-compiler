@@ -156,11 +156,8 @@ pub fn build_artifact_with_opts(example: &str, source: &str, opts: BuildOpts) ->
 
     let mut cfg_fns = Vec::with_capacity(funcs.len());
     let mut domtrees = std::collections::BTreeMap::new();
-    for f in &funcs {
-        let li = loop_infos
-            .get(fn_index(&funcs, f))
-            .cloned()
-            .unwrap_or_default();
+    for (fi, f) in funcs.iter().enumerate() {
+        let li = loop_infos.get(fi).cloned().unwrap_or_default();
         cfg_fns.push(layout::cfg_layout(&f.name, f, &li));
         domtrees.insert(f.name.clone(), domtree_of(f));
     }
@@ -225,14 +222,6 @@ fn syntax_error_parts(e: &helix_syntax::SyntaxError) -> (Span, String) {
         helix_syntax::SyntaxError::Lex(le) => (le.span, le.to_string()),
         helix_syntax::SyntaxError::Parse(pe) => (pe.span, pe.to_string()),
     }
-}
-
-/// Index of `f` inside `funcs` by position (analysis APIs want parallel lists).
-fn fn_index(funcs: &[FuncIr], f: &FuncIr) -> usize {
-    funcs
-        .iter()
-        .position(|x| std::ptr::eq(x, f))
-        .unwrap_or_else(|| funcs.iter().position(|x| x.name == f.name).unwrap_or(0))
 }
 
 /// Prints every function of one stage.

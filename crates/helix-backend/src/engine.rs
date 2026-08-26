@@ -338,6 +338,15 @@ impl JitEngine {
         plan: &ParallelPlan,
         unchecked: bool,
     ) -> Result<JitEngine, String> {
+        // ---- input contract ----------------------------------------------------
+        // The backend lowers SSA-form IR; verifying here turns a malformed
+        // upstream into a precise error instead of a miscompile or CLIF
+        // verifier panic deep in codegen. (The extracted region bodies are
+        // verified inside `build_body_ir`.)
+        for f in program {
+            helix_ir::verify_ssa(f).map_err(|e| format!("input IR '{}' not valid SSA: {e}", f.name))?;
+        }
+
         // ---- plan preparation -------------------------------------------------
         // Extract every expressible region up front. EVERY surviving region of
         // a function gets its own dispatch hook (keyed by header block) — the

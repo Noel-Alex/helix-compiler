@@ -181,13 +181,13 @@ function renderSource(art) {
       const span = document.createElement('span');
       span.className = sp.cls || '';
       span.textContent = sp.text;
-      if (diagsHere.length) {
-        const hit = diagsHere.some(d => sp.end > d.span.start && sp.start < d.span.end);
-        if (hit) span.classList.add('diag-u');
-      }
       cell.appendChild(span);
       if (sp.tok) attachTokenHover(span, sp.tok);
-      if (diagsHere.length) attachDiagHover(span, diagsHere, sp);
+      const hits = diagsHere.filter(d => sp.end > d.span.start && sp.start < d.span.end);
+      if (hits.length) {
+        span.classList.add('diag-u');
+        attachDiagHover(span, hits);
+      }
     }
     if (diagsHere.length) tr.classList.add('has-diag', 'diag-solo');
     tr.appendChild(ln);
@@ -199,7 +199,35 @@ function renderSource(art) {
 function attachTokenHover(spanEl, tok) {
   spanEl.dataset.tokIdx = tok._idx ?? '';
 }
-function attachDiagHover() {}
+
+/** Hover tooltip for diagnostic-underlined tokens: one line per diag message. */
+function attachDiagHover(spanEl, diags) {
+  spanEl.addEventListener('mouseenter', () => {
+    let tip = $('.diag-hover-tip');
+    if (!tip) {
+      tip = document.createElement('div');
+      tip.className = 'diag-hover-tip';
+      document.body.appendChild(tip);
+    }
+    tip.textContent = '';
+    for (const d of diags) {
+      const row = document.createElement('div');
+      row.textContent = d.msg;
+      tip.appendChild(row);
+    }
+    spanEl.classList.add('hot');
+    tip.classList.add('show');
+    const r = spanEl.getBoundingClientRect();
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    tip.style.left = Math.min(Math.max(r.left, 8), window.innerWidth - w - 8) + 'px';
+    tip.style.top = (r.bottom + h + 8 > window.innerHeight - 8
+      ? r.top - h - 8 : r.bottom + 8) + 'px';
+  });
+  spanEl.addEventListener('mouseleave', () => {
+    spanEl.classList.remove('hot');
+    $('.diag-hover-tip')?.classList.remove('show');
+  });
+}
 
 /* ============================================================
    TOKENS phase — table + hover sync to source highlight
@@ -826,7 +854,6 @@ const VERDICT_META = {
   SAFE:       { glyph: '✓', label: 'PARALLELIZED' },
   REDUCTION:  { glyph: null, label: 'REDUCTION' },
   SEQUENTIAL: { glyph: '⚠', label: 'SEQUENTIAL' },
-  REJECTED:   { glyph: '⚠', label: 'REJECTED' },
 };
 
 function renderLoops(art) {
@@ -845,7 +872,7 @@ function renderLoops(art) {
   loops.forEach(L => {
     const verdict = String(L.verdict ?? 'SEQUENTIAL').toUpperCase();
     const meta = VERDICT_META[verdict] ?? VERDICT_META.SEQUENTIAL;
-    const rejected = verdict === 'SEQUENTIAL' || verdict === 'REJECTED';
+    const rejected = verdict === 'SEQUENTIAL';
 
     const card = document.createElement('article');
     card.className = 'loop-card ' + verdict;
@@ -879,7 +906,6 @@ function renderLoops(art) {
     whyKey.textContent = rejected ? 'WHY REJECTED' : (verdict === 'REDUCTION' ? 'HOW IT RUNS' : 'VERDICT');
     const whyTxt = document.createElement('span');
     whyTxt.textContent = L.reason ?? '—';
-    why.title = L.explain || L.reason || '';
     why.append(whyKey, whyTxt);
     card.appendChild(why);
 
@@ -949,8 +975,9 @@ function renderLoops(art) {
         const pair = document.createElement('span');
         pair.className = 'pair-mono';
         pair.innerHTML =
-          `<span>${esc(d.sink ?? d.to ?? '?')}</span><span class="arr"> ← </span><span>${esc(d.source ?? d.from ?? '?')}</span>`;
-        pair.title = d.explain ?? d.note ?? '';
+          `<span>${esc(d.array ?? '?')}</span>` +
+          (d.level != null ? ` <span class="arr">·</span> level ${esc(String(d.level))}` : '');
+        pair.title = d.explain ?? '';
         row.appendChild(pair);
         depVal.appendChild(row);
       }
@@ -965,11 +992,10 @@ function renderLoops(art) {
     body.appendChild(depWrap);
 
     // plan / reduction strip
-    if (verdict === 'SAFE' && L.plan) {
+    if (verdict === 'SAFE' && L.plan?.threads) {
       const plan = document.createElement('span');
       plan.className = 'plan-strip';
-      plan.innerHTML = `⚙ plan&nbsp;&nbsp;strip-mined → ${esc(String(L.plan.threads ?? '?'))} threads` +
-        (L.plan.tile && L.plan.tile !== 'none' ? ` · tile=${esc(L.plan.tile)}` : '');
+      plan.innerHTML = `⚙ plan&nbsp;&nbsp;→ ${esc(String(L.plan.threads))} threads`;
       plan.title = 'runtime execution plan chosen for this loop';
       body.appendChild(plan);
     }
@@ -1267,7 +1293,15 @@ function flashStep(id) {
    ============================================================ */
 async function fetchJSON(url, opts) {
   const res = await fetch(url, opts);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    // Prefer the API's JSON error body ({ "error": msg }) over a bare status.
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body && typeof body.error === 'string') msg = body.error;
+    } catch { /* body was not JSON */ }
+    throw new Error(msg);
+  }
   return res.json();
 }
 
@@ -1280,9 +1314,10 @@ async function loadExamples() {
     state.examples = [];
   }
   if (!state.examples.length) {
-    // static fallback — mirrors the repo's examples/ directory
-    state.examples = ['saxpy', 'matmul', 'stencil_2d', 'jacobi_2d', 'dot_reduction',
-                      'fib_recursion', 'gcd_box_test', 'minmax_reduction', 'count_primes_sieve'];
+    // static fallback — mirrors builtin_examples() in crates/helix-observe/src/server.rs
+    state.examples = ['saxpy', 'matmul', 'jacobi_2d', 'dot_reduction',
+                      'minmax_reduction', 'count_primes_sieve', 'fib_recursion',
+                      'gcd_box_test', 'recurrence_reject', 'stencil_2d_reject', 'type_errors'];
   }
   ul.textContent = '';
   for (const name of state.examples) {
@@ -1345,6 +1380,12 @@ function renderAll() {
   } else cs.classList.add('hidden');
 
   $('#btn-recompile').classList.toggle('hidden', !state.fromCustom);
+
+  // standalone HTML export only makes sense for named stored examples
+  const exBtn = $('#btn-export');
+  const exported = state.examples.includes(state.exampleName);
+  exBtn.classList.toggle('hidden', !exported);
+  if (exported) exBtn.href = `/api/artifact/export?example=${encodeURIComponent(state.exampleName)}`;
 
   renderDiagBanner(art);
   refreshStepper(art);
@@ -1417,6 +1458,10 @@ function wireEvents() {
     }
   });
 
+  // a scrolled-away token must not leave its diagnostic tooltip stranded
+  document.addEventListener('scroll',
+    () => $('.diag-hover-tip')?.classList.remove('show'), true);
+
   document.addEventListener('keydown', ev => {
     const tag = document.activeElement?.tagName;
     const typing = tag === 'TEXTAREA' || tag === 'INPUT';
@@ -1443,8 +1488,12 @@ async function boot() {
   buildStepper();
   wireEvents();
   await loadExamples();
-  const first = $('#example-list .ex-item');
-  if (first) selectExample(first.textContent, first);
+  // open on the strongest showcase that actually loaded, else the first entry
+  const preferred = ['scale', 'recurrence_reject', 'dot_reduction']
+    .map(name => $(`#example-list .ex-item[data-example="${CSS.escape(name)}"]`))
+    .find(Boolean);
+  const first = preferred ?? $('#example-list .ex-item');
+  if (first) selectExample(first.dataset.example, first);
   else {
     // fully offline: no API, no fixtures — leave a graceful shell
     setArtifact({

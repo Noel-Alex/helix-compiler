@@ -89,7 +89,8 @@ pub struct Measurement {
     /// Coefficient of variation `stddev/mean` (0 when mean is 0).
     pub cv: f64,
     /// True when the first sample batch exceeded [`CV_RERUN_THRESHOLD`] and a
-    /// second, tighter batch replaced it.
+    /// rerun was performed. The rerun's samples replaced the originals only
+    /// when strictly tighter (lower CV); a noisier rerun never displaces them.
     pub reran_for_cv: bool,
 }
 
@@ -209,6 +210,13 @@ pub fn measure_with_reps(run: impl Fn(u32) -> Duration) -> Measurement {
             break;
         }
         reran_for_cv = true;
+    }
+    // Honesty: once a rerun ran, the SURVIVING measurement must record it
+    // even when the original batch won (mirrors run_interleaved's else arm).
+    if reran_for_cv {
+        if let Some(m) = best.as_mut() {
+            m.reran_for_cv = true;
+        }
     }
     best.unwrap_or_else(|| summarize(Vec::new(), reps, false))
 }

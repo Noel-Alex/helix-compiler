@@ -22,7 +22,13 @@ fn compile_ir(src: &str) -> Vec<helix_ir::FuncIr> {
 }
 
 /// Compiles `src` and runs it under a print capture, returning the lines.
+///
+/// Holds the serial lock for the whole run: the trap recorder is
+/// process-global, and an UNLOCKED run racing a `trapped()` test could hit a
+/// guard in the disarmed window — where `helix_panic` exits the process and
+/// kills the entire test binary (observed as flaky "test exited abnormally").
 fn jit_prints(src: &str) -> Vec<String> {
+    let _guard = helix_backend::testutil::serial_lock();
     let irs = compile_ir(src);
     let plan = helix_backend::ParallelPlan::default();
     let engine = JitEngine::compile(&irs, &plan, false).expect("JIT compile");

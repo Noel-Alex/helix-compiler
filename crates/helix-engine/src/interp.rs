@@ -557,6 +557,7 @@ pub(crate) fn execute(program: &AdaptedProgram) -> Result<RunOutcome, RunError> 
         Err(RunError {
             kind: RunErrorKind::Internal(format!("interpreter panicked: {detail}")),
             span: Span { start: 0, end: 0 },
+            printed_so_far: Vec::new(),
         })
     })
 }
@@ -567,6 +568,7 @@ fn execute_in_worker(program: &AdaptedProgram) -> Result<RunOutcome, RunError> {
         return Err(RunError {
             kind: RunErrorKind::Internal("program has no main".to_string()),
             span: Span { start: 0, end: 0 },
+            printed_so_far: Vec::new(),
         });
     };
 
@@ -580,7 +582,12 @@ fn execute_in_worker(program: &AdaptedProgram) -> Result<RunOutcome, RunError> {
 
     match it.block_in_current_scope(&main_fn.body) {
         Ok(()) | Err(Stop::Return(_)) => {}
-        Err(Stop::Fail(e)) => return Err(e),
+        Err(Stop::Fail(mut e)) => {
+            // The trap must not swallow output: attach everything printed so
+            // drivers can emit it before the rendered error (JIT parity).
+            e.printed_so_far = std::mem::take(&mut it.printed);
+            return Err(e);
+        }
     }
     it.hash_final_arrays();
     Ok(RunOutcome {
@@ -621,6 +628,7 @@ fn internal(msg: impl Into<String>) -> Stop {
     Stop::Fail(RunError {
         kind: RunErrorKind::Internal(msg.into()),
         span: Span { start: 0, end: 0 },
+        printed_so_far: Vec::new(),
     })
 }
 
@@ -665,10 +673,6 @@ fn unary(op: UnOp, v: Value) -> Flow<Value> {
 
 #[allow(clippy::too_many_lines)] // exhaustive width × operator matrix
 fn binary(op: BinOp, lv: Value, rv: Value, span: Span) -> Flow<Value> {
-    let sym = op.symbol();
-    let l_desc = lv.ty_name();
-    let r_desc = rv.ty_name();
-    let fallback = move || internal(format!("'{sym}' over {l_desc} and {r_desc}"));
     match (op, lv, rv) {
         // Integer arithmetic: wrapping everywhere EXCEPT div/rem (trap below).
         (BinOp::Add, Value::I32(a), Value::I32(b)) => Ok(Value::I32(a.wrapping_add(b))),
@@ -741,7 +745,14 @@ fn binary(op: BinOp, lv: Value, rv: Value, span: Span) -> Flow<Value> {
         (BinOp::Ne, Value::F64(a), Value::F64(b)) => Ok(Value::Bool(a != b)),
         (BinOp::Ne, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a != b)),
 
-        _ => Err(fallback()),
+        // Unreachable for sema-accepted programs; descriptors are formatted
+        // only here so the hot path never builds error strings.
+        (op, l, r) => Err(internal(format!(
+            "'{}' over {} and {}",
+            op.symbol(),
+            l.ty_name(),
+            r.ty_name()
+        ))),
     }
 }
 

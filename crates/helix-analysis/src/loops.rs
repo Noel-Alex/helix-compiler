@@ -47,18 +47,20 @@ pub fn find_loops(func: &FuncIr) -> LoopInfo {
     let doms = helix_ir::dom::dominators(func);
     let mut raw = helix_ir::dom::natural_loops(func, &doms);
 
-    // Outer first (smaller bodies cannot contain larger ones).
-    raw.sort_by_key(|(_, body)| body.len());
+    // Outer first: only a strictly larger body can contain ours, so every
+    // potential parent is already placed when a loop is processed. (Sorting
+    // ascending here flattened the forest — every nested loop came out at
+    // depth 1 because the containment search only ever saw smaller loops.)
+    raw.sort_by_key(|(_, body)| std::cmp::Reverse(body.len()));
 
     let mut out: Vec<Loop> = Vec::new();
     for (i, (header, body)) in raw.into_iter().enumerate() {
-        // Parent = largest earlier loop whose body strictly contains ours.
-        let parent = out
-            .iter()
-            .enumerate()
-            .filter(|(ci, cand)| *ci != i && body.iter().all(|b| cand.blocks.contains(b)))
-            .map(|(ci, _)| ci)
-            .max();
+        // Parent = the innermost already-placed loop whose body strictly
+        // contains ours and whose header differs. `out` runs outer→inner,
+        // so the LAST hit is the smallest container: the immediate parent.
+        let parent = out.iter().rposition(|cand| {
+            cand.header != header && body.iter().all(|b| cand.blocks.contains(b))
+        });
         let depth = parent.map_or(1, |p| out[p].depth + 1);
         out.push(Loop {
             id: i,

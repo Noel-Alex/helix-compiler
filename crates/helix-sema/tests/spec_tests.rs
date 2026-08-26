@@ -283,3 +283,99 @@ fn builtin_names_cannot_be_redefined_as_functions() {
         "is a builtin and cannot be redefined"
     ));
 }
+
+// ---------------------------------------------------------------------------
+// 2026-08-25 review wave 3: diagnostic-matrix gaps
+// ---------------------------------------------------------------------------
+
+#[test]
+fn definite_assignment_both_branches_then_use() {
+    // `let x;` never parses (initializers are mandatory, pinned above), so
+    // the observable contract is: assigning in BOTH branches satisfies the
+    // join and the post-if read is well-typed.
+    ok(
+        "fn main() { let c = 1 < 2; let x: i64 = 0; \
+         if c { x = 1; } else { x = 2; } print(x); }",
+    );
+}
+
+#[test]
+fn all_paths_return_else_if_chains_and_nested_blocks() {
+    // An else-if spine whose LAST link lacks an else can fall through.
+    assert!(has(
+        &errs(
+            "fn f(n: i64) -> i64 { if n < 2 { return 1; } else if n < 4 { return 2; } } \
+             fn main() { print(f(3)); }"
+        ),
+        "not all control-flow paths return"
+    ));
+    // Same chain plus a trailing return accepts.
+    ok(
+        "fn f(n: i64) -> i64 { if n < 2 { return 1; } else if n < 4 { return 2; } return 3; } \
+         fn main() { print(f(3)); }",
+    );
+    // A bare nested block guarantees a return exactly when its contents do.
+    ok("fn f(n: i64) -> i64 { { return n; } } fn main() { print(f(3)); }");
+}
+
+#[test]
+fn constants_are_read_only() {
+    // Companion to loop-variable immutability (same check_assign walk).
+    assert!(has(
+        &errs("const N: i64 = 5; fn main() { N = 6; }"),
+        "cannot assign to constant 'N'"
+    ));
+}
+
+#[test]
+fn i32_literal_adaptation_at_boundary() {
+    // i32::MAX adapts into an annotated i32 slot...
+    ok("fn take(v: i32) -> i32 { return v; } fn main() { let x: i32 = 2147483647; print(take(x)); }");
+    // ...but MAX+1 is rejected at the literal, not silently wrapped.
+    assert!(has(
+        &errs("fn main() { let x: i32 = 2147483648; }"),
+        "integer literal 2147483648 does not fit in i32"
+    ));
+    // The same range check guards consts.
+    assert!(has(
+        &errs("const C: i32 = 2147483648; fn main() {}"),
+        "integer literal 2147483648 does not fit in i32"
+    ));
+    // Unannotated literals stay i64: no annotation means no adaptation.
+    ok("fn main() { let x = 2147483648; print(x); }");
+}
+
+#[test]
+fn array_index_must_be_integer_in_every_position() {
+    // Read position.
+    assert!(has(
+        &errs("fn main() { let a: [i64] = zeros(4); print(a[1.5]); }"),
+        "array index must be an integer, found f64"
+    ));
+    // Store position.
+    assert!(has(
+        &errs("fn main() { let a: [f64] = zeros(4); a[0.5] = 1.0; }"),
+        "array index must be an integer, found f64"
+    ));
+    // i32 indices widen implicitly (the spec's single coercion) — accepted.
+    ok("fn main() { let a: [i64] = zeros(4); let i: i32 = 2; print(a[i]); }");
+}
+
+#[test]
+fn call_arity_mismatch_rejected() {
+    assert!(has(
+        &errs("fn add(a: i64, b: i64) -> i64 { return a + b; } fn main() { print(add(1)); }"),
+        "function 'add' expects 2 argument(s), got 1"
+    ));
+    assert!(has(
+        &errs("fn add(a: i64, b: i64) -> i64 { return a + b; } fn main() { print(add(1, 2, 3)); }"),
+        "function 'add' expects 2 argument(s), got 3"
+    ));
+    // Correct arity accepts.
+    ok("fn add(a: i64, b: i64) -> i64 { return a + b; } fn main() { print(add(1, 2)); }");
+    // Builtins enforce arity too.
+    assert!(has(
+        &errs("fn main() { print(len()); }"),
+        "builtin 'len' expects 1 argument(s), got 0"
+    ));
+}

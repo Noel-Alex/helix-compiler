@@ -70,7 +70,8 @@ impl RunErrorKind {
     }
 }
 
-/// A runtime failure: what happened and where (byte span into the source).
+/// A runtime failure: what happened and where (byte span into the source),
+/// plus everything `print` had already produced.
 #[derive(Clone, Debug)]
 pub struct RunError {
     /// Which class of failure occurred.
@@ -78,13 +79,22 @@ pub struct RunError {
     /// Span of the offending node (the index expression for bounds errors,
     /// the whole binary expression for division errors).
     pub span: Span,
+    /// Lines printed before the failure, in order. Drivers emit these before
+    /// the rendered message so a trapping program produces the same stdout
+    /// under the interpreter as under the JIT (which streams lines as they
+    /// are produced).
+    pub printed_so_far: Vec<String>,
 }
 
 impl RunError {
-    /// Builds an error at `span`.
+    /// Builds an error at `span` with nothing printed yet.
     #[must_use]
     pub fn new(kind: RunErrorKind, span: Span) -> Self {
-        Self { kind, span }
+        Self {
+            kind,
+            span,
+            printed_so_far: Vec::new(),
+        }
     }
 
     /// Renders the spec-mandated message: `runtime error: <message> at line N`.
