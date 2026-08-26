@@ -107,7 +107,9 @@ fn native_beats_interpreter_on_streaming_kernels() {
     let src = saxpy.source_at_size(1 << 20);
 
     let interp = interp_variant(&src).unwrap();
-    let interp_ms = helix_bench::timing::measure_with_reps(|r| interp.time_batch(r)).median_ms;
+    let interp_ms = helix_bench::timing::measure_with_reps(|r| interp.time_batch(r))
+        .expect("interpreter timing cannot fail")
+        .median_ms;
 
     let start = std::time::Instant::now();
     run_native(&src).unwrap();

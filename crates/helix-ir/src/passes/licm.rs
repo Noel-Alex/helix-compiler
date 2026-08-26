@@ -14,7 +14,10 @@
 //! loop-carried value).
 //!
 //! Hoisting appends the instruction to the loop's preheader (the unique
-//! non-back-edge predecessor of the header). SSA makes the transform
+//! non-back-edge predecessor of the header; when several outside jump-preds
+//! exist they are first forwarded through one fresh block — a loop whose
+//! outside entries include a *branch* is skipped entirely, since its branch
+//! edge would bypass the synthesized preheader). SSA makes the transform
 //! trivially safe: the hoisted value has exactly one definition, so every use
 //! in the loop still reaches it — now unconditionally before the loop.
 
@@ -135,6 +138,9 @@ pub fn licm(ir: &mut FuncIr) -> ChangeFlag {
 /// Find or create the preheader: the unique predecessor of `header` that is
 /// not inside the loop. When several outside jump-preds exist they are
 /// forwarded through one fresh block so there is exactly one insertion point.
+/// Returns `None` — skipping hoisting for this loop — when an outside pred is
+/// a *branch*: its edge would bypass any synthesized preheader, so hoisted
+/// defs would not dominate their in-loop uses.
 fn ensure_preheader(
     ir: &mut FuncIr,
     header: BlockId,
@@ -154,28 +160,41 @@ fn ensure_preheader(
     }
 
     // Multiple outside preds: forward them all through one fresh block.
+    //
+    // Only JUMP preds can be redirected. A BRANCH pred into the header keeps
+    // its edge — but then hoisting into the fresh block would be unsound: the
+    // hoisted defs would not dominate the values' uses reached via that
+    // branch edge. Rather than rewrite branch polarity, skip LICM for this
+    // loop entirely and leave the CFG untouched.
+    if outside
+        .iter()
+        .any(|p| matches!(ir.term(*p), Term::Branch { .. }))
+    {
+        return None;
+    }
+
     let pre = ir.new_block();
     let mut forwarded: Vec<(BlockId, Vec<ValueId>)> = Vec::new();
     for p in outside {
-        let pi = p.0 as usize;
-        let term = std::mem::replace(&mut ir.blocks[pi].term, Term::Return(None));
-        match term {
-            Term::Jump(t, args) if t == header => {
-                forwarded.push((p, args));
-                ir.set_term(p, Term::Jump(pre, Vec::new()));
-                flag.changed = true;
-            }
-            other => {
-                // Branch preds keep their terminator untouched.
-                ir.blocks[pi].term = other;
-            }
+        // Peek at the terminator WITHOUT replacing it first: set_term repairs
+        // the header's pred list only when it can see the old successors, and
+        // a blind mem::replace (historically `Return(None)`) hid the old edge
+        // from it — leaving stale preds behind.
+        if let Term::Jump(t, args) = ir.term(p)
+            && *t == header
+        {
+            let args = args.clone();
+            forwarded.push((p, args));
+            ir.set_term(p, Term::Jump(pre, Vec::new()));
+            flag.changed = true;
         }
     }
     if forwarded.is_empty() {
-        // Only branch preds: no safe single insertion point via forwarding.
-        // Keep `pre` unused-but-jumping to header to preserve structure.
-        ir.set_term(pre, Term::Jump(header, Vec::new()));
-        return Some(pre);
+        // Nothing was redirected: drop the fresh block and skip this loop.
+        let mut keep = vec![true; ir.blocks.len()];
+        keep[pre.0 as usize] = false;
+        ir.compact(&keep);
+        return None;
     }
 
     // Forward phi values from each old edge into the new one. Every old edge

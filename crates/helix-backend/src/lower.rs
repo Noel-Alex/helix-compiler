@@ -317,15 +317,7 @@ pub fn translate_fn(
     imports: &HashMap<String, FuncId>,
     sigs: &HashMap<String, Signature>,
 ) -> Result<(), String> {
-    translate_fn_rt(
-        ir,
-        unchecked,
-        func,
-        module,
-        imports,
-        sigs,
-        HashMap::new(),
-    )
+    translate_fn_rt(ir, unchecked, func, module, imports, sigs, HashMap::new())
 }
 
 /// [`translate_fn`] with an optional parallel-region hook (see

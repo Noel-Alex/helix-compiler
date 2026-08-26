@@ -48,7 +48,7 @@ fn locate(source: &str, offset: u32) -> (usize, usize, usize, String) {
         }
     }
     let rest = &source[line_start..];
-    let line_end = rest.find('\n').map_or(rest.len(), |p| p);
+    let line_end = rest.find('\n').unwrap_or(rest.len());
     let line_text = rest[..line_end].trim_end_matches('\r').to_string();
     let col = source[line_start..off.min(source.len())].chars().count() + 1;
     (line_no, col, line_start, line_text)
@@ -62,7 +62,12 @@ mod tests {
     fn caret_lands_under_the_span() {
         // `y` sits 9 chars into line 2 (byte offset 21): column 10, 1-based.
         let src = "fn main() {\n    let x = y;\n}";
-        let out = render(src, "t.hx", Span { start: 21, end: 22 }, "undeclared variable 'y'");
+        let out = render(
+            src,
+            "t.hx",
+            Span { start: 21, end: 22 },
+            "undeclared variable 'y'",
+        );
         assert!(out.contains("t.hx:2:10"), "{out}");
         assert!(out.contains("^"), "{out}");
         assert!(out.contains("undeclared variable 'y'"), "{out}");

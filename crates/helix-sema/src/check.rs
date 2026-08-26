@@ -271,6 +271,11 @@ impl TypedExpr {
     fn lit_true(&self) -> bool {
         matches!(self.kind, TypedExprKind::BoolLit(true))
     }
+
+    /// Structural "this condition is literally false".
+    fn lit_false(&self) -> bool {
+        matches!(self.kind, TypedExprKind::BoolLit(false))
+    }
 }
 
 impl TypedStmt {
@@ -278,17 +283,31 @@ impl TypedStmt {
     pub fn always_returns(&self) -> bool {
         match self {
             TypedStmt::Return { .. } => true,
-            TypedStmt::If(f) => match f.else_arm.as_ref() {
-                Some(ElseArm::Block(b)) => {
-                    f.cond.lit_true()
-                        || (block_always_returns(&f.then_blk) && block_always_returns(b))
+            TypedStmt::If(f) => {
+                // A literal condition executes exactly one arm; the other is
+                // dead code and must not influence the verdict.
+                if f.cond.lit_true() || f.cond.lit_false() {
+                    let live = if f.cond.lit_true() {
+                        block_always_returns(&f.then_blk)
+                    } else {
+                        match &f.else_arm {
+                            Some(ElseArm::Block(b)) => block_always_returns(b),
+                            Some(ElseArm::If(inner)) => if_always_returns(inner),
+                            None => false,
+                        }
+                    };
+                    return live;
                 }
-                Some(ElseArm::If(inner)) => {
-                    (f.cond.lit_true() || block_always_returns(&f.then_blk))
-                        && if_always_returns(inner)
+                match f.else_arm.as_ref() {
+                    Some(ElseArm::Block(b)) => {
+                        block_always_returns(&f.then_blk) && block_always_returns(b)
+                    }
+                    Some(ElseArm::If(inner)) => {
+                        block_always_returns(&f.then_blk) && if_always_returns(inner)
+                    }
+                    None => false,
                 }
-                None => f.cond.lit_true() && block_always_returns(&f.then_blk),
-            },
+            }
             // A nested block guarantees a return exactly when one of its own
             // statements does.
             TypedStmt::Nested(b) => block_always_returns(b),

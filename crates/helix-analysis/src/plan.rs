@@ -30,7 +30,7 @@
 use crate::Bound;
 use crate::access;
 use crate::canon::{self, CanonicalLoop};
-use crate::deps::{self, DepOutcome, IterRange};
+use crate::deps::{self, DepOutcome, Domain, IterRange};
 use crate::loops::{Loop, LoopInfo};
 use crate::reduce;
 use helix_ir::{BlockId, FuncIr, LocalId};
@@ -186,25 +186,29 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
             var: local_name(func, r.var),
         });
 
-        // Iteration range for bound-aware testing (half-open [start, end)).
-        let range = canonical.as_ref().map_or(
-            IterRange {
-                lo: i128::MIN / 4,
-                hi: i128::MAX / 4,
-            },
-            |c| match (&c.start, &c.end) {
-                (Bound::Const(lo), Bound::Const(hi)) => IterRange {
+        // Proof domain for bound-aware testing. Constant bounds give the
+        // battery an EXACT window; symbolic bounds give `Domain::Symbolic`,
+        // under which range-dependent refutations are forbidden (an invented
+        // finite window containing no solution proves nothing about real i64
+        // iteration spaces — see `deps::Domain`).
+        let domain = canonical.as_ref().map_or(Domain::Symbolic, |c| {
+            match (&c.start, &c.end) {
+                (Bound::Const(lo), Bound::Const(hi)) => Domain::Bounded(IterRange {
                     lo: i128::from(*lo),
                     hi: i128::from(*hi).saturating_sub(1),
-                },
-                _ => IterRange {
-                    lo: -1 << 40,
-                    hi: 1 << 40,
-                }, // symbolic bounds: wide box
-            },
-        );
+                }),
+                _ => Domain::Symbolic,
+            }
+        });
 
-        // Pair same-array accesses; classify RAW/WAR/WAW.
+        // Pair same-array accesses; classify RAW/WAR/WAW. Default is ORDERED
+        // body position: earlier write → later read is RAW (flow), earlier
+        // read → later write is WAR (anti), write → write is WAW (output).
+        // When the battery SOLVES a mixed pair's relative iteration order,
+        // the solved sign overrides the positional guess (positive distance
+        // = the read site runs after the write site → flow) — body position
+        // alone mislabels shapes like `a[i] = a[i-1]`, whose READ is spelled
+        // first yet carries a genuine flow dependence.
         let mut raw_deps = Vec::new();
         let mut war_deps = Vec::new();
         let mut waw_deps = Vec::new();
@@ -215,8 +219,10 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
                 if src.arr != dst.arr {
                     continue;
                 }
-                let kind = match (src.is_write, dst.is_write) {
-                    (true, false) | (false, true) => "RAW",
+                let mixed = src.is_write != dst.is_write;
+                let pos_kind = match (src.is_write, dst.is_write) {
+                    (true, false) => "RAW",
+                    (false, true) => "WAR",
                     (true, true) => "WAW",
                     (false, false) => continue, // RAR never a dependence
                 };
@@ -227,21 +233,37 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
                         "unanalyzable subscript on '{name}' — assuming dependence"
                     ));
                     push_edge(
-                        sink_for(kind, &mut raw_deps, &mut war_deps, &mut waw_deps),
-                        kind,
+                        sink_for(pos_kind, &mut raw_deps, &mut war_deps, &mut waw_deps),
+                        pos_kind,
                         &name,
                         None,
                         "*",
                         lp.depth,
                         format!(
-                            "{kind} {name}[?] vs {name}[?] — subscript not affine, conservative"
+                            "{pos_kind} {name}[?] vs {name}[?] — subscript not affine, conservative"
                         ),
                     );
                     continue;
                 };
-                // Battery convention: the READ side is the first operand, so a
-                // classic `a[i] = a[i-1] + c` reports distance +1.
-                match deps::test_pair(&[aff_r], &[aff_w], range) {
+                // Battery convention: the solved distance counts the gap
+                // between matched-element iterations of the FIRST-fed minus
+                // SECOND-fed operand. For W→W the r_of/w_of helpers would
+                // put the body-LATER write first (it occupies the read
+                // slot), flipping the sign; feed the earlier write first so
+                // WAW distances come out physical (+1 for `a[i]=1;
+                // a[i+1]=2` overwriting next iteration). Mixed pairs keep
+                // the READ-first feed, where d>0 proves the write site ran
+                // earlier — flow/RAW — and d<0 an anti/WAR edge.
+                let (first, second) = if src.is_write && dst.is_write {
+                    // Both subscripts are `Some` here (let-else above).
+                    (
+                        src.affine.expect("affine checked above"),
+                        dst.affine.expect("affine checked above"),
+                    )
+                } else {
+                    (aff_r, aff_w)
+                };
+                match deps::test_pair(&[first], &[second], domain) {
                     DepOutcome::Independent => {}
                     DepOutcome::Dependence { distance, dirs } => {
                         // Exact distance 0 = both touches in ONE iteration:
@@ -249,14 +271,20 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
                         if distance == Some(0) && dirs.iter().all(|d| d.eq && !d.lt && !d.gt) {
                             continue;
                         }
+                        // Solved sign fixes the temporal order; otherwise the
+                        // positional label stands.
+                        let kind = match distance {
+                            Some(d) if mixed && d > 0 => "RAW",
+                            Some(d) if mixed && d < 0 => "WAR",
+                            _ => pos_kind,
+                        };
                         let dir_str: String = dirs.iter().map(|d| d.describe()).collect();
                         let dist_txt = distance.map_or("?".to_string(), |d| d.to_string());
                         let name = arr_name(src.arr);
                         let detail = if distance.is_some() {
                             format!("carried by iteration distance {dist_txt}")
                         } else {
-                            "gcd/box test inconclusive — integer solutions exist in range"
-                                .to_string()
+                            "gcd/box test inconclusive — integer solutions exist".to_string()
                         };
                         push_edge(
                             sink_for(kind, &mut raw_deps, &mut war_deps, &mut waw_deps),
@@ -502,10 +530,10 @@ fn user_call_names(func: &FuncIr, lp: &Loop) -> Vec<String> {
     for b in &lp.blocks {
         for inst in &func.block(*b).insts {
             if let helix_ir::Inst::Call(c) = inst {
-                let is_user = match c.callee.as_str() {
-                    "min" | "max" | "sqrt" | "abs" | "len" | "zeros" | "print" => false,
-                    _ => true,
-                };
+                let is_user = !matches!(
+                    c.callee.as_str(),
+                    "min" | "max" | "sqrt" | "abs" | "len" | "zeros" | "print"
+                );
                 if is_user && !out.iter().any(|n| n == &c.callee) {
                     out.push(c.callee.clone());
                 }

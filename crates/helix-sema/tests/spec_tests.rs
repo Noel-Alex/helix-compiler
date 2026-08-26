@@ -293,10 +293,8 @@ fn definite_assignment_both_branches_then_use() {
     // `let x;` never parses (initializers are mandatory, pinned above), so
     // the observable contract is: assigning in BOTH branches satisfies the
     // join and the post-if read is well-typed.
-    ok(
-        "fn main() { let c = 1 < 2; let x: i64 = 0; \
-         if c { x = 1; } else { x = 2; } print(x); }",
-    );
+    ok("fn main() { let c = 1 < 2; let x: i64 = 0; \
+         if c { x = 1; } else { x = 2; } print(x); }");
 }
 
 #[test]
@@ -330,7 +328,9 @@ fn constants_are_read_only() {
 #[test]
 fn i32_literal_adaptation_at_boundary() {
     // i32::MAX adapts into an annotated i32 slot...
-    ok("fn take(v: i32) -> i32 { return v; } fn main() { let x: i32 = 2147483647; print(take(x)); }");
+    ok(
+        "fn take(v: i32) -> i32 { return v; } fn main() { let x: i32 = 2147483647; print(take(x)); }",
+    );
     // ...but MAX+1 is rejected at the literal, not silently wrapped.
     assert!(has(
         &errs("fn main() { let x: i32 = 2147483648; }"),
@@ -378,4 +378,61 @@ fn call_arity_mismatch_rejected() {
         &errs("fn main() { print(len()); }"),
         "builtin 'len' expects 1 argument(s), got 0"
     ));
+}
+
+// ---------------------------------------------------------------------------
+// 2026-08-25 review wave 3: literal-condition all-paths-return regressions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn literal_true_then_no_return_else_returns_is_rejected() {
+    // `if true` executes ONLY the then-branch; the else arm is dead code, so
+    // its `return` cannot save the function. (Inverted condition used to
+    // accept this and the IR builder masked it with a synthesized zero.)
+    assert!(has(
+        &errs(
+            "fn f() -> i64 { if true { let x = 1; } else { return 7; } } fn main() { print(f()); }"
+        ),
+        "not all control-flow paths return"
+    ));
+}
+
+#[test]
+fn literal_true_then_returns_else_not_is_accepted() {
+    // Dead else arm may omit the return — only the then-branch runs.
+    ok("fn f() -> i64 { if true { return 7; } else { let x = 1; } } fn main() { print(f()); }");
+}
+
+#[test]
+fn literal_false_branch_skipped_correctly() {
+    // `if false` executes ONLY the else arm: accepted when it returns...
+    ok(
+        "fn f(n: i64) -> i64 { if false { print(n); } else { return n; } } fn main() { print(f(3)); }",
+    );
+    // ...and rejected when neither branch does.
+    assert!(has(
+        &errs(
+            "fn f() -> i64 { if false { let x = 1; } else { let y = 2; } } fn main() { print(f()); }"
+        ),
+        "not all control-flow paths return"
+    ));
+}
+
+#[test]
+fn nested_else_if_with_literal_conditions_rejected_when_fallthrough_exists() {
+    // Outer cond is not a literal, so BOTH the then-branch and the whole
+    // else-if spine must return. The inner `if true` link falls through, so
+    // the chain does not guarantee a return.
+    assert!(has(
+        &errs(
+            "fn f(p: bool) -> i64 { if p { return 1; } else if true { let x = 2; } } \
+             fn main() { print(f(true)); }"
+        ),
+        "not all control-flow paths return"
+    ));
+    // Same shape but with the dead-spine link returning: accepts.
+    ok(
+        "fn f(p: bool) -> i64 { if p { return 1; } else if true { return 2; } } \
+         fn main() { print(f(true)); }",
+    );
 }

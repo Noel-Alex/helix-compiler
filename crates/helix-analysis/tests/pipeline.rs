@@ -228,9 +228,125 @@ fn anti_and_output_dependences_are_reported_separately() {
     let Verdict::Sequential(_) = &r.verdict else {
         panic!("carried edges must reject");
     };
+    // W(a[i+1]) vs W(a[i]): cross-iteration output dependence. Sign
+    // convention: distance = conflicting-element iteration of the FIRST-fed
+    // store minus that of the SECOND. Here the body-first store (a[i+1]=7)
+    // reaches shared element k at iteration k-1 while the body-second store
+    // (a[i]=...) reaches it at k => -1. (The mirror shape `a[i]=1;
+    // a[i+1]=2` yields +1 — see output_dependence_... below.)
     assert_eq!(r.waw_deps.len(), 1, "a[i+1]=7 then a[i]=... next iter WAW");
-    assert!(!r.raw_deps.is_empty(), "flow edge survives too");
+    assert_eq!(r.waw_deps[0].distance, Some(-1));
+    // R(a[i+1]) vs W(a[i]): iteration i+1 READS what iteration i's write
+    // `a[i] = ...` overwrote — an ANTI (WAR) dependence, solved negative.
+    // The pre-fix classifier labeled every mixed pair RAW, hiding it.
+    assert_eq!(r.war_deps.len(), 1, "a[i+1] read vs a[i] overwrite: WAR");
+    assert!(matches!(
+        r.verdict,
+        Verdict::Sequential(_)
+    ));
+    // No flow edge exists in this loop: the only same-iteration mixed pair
+    // (write a[i+1], read a[i+1]) is loop-independent and dropped, and the
+    // carried pair is anti. RAW must stay empty.
+    assert!(r.raw_deps.is_empty(), "no cross-iteration flow here");
+}
+
+// ---------------------------------------------------------------------------
+// Ordered-kind showcases (2026-08-26 review): one clean example per kind
+// ---------------------------------------------------------------------------
+
+/// Classic flow dependence spelled with the READ first in the body
+/// (`a[i] = a[i-1]`): the solved positive distance proves the WRITE site is
+/// temporally first — this MUST be RAW even though body position alone would
+/// call the pair WAR.
+#[test]
+fn solved_positive_distance_is_raw_even_when_read_spelled_first() {
+    let reps = analyze_src(
+        "fn main() {
+            let n = 100;
+            let a: [i64] = zeros(n);
+            for i in 1..n {
+                a[i] = a[i - 1] + 1;
+            }
+        }",
+    );
+    let r = &reps[0];
+    let Verdict::Sequential(reason) = &r.verdict else {
+        panic!("recurrence must reject");
+    };
+    assert_eq!(r.raw_deps.len(), 1, "{reason}");
+    assert!(r.war_deps.is_empty() && r.waw_deps.is_empty());
+    assert_eq!(r.raw_deps[0].distance, Some(1));
+    assert!(reason.contains("RAW"), "{reason}");
+    assert_eq!(
+        r.summary_line(),
+        "Loop #1: RAW 1 / WAR 0 / WAW 0 => SEQUENTIAL (RAW a[i] <- a[i - 1] \
+         (carried by iteration distance 1, level 1))"
+    );
+}
+
+/// Anti-dependence showcase: each iteration reads an element a LATER
+/// iteration overwrites. Read site runs BEFORE the write site → WAR, and no
+/// flow edge may appear.
+#[test]
+fn anti_dependence_read_early_write_later_is_war_not_raw() {
+    let reps = analyze_src(
+        "fn main() {
+            let n = 50;
+            let a: [i64] = zeros(n + 1);
+            for i in 0..n {
+                a[i] = a[i + 1];
+            }
+        }",
+    );
+    let r = &reps[0];
+    let Verdict::Sequential(reason) = &r.verdict else {
+        panic!("anti-dependence must reject");
+    };
+    assert_eq!(r.war_deps.len(), 1, "read a[i+1], overwritten at i+1: WAR");
+    assert_eq!(r.war_deps[0].distance, Some(-1));
+    assert!(r.raw_deps.is_empty(), "no flow: {reason}");
+    assert!(r.waw_deps.is_empty());
+    assert!(reason.contains("WAR"), "{reason}");
+    assert!(
+        r.summary_line()
+            .starts_with("Loop #1: RAW 0 / WAR 1 / WAW 0 => SEQUENTIAL ("),
+        "{}",
+        r.summary_line()
+    );
+}
+
+/// Output-dependence showcase: two writes to the same element in different
+/// iterations race under DOALL — WAW, no reads involved.
+#[test]
+fn output_dependence_two_writes_same_element_is_waw() {
+    let reps = analyze_src(
+        "fn main() {
+            let n = 50;
+            let a: [i64] = zeros(n + 1);
+            for i in 0..n {
+                a[i] = 1;
+                a[i + 1] = 2;
+            }
+        }",
+    );
+    let r = &reps[0];
+    let Verdict::Sequential(_) = &r.verdict else {
+        panic!("output dependence must reject");
+    };
+    assert_eq!(r.waw_deps.len(), 1, "a[i]=1 vs a[i+1]=2 next iter");
+    // W→W pairs are fed to the battery earlier-write-first, so the distance
+    // is physical: the body-LATER store (a[i+1]=2) hits index j+1, which the
+    // body-EARLIER store (a[i]=1) re-overwrites one iteration later — the
+    // second write's site sits +1 past the first. WAW either way.
     assert_eq!(r.waw_deps[0].distance, Some(1));
+    assert!(r.raw_deps.is_empty());
+    assert!(r.war_deps.is_empty());
+    assert!(
+        r.summary_line()
+            .starts_with("Loop #1: RAW 0 / WAR 0 / WAW 1 => SEQUENTIAL ("),
+        "{}",
+        r.summary_line()
+    );
 }
 
 #[test]

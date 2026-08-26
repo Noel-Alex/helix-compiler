@@ -10,7 +10,7 @@
 use crate::ir::FuncIr;
 use crate::passes::{const_fold, copy_prop, cse, dce, licm, simplify_cfg};
 use crate::print::print_ir;
-use crate::verify;
+use crate::ssa::verify_ssa;
 
 /// Did a pass modify anything?
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +118,10 @@ pub fn run_pass(name: &str, ir: &mut FuncIr) -> Result<ChangeFlag, String> {
         "simplify_cfg" => simplify_cfg(ir),
         other => return Err(format!("unknown pass '{other}'")),
     };
-    verify(ir).map_err(|e| format!("after pass '{name}': {e}"))?;
+    // The drivers run on SSA-form IR by contract; `verify_ssa` additionally
+    // rejects multiply-defined values so a corrupting pass cannot silently
+    // downgrade the function to dominance-free checking.
+    verify_ssa(ir).map_err(|e| format!("after pass '{name}': {e}"))?;
     Ok(flag)
 }
 
@@ -147,7 +150,7 @@ pub fn run_optimization_pipeline(ir: &mut FuncIr) -> Vec<StageReport> {
     for pass in PassId::pipeline() {
         let before = count_insts(ir);
         let flag = run_pass_by_id(*pass, ir);
-        let ok = verify(ir);
+        let ok = verify_ssa(ir);
         if let Err(e) = ok {
             // A pass bug must be loud; course-scale compiler, no silent
             // recovery. Panic keeps the failure adjacent to its cause.
@@ -172,7 +175,7 @@ pub fn run_passes_to_fixpoint(ir: &mut FuncIr) -> Vec<StageReport> {
         for pass in PassId::pipeline() {
             let before = count_insts(ir);
             let flag = run_pass_by_id(*pass, ir);
-            if let Err(e) = verify(ir) {
+            if let Err(e) = verify_ssa(ir) {
                 panic!("pass {} broke IR: {e}", pass.name());
             }
             any_changed |= flag.changed;

@@ -104,15 +104,20 @@ pub trait ExecVariant {
     ///
     /// Default: loop [`run_once`](Self::run_once) and take wall-clock.
     /// Backends with cheaper re-invocation can override.
-    fn time_batch(&self, reps: u32) -> std::time::Duration {
+    ///
+    /// # Errors
+    /// The FIRST failed execution aborts the batch and is returned verbatim:
+    /// timed repetitions of code that crashes are meaningless, so the batch
+    /// must never silently swallow a mid-run failure.
+    fn time_batch(&self, reps: u32) -> Result<std::time::Duration, String> {
         let start = std::time::Instant::now();
         for _ in 0..reps {
-            let _ = std::hint::black_box(self.run_once());
+            std::hint::black_box(self.run_once()?);
             // Reclaim JIT-host allocations (each run's zeros(n) arrays would
             // otherwise accumulate across hundreds of timed samples).
             helix_backend::reset_host_heap();
         }
-        start.elapsed()
+        Ok(start.elapsed())
     }
 }
 
@@ -495,27 +500,6 @@ pub fn run_campaign(config: &BenchConfig) -> CampaignReport {
     }
 }
 
-/// Runs the full analysis pipeline on `src` and returns the first loop's
-/// verdict (`None` when the program has no analyzable loops). This is the
-/// OBSERVED half of the campaign's verdict gate.
-fn analyze_hot_loop_verdict(src: &str) -> Option<helix_analysis::Verdict> {
-    let prog = helix_syntax::parse_str(src).ok()?;
-    let typed = helix_sema::check(&prog).ok()?;
-    let mut funcs = helix_ir::build(&typed);
-    for f in &mut funcs {
-        helix_ir::to_ssa(f);
-    }
-    for f in &funcs {
-        let li = helix_analysis::find_loops(f);
-        if li.loops.is_empty() {
-            continue;
-        }
-        let reports = helix_analysis::analyze(f, &li);
-        return Some(reports.into_iter().next()?.verdict);
-    }
-    None
-}
-
 /// Short verdict label for diagnostics (`"SafeParallel"` etc.).
 fn verdict_label(v: Option<&helix_analysis::Verdict>) -> String {
     match v {
@@ -528,50 +512,117 @@ fn verdict_label(v: Option<&helix_analysis::Verdict>) -> String {
     }
 }
 
+/// What the verdict gate needs about one program's analysis.
+struct PlanView {
+    /// Verdicts of the loops the parallelizer APPROVED (plan regions), in
+    /// region order. This — not "the first loop's report" — is what
+    /// `native-par` executes, so it is what positive expectations check;
+    /// keying on the first loop breaks the moment a kernel grows an init
+    /// loop ahead of its compute loop.
+    approved: Vec<helix_analysis::Verdict>,
+    /// Total loops the analyzer examined across all functions (0 = the
+    /// pipeline saw nothing analyzable, which must not pass silently).
+    loops_analyzed: usize,
+}
+
+/// Runs the analysis pipeline on `src` and collects [`PlanView`].
+fn analyze_plan(src: &str) -> PlanView {
+    let empty = PlanView {
+        approved: Vec::new(),
+        loops_analyzed: 0,
+    };
+    let prog = match helix_syntax::parse_str(src) {
+        Ok(p) => p,
+        Err(_) => return empty,
+    };
+    let typed = match helix_sema::check(&prog) {
+        Ok(t) => t,
+        Err(_) => return empty,
+    };
+    let mut funcs = helix_ir::build(&typed);
+    for f in &mut funcs {
+        helix_ir::to_ssa(f);
+    }
+    let loops: Vec<_> = funcs.iter().map(helix_analysis::find_loops).collect();
+    let total: usize = loops.iter().map(|l| l.loops.len()).sum();
+    let reports: Vec<_> = funcs
+        .iter()
+        .zip(&loops)
+        .map(|(f, l)| helix_analysis::analyze(f, l))
+        .collect();
+    let plan = helix_analysis::build_plan(&funcs, &loops, &reports);
+    let approved = plan
+        .regions
+        .iter()
+        .filter_map(|r| {
+            // RegionDesc carries the loop's HEADER BLOCK; LoopReport is keyed
+            // by the loop FOREST id, so resolve header -> loop -> report.
+            let lp = loops.get(r.func_idx)?.loops.iter().find(|l| l.header == r.header)?;
+            reports
+                .get(r.func_idx)?
+                .iter()
+                .find(|rep| rep.loop_id == lp.id)
+                .map(|rep| rep.verdict.clone())
+        })
+        .collect();
+    PlanView {
+        approved,
+        loops_analyzed: total,
+    }
+}
+
 /// Measures one kernel across its size sweep.
 fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> {
-    // Verdict gate: the analyzer's actual verdict on this kernel's source must
-    // match what the registry EXPECTED, or the campaign aborts. Without this a
-    // silent analyzer regression would drain the parallel numbers while every
-    // row still claimed SafeParallel (the numbers would look real).
+    // Verdict gate: whatever the dependence engine APPROVES for this kernel's
+    // perf program must satisfy the registry's expectation, or the campaign
+    // aborts. Without this a silent analyzer regression would drain the
+    // parallel numbers while every row still claimed SafeParallel (the
+    // numbers would look real). Positive expectations check the APPROVED PLAN
+    // regions; the Sequential (negative) expectation checks that loops WERE
+    // analyzed and that NOTHING was approved — build_plan never emits
+    // rejected loops, so "empty approval list" alone would be vacuous.
     let observed = if kernel.expected_verdict != kernels::ExpectedVerdict::NotApplicable {
-        let observed = analyze_hot_loop_verdict(&kernel.perf_source);
-        let matches = if let Some(v) = &observed {
-            match kernel.expected_verdict {
-                ExpectedVerdict::SafeParallel => {
-                    matches!(v, helix_analysis::Verdict::SafeParallel)
-                }
-                ExpectedVerdict::ReductionParallel => {
-                    matches!(v, helix_analysis::Verdict::ReductionParallel(_))
-                }
-                _ => matches!(v, helix_analysis::Verdict::Sequential(_)),
-            }
-        } else {
-            false
+        let view = analyze_plan(&kernel.perf_source);
+        assert!(
+            view.loops_analyzed > 0,
+            "{}: analyzer saw no loops at all — pipeline regressed or the \
+             kernel source drifted",
+            kernel.name
+        );
+        let ok = match kernel.expected_verdict {
+            ExpectedVerdict::SafeParallel => view
+                .approved
+                .iter()
+                .any(|v| matches!(v, helix_analysis::Verdict::SafeParallel)),
+            ExpectedVerdict::ReductionParallel => view.approved.iter().any(|v| {
+                matches!(v, helix_analysis::Verdict::ReductionParallel(_))
+            }),
+            _ => view.approved.is_empty(),
         };
         assert!(
-            matches,
-            "{}: analyzer verdict {} does not match expected {:?} — \
+            ok,
+            "{}: approved-region verdicts {} do not match expected {:?} — \
              analysis regressed or the kernel source drifted",
             kernel.name,
-            verdict_label(observed.as_ref()),
+            verdict_labels(&view.approved),
             kernel.expected_verdict
         );
-        Some(verdict_label(observed.as_ref()))
+        Some(verdict_labels(&view.approved))
     } else {
         None
     };
 
+    // PARITY GATE (once per kernel): EVERY variant shape that will be timed —
+    // the interpreter AND each native form the campaign constructs below —
+    // must execute once at the correctness size and agree with the oracle
+    // under the kernel's tolerance. A variant that cannot even do that must
+    // abort the campaign loudly; discovering the disagreement after 15 timed
+    // samples would mean publishing numbers from code that computes garbage.
+    // (interp_max_size gating stays untouched: it bounds TIMED cost only.)
+    assert_parity_all_variants(kernel, config);
+
     let mut out = Vec::new();
     for size in kernel.sizes {
-        // Parity gate first: all variants must agree at the tiny size before
-        // any number is trusted at the big one.
-        assert!(
-            parity_holds(kernel),
-            "{}: cross-variant parity failed at correctness size",
-            kernel.name
-        );
-
         let src = kernel.source_at_size(*size);
         let mut variants: Vec<Box<dyn ExecVariant>> = Vec::new();
 
@@ -588,8 +639,18 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
             }
         }
         let has_regions = kernel.is_parallel_candidate();
-        if let Ok(native) = native_variant(&src) {
-            variants.push(native);
+        // A native compile failure on a kernel whose expected verdict implies
+        // parallel capability is a CAMPAIGN failure, never silent absence:
+        // dropping the row would look like "no data" when it is really "the
+        // backend broke" (and would drain the report's headline numbers).
+        match native_variant(&src) {
+            Ok(native) => variants.push(native),
+            Err(e) if has_regions => panic!(
+                "{}: native-seq compile failed at N={size} (kernel expects a \
+                 parallel-capable verdict, so this aborts the campaign): {e}",
+                kernel.name
+            ),
+            Err(_) => {}
         }
         // Parallel variant: same compiled plan, executions pin HELIX_NTHREADS
         // to a mid-range count (the efficiency table carries the full sweep).
@@ -604,17 +665,31 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
                 .unwrap_or(hw.min(config.max_threads).max(2));
             match NativeVariant::new_parallel(&src, p) {
                 Ok(v) => variants.push(Box::new(v)),
+                Err(e) if has_regions => panic!(
+                    "{}: native-par{p} compile failed at N={size}: {e}",
+                    kernel.name
+                ),
                 Err(_) => {}
             }
         }
-        if variants.is_empty() {
-            continue;
-        }
+        assert!(
+            !variants.is_empty(),
+            "{}: no executable variant could be built at N={size}",
+            kernel.name
+        );
 
-        // Round-robin sampling across all present variants.
+        // Round-robin sampling across all present variants. Any execution
+        // error during pilot/warmup/sampling aborts: never sample failing code.
         let names: Vec<&str> = variants.iter().map(|v| v.name()).collect();
-        let measurements =
-            timing::run_interleaved(&names, |vi, reps| variants[vi].time_batch(reps));
+        let measurements = timing::run_interleaved(&names, |vi, reps| {
+            variants[vi].time_batch(reps)
+        })
+        .unwrap_or_else(|e| {
+            panic!(
+                "kernel {} size {} failed during timing: {e}",
+                kernel.name, size
+            )
+        });
 
         let baseline = measurements
             .first()
@@ -635,8 +710,8 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
             .collect();
 
         // Thread sweep for parallel candidates: p=1 vs p via HELIX_NTHREADS.
-        let efficiency = if kernel.is_parallel_candidate() && !variants.is_empty() {
-            sweep_efficiency(&src, config)
+        let efficiency = if kernel.is_parallel_candidate() {
+            sweep_efficiency(kernel, &src, *size, config)
         } else {
             Vec::new()
         };
@@ -655,6 +730,102 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
         });
     }
     out
+}
+
+/// Comma-separated labels for a list of verdicts (gate diagnostics).
+fn verdict_labels(verdicts: &[helix_analysis::Verdict]) -> String {
+    if verdicts.is_empty() {
+        return "(nothing approved)".to_string();
+    }
+    verdicts
+        .iter()
+        .map(|v| verdict_label(Some(v)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Executes EVERY variant shape the campaign will time for `kernel` once at
+/// the correctness-size source and asserts agreement with the oracle under
+/// the kernel's tolerance: the interpreter, native-seq, and every pinned
+/// native-par<P> the thread sweep / mid-range point construct. The first
+/// failing variant aborts with its name.
+fn assert_parity_all_variants(kernel: &KernelDef, config: &BenchConfig) {
+    let src = &kernel.correctness_source;
+    let oracle: Vec<String> = kernel
+        .expected_printed
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    // Collect (label, variant) for every shape the campaign could time.
+    let mut shapes: Vec<(String, Box<dyn ExecVariant>)> = Vec::new();
+    match interp_variant(src) {
+        Ok(v) => shapes.push(("interp".to_string(), Box::new(v))),
+        Err(e) => panic!("{}: interp parity variant failed to compile: {e}", kernel.name),
+    }
+    // native-seq: required whenever the verdict implies parallel capability;
+    // otherwise optional but still parity-checked WHEN PRESENT — the campaign
+    // times it, so it must agree at correctness size too.
+    let has_regions = kernel.is_parallel_candidate();
+    match native_variant(src) {
+        Ok(v) => shapes.push((v.name().to_string(), v)),
+        Err(e) if has_regions => panic!(
+            "{}: native-seq parity variant failed to compile: {e}",
+            kernel.name
+        ),
+        Err(_) => {}
+    }
+    // Every pinned parallel variant the campaign constructs: the mid-range P
+    // of the timed point plus EACH p of the efficiency sweep (including p=1,
+    // which sweep_efficiency builds as its pinned baseline).
+    let mut pins: Vec<usize> = Vec::new();
+    if has_regions {
+        let hw = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let cap = config.max_threads.min(hw.max(1));
+        if config.thread_sweep.len() > 1 {
+            let mid = config
+                .thread_sweep
+                .iter()
+                .copied()
+                .filter(|&x| x > 1)
+                .find(|&x| x >= hw / 2)
+                .unwrap_or(hw.min(config.max_threads).max(2));
+            pins.push(mid);
+        }
+        for p in &config.thread_sweep {
+            if *p >= 1 && *p <= cap && !pins.contains(p) {
+                pins.push(*p);
+            }
+        }
+    }
+    for p in pins {
+        match NativeVariant::new_parallel(src, p) {
+            Ok(v) => shapes.push((format!("{}{p}", v.name()), Box::new(v))),
+            Err(e) => panic!(
+                "{}: native-par{p} parity variant failed to compile: {e}",
+                kernel.name
+            ),
+        }
+    }
+
+    for (label, variant) in &shapes {
+        let out = variant.run_once().unwrap_or_else(|e| {
+            panic!(
+                "{}: parity ABORT — variant [{label}] failed at correctness \
+                 size: {e}",
+                kernel.name
+            )
+        });
+        assert!(
+            kernel.tolerance.matches(&out.printed, &oracle),
+            "{}: parity ABORT — variant [{label}] printed {:?}, expected {:?} \
+             (tolerance {})",
+            kernel.name,
+            out.printed,
+            oracle,
+            kernel.tolerance.name()
+        );
+    }
 }
 
 /// Cross-variant output agreement at the kernel's correctness size.
@@ -684,7 +855,15 @@ pub fn parity_holds(kernel: &KernelDef) -> bool {
 /// Times one program's interpreter at p=1 vs the swept p values by pinning
 /// `HELIX_NTHREADS` (the override helix-runtime honours), producing
 /// [`EfficiencyRow`]s normalized to the p=1 point.
-fn sweep_efficiency(src: &str, config: &BenchConfig) -> Vec<EfficiencyRow> {
+///
+/// Variant construction or execution failures abort loudly (they would
+/// otherwise masquerade as "no scaling data").
+fn sweep_efficiency(
+    kernel: &KernelDef,
+    src: &str,
+    size: i64,
+    config: &BenchConfig,
+) -> Vec<EfficiencyRow> {
     let hw = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -703,23 +882,30 @@ fn sweep_efficiency(src: &str, config: &BenchConfig) -> Vec<EfficiencyRow> {
     // baked-in hint (8) would run, and since the env override CAPS the hint,
     // every p >= 8 would tie the baseline at ~1.0x — exactly the flat-sweep
     // bug this replaces.
-    // Without the native feature the interpreter stands in (it ignores thread
-    // hints, so rows honestly report ~1.0x — no fabricated scaling).
-    let native_ready = matches!(native_availability(), NativeAvailability::Ready);
-    let make_variant = |p: usize| -> Result<Box<dyn ExecVariant>, String> {
-        if native_ready {
-            NativeVariant::new_parallel(src, p).map(|v| Box::new(v) as Box<dyn ExecVariant>)
-        } else {
-            interp_variant(src).map(|v| Box::new(v) as Box<dyn ExecVariant>)
-        }
+    let make_variant = |p: usize| -> Box<dyn ExecVariant> {
+        NativeVariant::new_parallel(src, p)
+            .map(|v| Box::new(v) as Box<dyn ExecVariant>)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{}: efficiency-sweep native-par{p} failed to compile at \
+                     N={size}: {e}",
+                    kernel.name
+                )
+            })
     };
     let mut rows = Vec::with_capacity(ps.len());
     let mut base = f64::NAN;
     for &p in &ps {
-        let Ok(variant) = make_variant(p) else {
-            return Vec::new();
-        };
-        let med = timing::measure_with_reps(|r| variant.time_batch(r)).median_ms;
+        let variant = make_variant(p);
+        let med = timing::measure_with_reps(|r| variant.time_batch(r))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "kernel {} size {} failed during timing \
+                     (efficiency sweep p={p}): {e}",
+                    kernel.name, size
+                )
+            })
+            .median_ms;
         if p == 1 {
             base = med;
             rows.push(EfficiencyRow {

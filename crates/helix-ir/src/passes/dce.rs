@@ -1,11 +1,13 @@
 //! Dead-code elimination by mark-and-sweep over effect reachability.
 //!
 //! Roots are everything observable: `Store` (callee writes escape), `Call`
-//! (arbitrary effects — even `zeros` allocates), `Load` (may trap on a bad
-//! index, so deleting one would erase a mandated runtime error). Terminators
-//! are structural roots by definition. A backward worklist marks every pure
-//! instruction whose value feeds a marked instruction; the sweep then deletes
-//! unmarked pure instructions and unmarked non-parameter phis.
+//! (arbitrary effects — even `zeros` allocates), and everything where
+//! [`Inst::may_trap`] holds — `Load` (bounds) and integer `/`/`%` (zero
+//! divisor, `MIN / -1`) trap by lang-spec, so deleting an unused `1 / 0`
+//! would erase a mandated runtime error. Terminators are structural roots by
+//! definition. A backward worklist marks every pure instruction whose value
+//! feeds a marked instruction; the sweep then deletes unmarked pure
+//! instructions and unmarked non-parameter phis.
 //!
 //! The mark phase is a transitive closure over operand edges. Post-SSA names
 //! have unique defs, so "who produces this operand?" is one hash lookup into
@@ -74,9 +76,11 @@ pub fn dce(ir: &mut FuncIr) -> ChangeFlag {
 
     // Seed with effecting instructions AND every value read by a terminator
     // (branch conditions, jump arguments, return values are all observable).
+    // Trapping instructions (`may_trap`: div/rem, loads, calls) are roots too
+    // — an unused `1 / 0` must still trap at runtime.
     for bi in 0..ir.blocks.len() {
         for (ii, inst) in ir.blocks[bi].insts.iter().enumerate() {
-            if matches!(inst, Inst::Load(_) | Inst::Store { .. } | Inst::Call { .. }) {
+            if inst.may_trap() || matches!(inst, Inst::Store { .. }) {
                 live_insts[bi][ii] = true;
                 work.push(Node::Inst(bi as u32, ii));
             }

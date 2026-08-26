@@ -219,10 +219,7 @@ impl Lexer<'_> {
             let value = text.parse::<f64>().unwrap_or(f64::INFINITY);
             if value.is_infinite() {
                 return Err(LexError {
-                    span: Span::new(
-                        u32::try_from(start).unwrap_or(u32::MAX),
-                        self.here(),
-                    ),
+                    span: Span::new(u32::try_from(start).unwrap_or(u32::MAX), self.here()),
                     msg: format!("float literal `{text}` is too large"),
                 });
             }

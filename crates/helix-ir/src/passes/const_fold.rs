@@ -110,11 +110,9 @@ pub fn fold_bin(op: BinOp, x: Constant, y: Constant) -> Option<Constant> {
     }
 
     match (x.as_num()?, y.as_num()?) {
-        ((crate::ir::Num::I(a), _), (crate::ir::Num::I(b), _)) => fold_bin_int(op, a, b),
-        ((crate::ir::Num::F(a), true), (crate::ir::Num::F(b), true)) => {
-            fold_bin_f32(op, a as f32, b as f32)
-        }
-        ((crate::ir::Num::F(a), false), (crate::ir::Num::F(b), false)) => fold_bin_f64(op, a, b),
+        (crate::ir::Num::I(a), crate::ir::Num::I(b)) => fold_bin_int(op, a, b),
+        (crate::ir::Num::F32(a), crate::ir::Num::F32(b)) => fold_bin_f32(op, a, b),
+        (crate::ir::Num::F64(a), crate::ir::Num::F64(b)) => fold_bin_f64(op, a, b),
         _ => None, // mixed int/float requires an explicit cast in HELIX
     }
 }
@@ -168,24 +166,22 @@ fn fold_bin_f64(op: BinOp, a: f64, b: f64) -> Option<Constant> {
 }
 
 fn fold_bin_f32(op: BinOp, a: f32, b: f32) -> Option<Constant> {
-    match fold_bin_f64(op, a as f64, b as f64) {
-        // Recompute in f32 to preserve single-precision rounding.
-        Some(Constant::F64(_)) => match op {
-            BinOp::Add => Some(Constant::F32(a + b)),
-            BinOp::Sub => Some(Constant::F32(a - b)),
-            BinOp::Mul => Some(Constant::F32(a * b)),
-            BinOp::Div => Some(Constant::F32(a / b)),
-            BinOp::Rem => Some(Constant::F32(a % b)),
-            BinOp::Lt => Some(Constant::Bool(a < b)),
-            BinOp::Gt => Some(Constant::Bool(a > b)),
-            BinOp::Le => Some(Constant::Bool(a <= b)),
-            BinOp::Ge => Some(Constant::Bool(a >= b)),
-            BinOp::Eq => Some(Constant::Bool(a == b)),
-            BinOp::Ne => Some(Constant::Bool(a != b)),
-            _ => None,
-        },
-        other => other,
-    }
+    use BinOp::*;
+    let r = match op {
+        Add => Constant::F32(a + b),
+        Sub => Constant::F32(a - b),
+        Mul => Constant::F32(a * b),
+        Div => Constant::F32(a / b), // IEEE: no traps
+        Rem => Constant::F32(a % b),
+        Lt => Constant::Bool(a < b),
+        Gt => Constant::Bool(a > b),
+        Le => Constant::Bool(a <= b),
+        Ge => Constant::Bool(a >= b),
+        Eq => Constant::Bool(a == b),
+        Ne => Constant::Bool(a != b),
+        And | Or => return None,
+    };
+    Some(r)
 }
 
 /// Fold one unary op.

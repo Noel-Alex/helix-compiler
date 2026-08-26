@@ -89,27 +89,28 @@ impl Constant {
         }
     }
 
-    /// Numeric view used by constant folding: integers widened to `i64`,
-    /// floats widened to `f64`. Returns `None` for bools. The bool records
-    /// whether the value is single-precision.
+    /// Numeric view used by constant folding. The payload carries its own
+    /// width so the folder dispatches to native per-width ops — folding an
+    /// `F64` constant through `f32` arithmetic silently rounds it to single
+    /// precision. Returns `None` for bools.
     #[must_use]
-    pub(crate) fn as_num(&self) -> Option<(Num, bool)> {
+    pub(crate) fn as_num(&self) -> Option<Num> {
         Some(match self {
-            Constant::I64(v) => (Num::I(*v), false),
-            Constant::I32(v) => (Num::I(*v as i64), false),
-            Constant::F32(v) => (Num::F(*v as f64), true),
-            Constant::F64(v) => (Num::F(*v), true),
+            Constant::I64(v) => Num::I(*v),
+            Constant::I32(v) => Num::I(*v as i64),
+            Constant::F32(v) => Num::F32(*v),
+            Constant::F64(v) => Num::F64(*v),
             Constant::Bool(_) => return None,
         })
     }
 }
 
-/// Widened numeric payload shared by the folder. `is_f32` remembers whether
-/// the result must be narrowed back to single precision.
+/// Width-tagged numeric payload shared by the folder.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Num {
     I(i64),
-    F(f64),
+    F32(f32),
+    F64(f64),
 }
 
 // ---------------------------------------------------------------------------
@@ -299,10 +300,13 @@ impl Inst {
         }
     }
 
-    /// May evaluating this instruction trap at runtime (integer div/rem)?
-    /// Such instructions are never speculated out of loops.
+    /// May evaluating this instruction trap at runtime? Integer div/rem trap
+    /// on a zero divisor (and `MIN / -1`); loads may trap on bounds checks;
+    /// calls are treated conservatively. Such instructions must survive DCE
+    /// even when unused and are never speculated out of loops. Casts never
+    /// trap: float→int saturates, int→int truncates (`lower.rs`).
     #[must_use]
-    pub fn can_trap(&self) -> bool {
+    pub fn may_trap(&self) -> bool {
         matches!(
             self,
             Inst::Bin {

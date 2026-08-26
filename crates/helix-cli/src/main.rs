@@ -66,13 +66,27 @@ fn dispatch(args: &[String]) -> i32 {
 /// One-screen help per subcommand (the happy path to discovery).
 fn print_subcommand_help(cmd: &str) {
     let text = match cmd {
-        "run" => "helix run <file.hx> [options]\n\nExecutes a HELIX program.\n\n  --backend <interp|jit>   backend choice; default interp.\n                           --backend=jit also accepted. The JIT compiles\n                           through Cranelift and parallelizes approved loops.\n  --threads <n> (-t)       cap parallel loops at n threads for this run.\n  --unchecked              strip array bounds checks (JIT only).\n\nExit codes: 0 ok · 1 runtime/compile error · 2 bad arguments.",
-        "check" => "helix check <file.hx>\n\nType-checks only; prints diagnostics with source carets.\nExit codes: 0 ok · 1 diagnostics found.",
-        "dump" => "helix dump <stage> <file.hx>\n\nPrints one pipeline stage for inspection or golden tests.\nStages: tokens | ast | ir | ssa",
-        "loops" => "helix loops <file.hx>\n\nRuns loop detection + the dependence battery and prints one verdict\nper loop:\n  SAFE         iterations proven independent -> DOALL parallel\n  REDUCTION(op) associative accumulation -> private partials + combine\n  SEQUENTIAL   refused; the reason line names the carrying access pair",
-        "bench" => "helix bench [--quick] [--out <dir>]\n\nRuns the benchmark campaign: interleaved sampling, CV-gated reruns,\nchecksummed parity gates, and analyzer-verdict assertions.\n  --quick     smaller sizes for fast turnaround\n  --out <dir> output directory (default docs/benchmarks/data)",
-        "observe" => "helix observe [--port <n>] [--no-open]\n\nLaunches the Observatory web UI at http://127.0.0.1:<port> (default 8931)\nand opens a browser tab unless --no-open is given.",
-        "selftest" => "helix selftest\n\nDifferential gauntlet: every examples/*.hx runs through BOTH backends;\nprinted output must be byte-identical. Exit 1 on any mismatch.",
+        "run" => {
+            "helix run <file.hx> [options]\n\nExecutes a HELIX program.\n\n  --backend <interp|jit>   backend choice; default interp.\n                           --backend=jit also accepted. The JIT compiles\n                           through Cranelift and parallelizes approved loops.\n  --threads <n> (-t)       cap parallel loops at n threads for this run.\n  --unchecked              strip array bounds checks (JIT only).\n\nExit codes: 0 ok · 1 runtime/compile error · 2 bad arguments."
+        }
+        "check" => {
+            "helix check <file.hx>\n\nType-checks only; prints diagnostics with source carets.\nExit codes: 0 ok · 1 diagnostics found."
+        }
+        "dump" => {
+            "helix dump <stage> <file.hx>\n\nPrints one pipeline stage for inspection or golden tests.\nStages: tokens | ast | ir | ssa"
+        }
+        "loops" => {
+            "helix loops <file.hx>\n\nRuns loop detection + the dependence battery and prints one verdict\nper loop:\n  SAFE         iterations proven independent -> DOALL parallel\n  REDUCTION(op) associative accumulation -> private partials + combine\n  SEQUENTIAL   refused; the reason line names the carrying access pair"
+        }
+        "bench" => {
+            "helix bench [--quick] [--out <dir>]\n\nRuns the benchmark campaign: interleaved sampling, CV-gated reruns,\nchecksummed parity gates, and analyzer-verdict assertions.\n  --quick     smaller sizes for fast turnaround\n  --out <dir> output directory (default docs/benchmarks/data)"
+        }
+        "observe" => {
+            "helix observe [--port <n>] [--no-open]\n\nLaunches the Observatory web UI at http://127.0.0.1:<port> (default 8931)\nand opens a browser tab unless --no-open is given."
+        }
+        "selftest" => {
+            "helix selftest\n\nDifferential gauntlet: every examples/*.hx runs through BOTH backends;\nprinted output must be byte-identical. Exit 1 on any mismatch."
+        }
         _ => return,
     };
     println!("{text}");
@@ -180,12 +194,17 @@ fn cmd_run(rest: &[String]) -> i32 {
             // Convenience control: pin thread count for this run without
             // touching env vars in the shell.
             "--threads" | "-t" => {
-                threads_env = Some(format!("HELIX_NTHREADS={}", rest.get(i + 1).map(String::as_str).unwrap_or("")));
+                threads_env = Some(format!(
+                    "HELIX_NTHREADS={}",
+                    rest.get(i + 1).map(String::as_str).unwrap_or("")
+                ));
                 i += 1;
             }
             f if f.starts_with("--threads=") || f.starts_with("-t=") => {
-                threads_env =
-                    Some(format!("HELIX_NTHREADS={}", &f[f.find('=').expect("prefix checked") + 1..]));
+                threads_env = Some(format!(
+                    "HELIX_NTHREADS={}",
+                    &f[f.find('=').expect("prefix checked") + 1..]
+                ));
             }
             other if path.is_none() => path = Some(other),
             _ => {}

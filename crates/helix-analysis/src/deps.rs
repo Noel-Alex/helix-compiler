@@ -107,10 +107,31 @@ pub enum DepOutcome {
 }
 
 /// Loop bounds for the analyzed dimension: iterations i ∈ [lo, hi].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IterRange {
     pub lo: i128,
     pub hi: i128,
+}
+
+/// What the battery knows about the analyzed loop's iteration window.
+///
+/// `Bounded` carries the exact closed range, so range feasibility may REFUTE
+/// candidate dependences. `Symbolic` means the bounds are not compile-time
+/// constants: the real trip count is unknown and, for i64 indices,
+/// effectively unbounded — an invented finite window that happens to contain
+/// no solution proves nothing. Proof policy: under [`Domain::Symbolic`] only
+/// bound-free algebra may return [`DepOutcome::Independent`] (ZIV inequality,
+/// divisibility failures, unsolvable Diophantine equations); every stage
+/// whose refutation consults `range.lo`/`range.hi` is suppressed and
+/// conservatively reports [`DepOutcome::Dependence`]. Dependence verdicts
+/// (with exact distances where algebra provides them) flow identically in
+/// both domains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Domain {
+    /// Exact closed iteration window `[lo, hi]` (constant loop bounds).
+    Bounded(IterRange),
+    /// Unknown/symbolic bounds — see the type docs for the proof policy.
+    Symbolic,
 }
 
 /// Test ONE dimension of a subscript pair.
@@ -118,8 +139,17 @@ pub struct IterRange {
 /// Battery order: ZIV → Strong SIV → Weak-Zero SIV → Weak-Crossing SIV →
 /// gcd+box (general two-variable Diophantine with bound intersection).
 ///
-/// `range` constrains both source and sink iterations of THIS loop level.
-pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome {
+/// `domain` constrains both source and sink iterations of THIS loop level —
+/// see [`Domain`] for what a `Symbolic` domain may and may not prove.
+pub fn test_dimension(src: Affine, dst: Affine, domain: Domain) -> DepOutcome {
+    // Exact window only when the loop bounds are compile-time constants; a
+    // `None` range FORBIDS every refutation below that consults `range.lo` /
+    // `range.hi` (see [`Domain`] for the proof policy).
+    let range = match domain {
+        Domain::Bounded(r) => Some(r),
+        Domain::Symbolic => None,
+    };
+
     // ---- ZIV: no index variable on either side ------------------------------
     if src.a == 0 && dst.a == 0 {
         return if src.b == dst.b {
@@ -136,17 +166,20 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
     if src.a == dst.a && src.a != 0 {
         let delta = dst.b - src.b; // dst(i') = src(i)  =>  a*i' + q = a*i + p
         if delta % src.a != 0 {
+            return DepOutcome::Independent; // divisibility: bound-free algebra
+        }
+        let d = delta / src.a; // matched-pair gap: first-op iter − second-op iter
+        // d must be representable: no real i64 iteration space spans a pair
+        // farther apart than i64::MIN..i64::MAX trips — bound-free argument.
+        if d > i64::MAX as i128 || d < i64::MIN as i128 {
             return DepOutcome::Independent;
         }
-        let d = delta / src.a; // distance = sink - source = i' - i
-        // d must be representable and the iteration pair in-range.
-        if d > i64::MAX as i128 || d < i64::MIN as i128 {
-            return DepOutcome::Independent; // unreachable pair within any real trip count
-        }
         let dv = i64::try_from(d).expect("checked above");
-        // Bounds: source at i, sink at i + d; both must lie in [lo, hi] for some i.
-        let feasible = pairs_feasible(range, d);
-        if !feasible {
+        // Bounds: source at i, sink at i + d; both must lie in [lo, hi] for
+        // some i. Range feasibility refutes ONLY under an exact window.
+        if let Some(range) = range
+            && !pairs_feasible(range, d)
+        {
             return DepOutcome::Independent;
         }
         let dir = match d.cmp(&0) {
@@ -172,10 +205,12 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
         debug_assert!(a != 0);
         let diff = c - p;
         if diff % a != 0 {
-            return DepOutcome::Independent;
+            return DepOutcome::Independent; // divisibility: bound-free algebra
         }
         let point = diff / a;
-        if point < range.lo || point > range.hi {
+        if let Some(range) = range
+            && (point < range.lo || point > range.hi)
+        {
             return DepOutcome::Independent;
         }
         // The fixed iteration touches the same location from one side only:
@@ -199,12 +234,17 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
         debug_assert!(a != 0);
         let num = dst.b - src.b;
         if num % a != 0 {
-            return DepOutcome::Independent;
+            return DepOutcome::Independent; // divisibility: bound-free algebra
         }
         let sum = num / a; // i + j must equal `sum`
         // Feasible when the box admits two values adding to `sum`:
-        // max(lo, sum - hi) <= min(hi, sum - lo).
-        if range.lo.max(sum - range.hi) <= range.hi.min(sum - range.lo) {
+        // max(lo, sum - hi) <= min(hi, sum - lo). Refutable only under an
+        // exact window.
+        let feasible = match range {
+            Some(r) => r.lo.max(sum - r.hi) <= r.hi.min(sum - r.lo),
+            None => true,
+        };
+        if feasible {
             // '<' and '>' possible; '=' only when sum is even and sum/2 in
             // range. Conservative: allow all three directions.
             return DepOutcome::Dependence {
@@ -222,7 +262,7 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
     let k = dst.b - src.b;
     let g = gcd(lhs_a.abs(), rhs_a.abs());
     if g == 0 || k % g != 0 {
-        return DepOutcome::Independent;
+        return DepOutcome::Independent; // pure divisibility: bound-free algebra
     }
     // Parametric solution via extended Euclid on |coefficients| with sign fixups:
     // find one solution (i0, j0) to lhs_a*i - rhs_a*j = k.
@@ -230,7 +270,14 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
         // General solution: i = i0 + (rhs_a/g)*t, j = j0 + (lhs_a/g)*t.
         let si = rhs_a / g;
         let sj = lhs_a / g;
-        if box_has_solution(range, i0, j0, si, sj) {
+        // Box intersection refutes only under an exact window; symbolically
+        // the Diophantine family is infinite, so solutions can never be
+        // excluded by an invented trip count.
+        let boxed = match range {
+            Some(r) => box_has_solution(r, i0, j0, si, sj),
+            None => true,
+        };
+        if boxed {
             return DepOutcome::Dependence {
                 distance: None,
                 dirs: vec![DirVec::star()],
@@ -238,7 +285,7 @@ pub fn test_dimension(src: Affine, dst: Affine, range: IterRange) -> DepOutcome 
         }
         return DepOutcome::Independent;
     }
-    // Unsolvable Diophantine equation => independent.
+    // Unsolvable Diophantine equation => independent (bound-free algebra).
     DepOutcome::Independent
 }
 
@@ -360,14 +407,14 @@ fn pairs_feasible(range: IterRange, d: i128) -> bool {
 pub fn test_pair(
     subscripts_src: &[Affine],
     subscripts_dst: &[Affine],
-    range: IterRange,
+    domain: Domain,
 ) -> DepOutcome {
     debug_assert_eq!(subscripts_src.len(), subscripts_dst.len());
     let mut combined_dirs: Vec<DirVec> = Vec::new();
     let mut distance: Option<i64> = Some(0);
 
     for (s, d) in subscripts_src.iter().zip(subscripts_dst.iter()) {
-        match test_dimension(*s, *d, range) {
+        match test_dimension(*s, *d, domain) {
             DepOutcome::Independent => return DepOutcome::Independent,
             DepOutcome::Dependence {
                 distance: dist,
@@ -408,8 +455,16 @@ mod tests {
 
     const R: IterRange = IterRange { lo: 0, hi: 99 };
 
+    /// Shorthand: exact-window domain over `r`.
+    fn bd(r: IterRange) -> Domain {
+        Domain::Bounded(r)
+    }
+
     fn outcome_is_independent(src: Affine, dst: Affine) -> bool {
-        matches!(test_dimension(src, dst, R), DepOutcome::Independent)
+        matches!(
+            test_dimension(src, dst, bd(R)),
+            DepOutcome::Independent
+        )
     }
 
     #[test]
@@ -427,7 +482,7 @@ mod tests {
     #[test]
     fn strong_siv_distance_one() {
         // a[i-1] vs a[i]: src coeff 1 b -1; dst coeff 1 b 0 => distance = (0-(-1))/1 = 1
-        match test_dimension(Affine { a: 1, b: -1 }, Affine { a: 1, b: 0 }, R) {
+        match test_dimension(Affine { a: 1, b: -1 }, Affine { a: 1, b: 0 }, bd(R)) {
             DepOutcome::Dependence {
                 distance: Some(1),
                 dirs,
@@ -514,7 +569,7 @@ mod tests {
         match test_dimension(
             Affine { a: 1, b: -100 },
             Affine { a: 1, b: 0 },
-            IterRange { lo: 0, hi: 199 },
+            bd(IterRange { lo: 0, hi: 199 }),
         ) {
             DepOutcome::Dependence {
                 distance: Some(100),
@@ -528,7 +583,7 @@ mod tests {
             test_dimension(
                 Affine { a: 1, b: -100 },
                 Affine { a: 1, b: 0 },
-                IterRange { lo: 0, hi: 99 }
+                bd(IterRange { lo: 0, hi: 99 })
             ),
             DepOutcome::Independent
         ));
@@ -541,7 +596,7 @@ mod tests {
             test_pair(
                 &[Affine { a: 0, b: 1 }, Affine { a: 1, b: 0 }],
                 &[Affine { a: 0, b: 2 }, Affine { a: 1, b: 0 }],
-                R
+                bd(R)
             ),
             DepOutcome::Independent
         ));
@@ -563,7 +618,10 @@ mod tests {
         let dst = Affine { a: 1, b: 0 };
         let r = IterRange { lo: 0, hi: 9 };
         assert!(
-            matches!(test_dimension(src, dst, r), DepOutcome::Dependence { .. }),
+            matches!(
+                test_dimension(src, dst, bd(r)),
+                DepOutcome::Dependence { .. }
+            ),
             "a[5-2i] vs a[i] has real dependences at i=0..2"
         );
         // Cross-check against brute force.
@@ -578,7 +636,7 @@ mod tests {
         let dst = Affine { a: -1, b: 5 };
         let r = IterRange { lo: 0, hi: 9 };
         assert!(matches!(
-            test_dimension(src, dst, r),
+            test_dimension(src, dst, bd(r)),
             DepOutcome::Dependence { .. }
         ));
         assert!(box_brute_force(r, src, dst));
@@ -590,43 +648,204 @@ mod tests {
         let r = IterRange { lo: 100, hi: 199 };
         // src = 5 - 2i vs dst = i over [100,199]: lhs <= -195, rhs >= 100.
         assert!(matches!(
-            test_dimension(
-                Affine { a: -2, b: 5 },
-                Affine { a: 1, b: 0 },
-                r
-            ),
+            test_dimension(Affine { a: -2, b: 5 }, Affine { a: 1, b: 0 }, bd(r)),
             DepOutcome::Independent
         ));
-        assert!(!box_brute_force(r, Affine { a: -2, b: 5 }, Affine { a: 1, b: 0 }));
+        assert!(!box_brute_force(
+            r,
+            Affine { a: -2, b: 5 },
+            Affine { a: 1, b: 0 }
+        ));
     }
 
     #[test]
     fn box_agrees_with_brute_force_over_sign_grid() {
-        // Property sweep: every coefficient-sign combination and offset over a
-        // small box must agree with brute force. This is the net that catches
-        // any future sign-handling regression in the general-case path.
-        let r = IterRange { lo: 0, hi: 12 };
-        for sa in [-3i128, -2, -1, 1, 2, 3] {
-            for sb in [-4i128, -1, 0, 3, 7] {
-                for da in [-2i128, -1, 1, 2] {
-                    for db in [-3i128, 0, 2, 6] {
+        // Property sweep: every coefficient and offset over a small box must
+        // agree with brute force. This is the net that catches any future
+        // sign-handling regression in the general-case path. Coefficients span
+        // ±16 and offsets ±32 so every battery stage (ZIV, all three SIVs,
+        // gcd/box) sees both signs and mixed magnitudes; ranges include a
+        // negative window to exercise lo < 0 < hi.
+        for (lo, hi) in [(-5i128, 8), (0, 12), (-9, -2)] {
+            let r = IterRange { lo, hi };
+            for sa in [-16i128, -4, -2, -1, 1, 2, 4, 16] {
+                for sb in [-32i128, -7, -1, 0, 1, 3, 31] {
+                    for da in [-16i128, -3, -1, 1, 2, 15] {
+                        for db in [-32i128, -11, 0, 2, 8, 30] {
+                            let src = Affine { a: sa, b: sb };
+                            let dst = Affine { a: da, b: db };
+                            // Skip pairs routed to earlier battery stages? No:
+                            // brute force must agree with the WHOLE test_dimension,
+                            // which is exactly what production runs.
+                            let algebra = matches!(
+                                test_dimension(src, dst, bd(r)),
+                                DepOutcome::Dependence { .. }
+                            );
+                            let truth = box_brute_force(r, src, dst);
+                            assert_eq!(
+                                algebra, truth,
+                                "src={sa}*i{sb:+} dst={da}*j{db:+} range=[{lo},{hi}]"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Symbolic-bound proof policy ------------------------------------------
+    //
+    // With unknown loop bounds only bound-free algebra may prove independence:
+    // an invented finite iteration window that happens to contain no solution
+    // proves nothing about a real i64 trip count.
+
+    /// Closed-form ground truth under symbolic bounds: a solution to
+    /// `src(i) == dst(j)` over ALL of Z² exists iff the Diophantine equation
+    /// `src.a*i - dst.a*j == dst.b - src.b` is solvable, i.e. gcd(a_s, a_d)
+    /// divides the constant term. This is exactly what the battery may use —
+    /// nothing more — when the domain is [`Domain::Symbolic`].
+    fn symbolic_truth(src: Affine, dst: Affine) -> bool {
+        let g = gcd(src.a.abs(), dst.a.abs());
+        g != 0 && ((dst.b - src.b) % g == 0)
+    }
+
+    #[test]
+    fn symbolic_domain_matches_closed_form_over_full_grid() {
+        // Under Domain::Symbolic the verdict must be EXACTLY "gcd divides":
+        // never refuted by range feasibility, never approved by anything
+        // weaker. Sweep the same wide grid as the bounded property test.
+        for sa in [-16i128, -4, -2, -1, 1, 2, 4, 16] {
+            for sb in [-32i128, -7, -1, 0, 1, 3, 31] {
+                for da in [-16i128, -3, -1, 1, 2, 15] {
+                    for db in [-32i128, -11, 0, 2, 8, 30] {
                         let src = Affine { a: sa, b: sb };
                         let dst = Affine { a: da, b: db };
-                        // Skip pairs routed to earlier battery stages? No:
-                        // brute force must agree with the WHOLE test_dimension,
-                        // which is exactly what production runs.
                         let algebra = matches!(
-                            test_dimension(src, dst, r),
+                            test_dimension(src, dst, Domain::Symbolic),
                             DepOutcome::Dependence { .. }
                         );
-                        let truth = box_brute_force(r, src, dst);
                         assert_eq!(
-                            algebra, truth,
-                            "src={sa}*i{sb:+} dst={da}*j{db:+} range=[0,12]"
+                            algebra,
+                            symbolic_truth(src, dst),
+                            "src={sa}*i{sb:+} dst={da}*j{db:+} (symbolic)"
                         );
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn symbolic_never_refutes_what_bounded_proves_dependent() {
+        // Monotonicity: if the exact window says Dependence, the unbounded
+        // domain must not claim Independent — dropping constraints cannot
+        // create independence.
+        for sa in [-3i128, -1, 1, 2] {
+            for sb in [-5i128, 0, 4] {
+                for da in [-2i128, 1, 3] {
+                    for db in [-6i128, 1, 9] {
+                        let src = Affine { a: sa, b: sb };
+                        let dst = Affine { a: da, b: db };
+                        let r = IterRange { lo: -4, hi: 9 };
+                        if matches!(
+                            test_dimension(src, dst, bd(r)),
+                            DepOutcome::Dependence { .. }
+                        ) {
+                            assert!(
+                                matches!(
+                                    test_dimension(src, dst, Domain::Symbolic),
+                                    DepOutcome::Dependence { .. }
+                                ),
+                                "symbolic contradicted bounded Dependence: \
+                                 src={sa}*i{sb:+} dst={da}*j{db:+}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn symbolic_keeps_exact_distances_and_directions() {
+        // Distance algebra is bound-free: a[i-1] vs a[i] still reports
+        // distance 1 with direction '>' even though bounds are unknown.
+        match test_dimension(
+            Affine { a: 1, b: -1 },
+            Affine { a: 1, b: 0 },
+            Domain::Symbolic,
+        ) {
+            DepOutcome::Dependence {
+                distance: Some(1),
+                dirs,
+            } => assert!(dirs[0].gt && !dirs[0].eq && !dirs[0].lt),
+            other => panic!("expected distance-1 dependence, got {other:?}"),
+        }
+        // Divisibility proof survives too: a[2i] vs a[2i+1] can never alias
+        // regardless of trip count.
+        assert!(matches!(
+            test_dimension(
+                Affine { a: 2, b: 0 },
+                Affine { a: 2, b: 1 },
+                Domain::Symbolic
+            ),
+            DepOutcome::Independent
+        ));
+        // But the same-coefficient case whose ONLY refutation was the range
+        // (distance-100 pair outside [0,99]) now stays conservatively
+        // dependent.
+        assert!(matches!(
+            test_dimension(
+                Affine { a: 1, b: -100 },
+                Affine { a: 1, b: 0 },
+                Domain::Symbolic
+            ),
+            DepOutcome::Dependence { .. }
+        ));
+        // Weak-zero out-of-range point (a[200] with i ∈ [0,99]) likewise
+        // loses its range-based refutation under symbolic bounds.
+        assert!(matches!(
+            test_dimension(
+                Affine { a: 1, b: 0 },
+                Affine { a: 0, b: 200 },
+                Domain::Symbolic
+            ),
+            DepOutcome::Dependence { .. }
+        ));
+        // ZIV stays fully valid: distinct constants never alias anywhere.
+        assert!(matches!(
+            test_dimension(
+                Affine { a: 0, b: 3 },
+                Affine { a: 0, b: 5 },
+                Domain::Symbolic
+            ),
+            DepOutcome::Independent
+        ));
+    }
+
+    #[test]
+    fn test_pair_symbolic_domain_flows_through() {
+        // Multi-dimension driver honors the domain: first dimension proves
+        // independence by divisibility -> overall independent; a surviving
+        // pair stays dependent with its distance preserved.
+        assert!(matches!(
+            test_pair(
+                &[Affine { a: 0, b: 1 }, Affine { a: 1, b: 0 }],
+                &[Affine { a: 0, b: 2 }, Affine { a: 1, b: 0 }],
+                Domain::Symbolic
+            ),
+            DepOutcome::Independent
+        ));
+        match test_pair(
+            &[Affine { a: 1, b: -1 }],
+            &[Affine { a: 1, b: 0 }],
+            Domain::Symbolic,
+        ) {
+            DepOutcome::Dependence {
+                distance: Some(1),
+                ..
+            } => {}
+            other => panic!("expected distance-1 through pair, got {other:?}"),
         }
     }
 }

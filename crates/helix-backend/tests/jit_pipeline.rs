@@ -884,44 +884,118 @@ fn array_only_parallel_region_writes_correctly() {
 }
 
 // ---------------------------------------------------------------------------
-// zeros-in-region demotion + f32 reduction seed/readback — wave-3 regressions
+// Regression: zeros() inside an approved DOALL loop (compile-failure fix)
 // ---------------------------------------------------------------------------
 
-/// `zeros` inside an approved loop has no parent fat-pointer to stash, so the
-/// region used to fail JIT compilation on a valid program. The extractor now
-/// demotes such regions (sequential lowering), and the program must still run
-/// correctly through the JIT.
+/// `zeros` inside an otherwise-approvable DOALL loop used to pass the
+/// extractor's builtin whitelist and then fail the WHOLE JIT compile: the
+/// freshly allocated array has no parent-side fat pointer to stash
+/// (`emit_region_dispatch` → `lookup_array` → "array local lN referenced
+/// before allocation"), because its defining call lives in the orphaned loop
+/// blocks. Extraction now demotes any region containing `zeros` to the
+/// sequential path, so the program compiles and stays differential.
 #[test]
 fn zeros_inside_parallel_loop_still_correct() {
     let src = r#"
         fn main() {
-            let n = 4;
-            let sums: [i64] = zeros(n);
+            let n = 100;
+            let out: [i64] = zeros(n);
             for i in 0..n {
                 let t: [i64] = zeros(8);
-                t[0] = i;
-                sums[i] = t[0];
+                t[3] = i * 2;
+                out[i] = t[3] + t[4];
             }
-            print(sums[0]);
-            print(sums[3]);
+            print(out[50]);
+            print(out[99]);
         }
     "#;
-    // Analysis may approve the loop (its memory accesses look independent);
-    // the BACKEND must demote it during extraction because a zeros-created
-    // array has no parent binding to stash. Compiling with the plan must
-    // therefore succeed (it used to fail outright) and run correctly.
+    // The analysis layer still APPROVES the loop (zeros is a pure builtin
+    // and the fresh array carries no cross-iteration dependence): demotion
+    // is the backend's extraction-time decision, invisible to the plan.
     let irs = compile_ir(src);
     let plan = analyze_plan(&irs);
+    assert_eq!(
+        plan.regions.len(),
+        1,
+        "DOALL shape must remain analysis-approved"
+    );
+
+    // The full planned pipeline must COMPILE (it used to abort in the parent
+    // stash emission) and match the interpreter byte-for-byte.
+    let ast = helix_syntax::parse_str(src).expect("parse");
+    let typed = helix_sema::check(&ast).expect("sema");
+    let interp = helix_engine::run_with_source(src, &typed)
+        .expect("interp run")
+        .printed;
     let engine =
-        JitEngine::compile(&irs, &to_backend_plan(&plan), false).expect("compile with plan");
+        JitEngine::compile(&irs, &to_backend_plan(&plan), false).expect("zeros-in-region compile");
     let (lines, result) = helix_backend::engine::capture_prints(|| engine.run_main());
     result.expect("run");
-    assert_eq!(lines, vec!["0".to_string(), "3".to_string()]);
-    // And the sequential path matches the interpreter exactly.
-    let (jitd, interp) = assert_parity(src);
-    assert_eq!(interp, vec!["0", "3"]);
-    assert_eq!(jitd, vec!["0", "3"]);
+    assert_eq!(lines, interp);
+    // t[4] is always 0, so out[i] = i*2 ⇒ 100 and 198.
+    assert_eq!(interp, vec!["100", "198"]);
 }
+
+// ---------------------------------------------------------------------------
+// Regression: f32 reduction round-trip (seed narrowing + readback decoding)
+// ---------------------------------------------------------------------------
+
+/// f32 SUM reduction with a NON-ZERO seed and exact-binary terms: every
+/// partial is exactly representable in f32, so parallel reassociation cannot
+/// move the result — any deviation is an encoding bug. This pins both f32
+/// facets at once: the seed used to be copied from the WIDENED stash word
+/// (low 4 bytes of an f64 bit pattern ≠ the f32 bits), and the readback slot
+/// used to be decoded as f64 bits then re-demoted.
+#[test]
+fn f32_sum_reduction_bit_exact_vs_interpreter() {
+    let src = r#"
+        fn main() {
+            let n = 100;
+            let a: [f32] = zeros(n);
+            for i in 0..n {
+                a[i] = 0.25;
+            }
+            let s: f32 = 1.5;
+            for i in 0..n {
+                s = s + a[i];
+            }
+            print(s);
+        }
+    "#;
+    // 1.5 + 100 * 0.25 = 26.5, exact at every step in f32 and f64 alike.
+    let out = assert_parallel_parity(src, 2);
+    let got: f32 = out[0].parse().expect("f32 parse of sum output");
+    assert_eq!(got, 26.5f32);
+}
+
+/// f32 MIN reduction where the SEED must win (-1000 vs elements ≥ -99):
+/// under the old seed bug the widened -1000.0f32 stash word narrowed to
+/// garbage (+0.0), so the minimum came out as an element instead. The seed
+/// surviving the round trip is the assertion.
+#[test]
+fn f32_min_reduction_seed_survives_roundtrip() {
+    let src = r#"
+        fn main() {
+            let n = 100;
+            let a: [f32] = zeros(n);
+            for i in 0..n {
+                a[i] = (0 - i) as f32;
+            }
+            let m = (0.0 - 1000.0) as f32;
+            for i in 0..n {
+                m = min(m, a[i]);
+            }
+            print(m);
+        }
+    "#;
+    let out = assert_parallel_parity(src, 2);
+    let got: f32 = out[0].parse().expect("f32 parse of min output");
+    assert_eq!(got, -1000.0f32);
+}
+
+// ---------------------------------------------------------------------------
+// f32/i32 reduction width regressions — wave-3 additions
+// ---------------------------------------------------------------------------
 
 /// An f32 sum reduction must survive seed → accumulate → fold → readback at
 /// native width. Values are exact binary fractions so reassociation cannot

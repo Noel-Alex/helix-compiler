@@ -111,8 +111,15 @@ pub mod testutil {
 
     /// Serializes whole-engine runs that install the panic hook or reset the
     /// recorded-error slot (process-global state).
-    pub fn serial_lock() -> &'static std::sync::Mutex<()> {
+    ///
+    /// Returns a held guard: `let _g = serial_lock();` blocks until every
+    /// other engine run in the process finishes. (Returning a bare `&Mutex`
+    /// would acquire nothing — that bug let trap tests race and randomly
+    /// killed the whole test binary via `helix_panic`'s disarmed-window exit.)
+    pub fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::engine::serial_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Arms the trap recorder: subsequent runtime traps are recorded instead

@@ -199,8 +199,8 @@ pub fn capture_prints<R>(f: impl FnOnce() -> R) -> (Vec<String>, R) {
 }
 
 /// Serializes engine runs that touch process-global state (`LAST_PANIC`,
-/// hook installation). Tests hold this guard; single-program production runs
-/// never contend.
+/// trap recorder). Tests acquire the returned guard; single-program production
+/// runs never contend.
 #[doc(hidden)]
 pub fn serial_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -344,7 +344,8 @@ impl JitEngine {
         // verifier panic deep in codegen. (The extracted region bodies are
         // verified inside `build_body_ir`.)
         for f in program {
-            helix_ir::verify_ssa(f).map_err(|e| format!("input IR '{}' not valid SSA: {e}", f.name))?;
+            helix_ir::verify_ssa(f)
+                .map_err(|e| format!("input IR '{}' not valid SSA: {e}", f.name))?;
         }
 
         // ---- plan preparation -------------------------------------------------
@@ -352,8 +353,7 @@ impl JitEngine {
         // a function gets its own dispatch hook (keyed by header block) — the
         // old first-region-wins map silently ran all sibling loops sequential.
         let regions = crate::parallel::prepare(plan, program);
-        let mut hooks: HashMap<usize, HashMap<usize, crate::parallel::RtHook>> =
-            HashMap::new();
+        let mut hooks: HashMap<usize, HashMap<usize, crate::parallel::RtHook>> = HashMap::new();
         let mut bodies: Vec<crate::parallel::BodyArtifact> = Vec::new();
         for r in &regions {
             hooks

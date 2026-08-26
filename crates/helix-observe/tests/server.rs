@@ -219,15 +219,18 @@ async fn run_post_rejects_json_without_usable_source() {
     let addr = spawn().await;
     // A JSON object without a usable `source` must 400 with a showable
     // message, not silently compile empty source into a full artifact.
-    for payload in ["{}", "{\"other\":1}", "{\"source\":\"\"}", "{\"source\":\"  \"}"] {
+    for payload in [
+        "{}",
+        "{\"other\":1}",
+        "{\"source\":\"\"}",
+        "{\"source\":\"  \"}",
+    ] {
         let (status, ctype, body) = http(addr, "POST", "/api/run", Some(payload)).await;
         assert_eq!(status, 400, "{payload}");
         assert!(ctype.starts_with("application/json"), "{payload}");
         let err: serde_json::Value = serde_json::from_str(&body).expect("error json");
         assert!(
-            err["error"]
-                .as_str()
-                .is_some_and(|m| m.contains("source")),
+            err["error"].as_str().is_some_and(|m| m.contains("source")),
             "{payload}: {body}"
         );
     }

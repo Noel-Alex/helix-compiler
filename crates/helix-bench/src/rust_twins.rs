@@ -33,11 +33,41 @@ pub fn printed_checksum(lines: &[String]) -> u64 {
 // Input generators (shared shape with the HELIX sources)
 // ---------------------------------------------------------------------------
 
-/// The deterministic init used by every HELIX streaming/reduction kernel:
-/// all-zeros arrays. Kept here for documentation; twins allocate identically.
+/// The deterministic init of `saxpy.hx`: sign/fraction-mixed values so no
+/// execution pass can fold the kernel or pass parity vacuously.
+/// `x[i] = ((i*17+3) % 251)/17 - 4`, `y[i] = ((i*29+11) % 241)/19 - 5`.
 #[must_use]
-pub fn zeros(n: usize) -> Vec<f64> {
-    vec![0.0; n]
+pub fn saxpy_inputs(n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut x = vec![0.0f64; n];
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        x[i] = ((i * 17 + 3) % 251) as f64 / 17.0 - 4.0;
+        y[i] = ((i * 29 + 11) % 241) as f64 / 19.0 - 5.0;
+    }
+    (x, y)
+}
+
+/// The deterministic init of `scale.hx`:
+/// `a[i] = ((i*13+5) % 199)/7 - 12`.
+#[must_use]
+pub fn scale_inputs(n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| ((i * 13 + 5) % 199) as f64 / 7.0 - 12.0)
+        .collect()
+}
+
+/// The deterministic init of `dot_reduction.hx`:
+/// `a[i] = ((i*7+1) % 97)/9 - 4`, `b[i] = ((i*11+2) % 89)/11 - 3`. Products
+/// cancel in aggregate, so a zero-initialized or half-seeded dot cannot pass.
+#[must_use]
+pub fn dot_inputs(n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut a = vec![0.0f64; n];
+    let mut b = vec![0.0f64; n];
+    for i in 0..n {
+        a[i] = ((i * 7 + 1) % 97) as f64 / 9.0 - 4.0;
+        b[i] = ((i * 11 + 2) % 89) as f64 / 11.0 - 3.0;
+    }
+    (a, b)
 }
 
 /// Matmul init mirroring `matmul.hx`: `a[i]=(i%97)*0.5`, `b[i]=((i*7)%89)*0.25`.
@@ -59,13 +89,12 @@ pub fn matmul_inputs(n: usize) -> (Vec<f64>, Vec<f64>) {
 // Twins
 // ---------------------------------------------------------------------------
 
-/// Twin of `saxpy.hx`: `y[i] += s*x[i]`, over SEEDED inputs (`x=1.0`,
-/// `y=2.0`) so every store is live and no pass can fold the loop away.
-/// Returns the rewritten `y`.
+/// Twin of `saxpy.hx`: `y[i] += s*x[i]` over the seeded [`saxpy_inputs`] so
+/// every store is live and no pass can fold the loop away. Returns the
+/// rewritten `y`.
 #[must_use]
 pub fn saxpy(n: usize, s: f64) -> Vec<f64> {
-    let x = vec![1.0f64; n];
-    let mut y = vec![2.0f64; n];
+    let (x, mut y) = saxpy_inputs(n);
     for i in 0..n {
         y[i] += s * x[i];
     }
@@ -73,8 +102,9 @@ pub fn saxpy(n: usize, s: f64) -> Vec<f64> {
     y
 }
 
-/// Twin of `dot_reduction.hx` over two seeded vectors (zeros would make the
-/// sum trivially 0 and let a broken kernel pass vacuously).
+/// Twin of `dot_reduction.hx` over two seeded vectors (the HELIX sources'
+/// formulas make the sum a cancelling mix — zeros would let a broken kernel
+/// pass vacuously).
 #[must_use]
 pub fn dot(a: &[f64], b: &[f64]) -> f64 {
     let mut acc = 0.0f64;
@@ -115,19 +145,36 @@ mod tests {
 
     #[test]
     fn saxpy_math_is_elementwise() {
-        let y = saxpy(1024, 2.5);
-        assert_eq!(y.len(), 1024);
-        // Seeded x=1, y=2 => y' = 2.5*1 + 2 = 4.5 everywhere.
-        assert!(y.iter().all(|&v| v == 4.5));
+        let n = 1024;
+        let (x, y0) = saxpy_inputs(n);
+        let y = saxpy(n, 2.5);
+        assert_eq!(y.len(), n);
+        for i in 0..n {
+            assert_eq!(y[i], 2.5 * x[i] + y0[i], "element {i}");
+        }
+    }
+
+    #[test]
+    fn input_generators_are_nonzero_and_sign_mixed() {
+        let gens: Vec<Box<dyn Fn(usize) -> Vec<f64>>> = vec![
+            Box::new(|n| saxpy_inputs(n).0),
+            Box::new(|n| saxpy_inputs(n).1),
+            Box::new(scale_inputs),
+            Box::new(|n| dot_inputs(n).0),
+            Box::new(|n| dot_inputs(n).1),
+        ];
+        for make in &gens {
+            let v = make(512);
+            assert!(v.iter().any(|&x| x > 0.0), "no positive values");
+            assert!(v.iter().any(|&x| x < 0.0), "no negative values");
+            assert!(v.iter().any(|&x| x != x.trunc()), "no fractional values");
+            // The vacuity this module exists to prevent:
+            assert!(v.iter().any(|&x| x != 0.0), "all-zero seed");
+        }
     }
 
     #[test]
     fn dot_matches_closed_form_for_seeded_inputs() {
-        // a[i] = 1, b[i] = 2 => sum = 2n exactly in f64 up to huge n.
-        let n = 4096;
-        let a = vec![1.0; n];
-        let b = vec![2.0; n];
-        assert_eq!(dot(&a, &b), 8192.0);
         // Non-trivial case vs direct computation.
         let c: Vec<f64> = (0..1000).map(|i| f64::from(i % 7)).collect();
         let d: Vec<f64> = (0..1000).map(|i| f64::from(i % 11)).collect();
@@ -135,6 +182,41 @@ mod tests {
             .map(|i| f64::from(i % 7) * f64::from(i % 11))
             .sum();
         assert_eq!(dot(&c, &d), expect);
+    }
+
+    // -- Oracle pins ---------------------------------------------------------
+    //
+    // These three values are EXACTLY what kernels.rs expects at its
+    // correctness sizes; they are computed here independently of the HELIX
+    // toolchain (plain Rust loops over the same formulas) so a drift in
+    // either side fails loudly.
+
+    #[test]
+    fn oracle_saxpy_y7_at_n1024() {
+        let n = 1024;
+        let (x, mut y) = saxpy_inputs(n);
+        for i in 0..n {
+            y[i] = 2.5 * x[i] + y[i];
+        }
+        assert_eq!(fmt_f64(y[7]), "14.204334365325078");
+    }
+
+    #[test]
+    fn oracle_scale_out42_at_n1000() {
+        let a = scale_inputs(1000);
+        let out42 = a[42] * 5.0;
+        assert_eq!(fmt_f64(out42), "49.28571428571429");
+    }
+
+    #[test]
+    fn oracle_dot_sum_at_n4096() {
+        let n = 4096;
+        let (a, b) = dot_inputs(n);
+        let mut acc = 0.0f64;
+        for i in 0..n {
+            acc += a[i] * b[i];
+        }
+        assert_eq!(fmt_f64(acc), "5206.808080808095");
     }
 
     #[test]
@@ -176,8 +258,18 @@ mod tests {
     }
 
     #[test]
-    fn zeros_are_zeros() {
-        assert_eq!(zeros(10), vec![0.0; 10]);
-        assert!(zeros(0).is_empty());
+    fn input_generators_match_source_formulas() {
+        let n = 300; // spans several modulus wrap points of every formula
+        let (x, y) = saxpy_inputs(n);
+        let a = scale_inputs(n);
+        let (da, db) = dot_inputs(n);
+        for i in [0usize, 1, 14, 17, 97, 199, 240, 250, 299] {
+            let f = i as f64;
+            assert_eq!(x[i], ((f * 17.0 + 3.0) % 251.0) / 17.0 - 4.0, "x[{i}]");
+            assert_eq!(y[i], ((f * 29.0 + 11.0) % 241.0) / 19.0 - 5.0, "y[{i}]");
+            assert_eq!(a[i], ((f * 13.0 + 5.0) % 199.0) / 7.0 - 12.0, "a[{i}]");
+            assert_eq!(da[i], ((f * 7.0 + 1.0) % 97.0) / 9.0 - 4.0, "dot_a[{i}]");
+            assert_eq!(db[i], ((f * 11.0 + 2.0) % 89.0) / 11.0 - 3.0, "dot_b[{i}]");
+        }
     }
 }

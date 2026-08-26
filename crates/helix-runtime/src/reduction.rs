@@ -93,11 +93,7 @@ pub(crate) unsafe fn fold(base: *mut u8, participants: usize, combine: CombineFn
             unsafe { base.add(ACC_OFFSET) }, // dst: cell 0 acc
             // SAFETY: p < participants keeps the cell inside the area.
             unsafe {
-                base.add(
-                    p.checked_mul(CELL_STRIDE)
-                        .expect("cell offset overflow")
-                        + ACC_OFFSET,
-                )
+                base.add(p.checked_mul(CELL_STRIDE).expect("cell offset overflow") + ACC_OFFSET)
             }, // src: cell p acc
         );
     }

@@ -472,11 +472,7 @@ fn pool_region_overhead_below_scope_spawn_overhead() {
     let mut best_scope = std::time::Duration::MAX;
     let mut best_pool = std::time::Duration::MAX;
     for _ in 0..3 {
-        best_scope = best_scope.min(time_regions(
-            RuntimeStage::ScopeThreads,
-            REGIONS,
-            ITERS,
-        ));
+        best_scope = best_scope.min(time_regions(RuntimeStage::ScopeThreads, REGIONS, ITERS));
         best_pool = best_pool.min(time_regions(RuntimeStage::Pool, REGIONS, ITERS));
     }
     // Pool must be at least in the same league as spawn-per-call; allow 25%

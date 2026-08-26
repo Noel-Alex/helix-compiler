@@ -89,6 +89,10 @@ struct Parser {
     /// a clean ParseError instead of a native stack-overflow abort. The cap
     /// also bounds the recursive tree printer and derived `Drop` downstream.
     depth: u32,
+    /// Statement nesting depth: each nested block, if/else arm, or for body
+    /// costs one unit of [`MAX_BLOCK_DEPTH`], same rationale as the
+    /// expression cap — bounded recursion in parser, printer, and Drop.
+    block_depth: u32,
 }
 
 /// Maximum expression nesting depth. Counts parenthesis levels, unary
@@ -99,12 +103,20 @@ struct Parser {
 /// the 2 MiB stack of a tokio worker thread.
 const MAX_EXPR_DEPTH: u32 = 128;
 
+/// Maximum statement nesting depth. Counts nested blocks (`{ … }`), if/else
+/// chains (each `else if` recurses through [`Parser::parse_if_stmt`]), and
+/// for bodies. Far above any human or generated program (~10 in practice);
+/// sized like [`MAX_EXPR_DEPTH`] so even debug-build frames stay far inside
+/// the 2 MiB stack of a tokio worker thread.
+const MAX_BLOCK_DEPTH: u32 = 512;
+
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self {
             tokens,
             pos: 0,
             depth: 0,
+            block_depth: 0,
         }
     }
 
@@ -124,6 +136,22 @@ impl Parser {
 
     fn leave_expr(&mut self) {
         self.depth = self.depth.saturating_sub(1);
+    }
+
+    /// Enters one deeper statement-nesting level; errors past the cap.
+    fn enter_block(&mut self, open: Span) -> Result<(), ParseError> {
+        self.block_depth += 1;
+        if self.block_depth > MAX_BLOCK_DEPTH {
+            return Err(ParseError {
+                span: open,
+                msg: format!("block nesting too deep (limit {MAX_BLOCK_DEPTH} levels)"),
+            });
+        }
+        Ok(())
+    }
+
+    fn leave_block(&mut self) {
+        self.block_depth = self.block_depth.saturating_sub(1);
     }
 
     // -- token cursor helpers ------------------------------------------------
@@ -346,10 +374,12 @@ impl Parser {
 
     fn parse_block(&mut self) -> Result<Block, ParseError> {
         let open = self.expect(TokKind::LBrace, "`{`")?;
+        self.enter_block(open.span)?;
         let mut stmts = Vec::new();
         while !self.at(&TokKind::RBrace) && !self.peek().is_eof() {
             stmts.push(self.parse_stmt()?);
         }
+        self.leave_block();
         let close = self.expect(TokKind::RBrace, "`}` or statement")?;
         Ok(Block {
             stmts,
@@ -481,6 +511,18 @@ impl Parser {
     /// clause may itself be an if-statement ([`ElsePart::If`]).
     fn parse_if_stmt(&mut self) -> Result<Stmt, ParseError> {
         let start = self.expect_kw(Kw::If)?.span;
+        // Charge one level per if-statement: the `else if` chain recurses
+        // here (one frame per arm), and each arm's block adds its own level
+        // via parse_block.
+        self.enter_block(start)?;
+        let result = self.parse_if_rest(start);
+        self.leave_block();
+        result
+    }
+
+    /// Continuation of [`Parser::parse_if_stmt`] with the depth already
+    /// entered (so every early-return path stays balanced).
+    fn parse_if_rest(&mut self, start: Span) -> Result<Stmt, ParseError> {
         let cond = self.parse_expr()?;
         let then_blk = self.parse_block()?;
 
@@ -787,6 +829,21 @@ impl Parser {
     }
 }
 
+// -- private AST plumbing ---------------------------------------------------
+
+impl Type {
+    /// Wraps a scalar as a full type.
+    fn from_scalar(sc: ScalarType) -> Type {
+        match sc {
+            ScalarType::I32 => Type::I32,
+            ScalarType::I64 => Type::I64,
+            ScalarType::F32 => Type::F32,
+            ScalarType::F64 => Type::F64,
+            ScalarType::Bool => Type::Bool,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,8 +861,7 @@ mod tests {
         src.push('1');
         src.push_str(&")".repeat(100_000));
         src.push_str("; }");
-        let err = crate::parse_str(&src)
-            .expect_err("deep nesting must be rejected, not crash");
+        let err = crate::parse_str(&src).expect_err("deep nesting must be rejected, not crash");
         assert!(
             err.to_string().contains("nesting too deep"),
             "wrong error: {err}"
@@ -817,8 +873,7 @@ mod tests {
         let mut src = String::from("fn main() { let x = ");
         src.push_str(&"!".repeat(50_000));
         src.push_str("true; }");
-        let err = crate::parse_str(&src)
-            .expect_err("deep unary chain must be rejected, not crash");
+        let err = crate::parse_str(&src).expect_err("deep unary chain must be rejected, not crash");
         assert!(err.to_string().contains("nesting too deep"));
     }
 
@@ -846,19 +901,64 @@ mod tests {
     fn normal_expressions_unaffected_by_depth_tracking() {
         parse_ok("fn main() { let x = -(1 + 2) * -(3 - 4); print(x); }");
     }
-}
 
-// -- private AST plumbing ---------------------------------------------------
+    // -- statement nesting depth (blocks, if/else chains) -------------------
 
-impl Type {
-    /// Wraps a scalar as a full type.
-    fn from_scalar(sc: ScalarType) -> Type {
-        match sc {
-            ScalarType::I32 => Type::I32,
-            ScalarType::I64 => Type::I64,
-            ScalarType::F32 => Type::F32,
-            ScalarType::F64 => Type::F64,
-            ScalarType::Bool => Type::Bool,
+    fn nested_blocks(depth: usize) -> String {
+        let mut src = String::from("fn main() { ");
+        for _ in 0..depth {
+            src.push_str("{ let x = 1; ");
         }
+        for _ in 0..depth {
+            src.push('}');
+        }
+        src.push_str(" }");
+        src
+    }
+
+    #[test]
+    fn deeply_nested_blocks_error_cleanly_not_stack_overflow() {
+        // Regression: 100k `{ … }` levels recursed through parse_block and
+        // overflowed the native stack; now a clean ParseError.
+        let err = crate::parse_str(&nested_blocks(100_000))
+            .expect_err("deep block nesting must be rejected, not crash");
+        assert!(
+            err.to_string().contains("block nesting too deep"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_else_if_chain_errors_cleanly() {
+        // Each `else if` recurses through parse_if_stmt; a long chain must
+        // hit the same cap as blocks instead of overflowing the stack.
+        let mut src = String::from("fn main() { if true { print(1); }");
+        for _ in 1..100_000 {
+            src.push_str(" else if false { print(2); }");
+        }
+        src.push_str(" else { print(3); } }");
+        let err =
+            crate::parse_str(&src).expect_err("deep else-if chain must be rejected, not crash");
+        assert!(err.to_string().contains("block nesting too deep"));
+    }
+
+    #[test]
+    fn legal_block_nesting_well_below_cap_still_parses() {
+        // ~100 levels of mixed blocks + ifs: ordinary machine-generated code.
+        parse_ok(&nested_blocks(100));
+        let mut src = String::from("fn main() { ");
+        for i in 0..50 {
+            src.push_str(&format!("if {i} < 100 {{ print({i}); }} else {{ }} "));
+        }
+        src.push('}');
+        parse_ok(&src);
+    }
+
+    #[test]
+    fn normal_statements_unaffected_by_block_depth_tracking() {
+        parse_ok(
+            "fn main() { for i in 0..3 { if i > 1 { print(i); } else { print(-i); } } \
+             { let y = 2; print(y); } }",
+        );
     }
 }

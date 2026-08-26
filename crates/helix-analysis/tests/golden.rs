@@ -111,9 +111,15 @@ fn recurrence_is_sequential_with_distance_one_raw() {
     let Verdict::Sequential(reason) = &r.verdict else {
         panic!("expected Sequential, got {:?}", r.verdict);
     };
+    // Mixed read/write pair with SOLVED positive distance: the sink (write
+    // a[i] at iteration i) temporally follows the source (read a[i-1] at
+    // iteration i-1) — wait, reversed: the WRITE at i lands AFTER the READ
+    // at i+1 consumes it, so d>0 means the value flows forward: a genuine
+    // FLOW (RAW) dependence. Position alone would mislabel it WAR.
     assert!(reason.contains("RAW"), "reason: {reason}");
     assert!(reason.contains("distance 1"), "reason: {reason}");
     assert_eq!(r.raw_deps.len(), 1);
+    assert!(r.war_deps.is_empty());
     let edge = &r.raw_deps[0];
     assert_eq!(edge.distance, Some(1));
     assert_eq!(edge.direction, ">"); // sink after source
@@ -123,7 +129,7 @@ fn recurrence_is_sequential_with_distance_one_raw() {
         "names the array: {}",
         edge.explain
     );
-    assert!(r.war_deps.is_empty() && r.waw_deps.is_empty());
+    assert!(r.waw_deps.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -178,12 +184,20 @@ fn gcd_box_test_is_sequential() {
     let Verdict::Sequential(reason) = &r.verdict else {
         panic!("expected Sequential, got {:?}", r.verdict);
     };
-    assert!(reason.contains("RAW"), "reason: {reason}");
-    assert_eq!(r.raw_deps.len(), 1);
-    // a[2i] vs a[i]: distance not a single constant => None; the gcd/box
-    // test leaves all crossing directions open (`<=>`).
-    assert_eq!(r.raw_deps[0].distance, None);
-    assert_eq!(r.raw_deps[0].direction, "<=>");
+    // a[2i] = a[i] + 1: the battery leaves the pair UNSOLVED (distance None,
+    // directions `<=>`), so the kind follows ordered body position: the READ
+    // a[i] is spelled before the WRITE a[2*i] => WAR (anti). Physically this
+    // loop only flows forward (element 2j is written at iter j, read at iter
+    // 2j), but proving that needs the iteration range, which symbolic bounds
+    // withhold; both kinds veto DOALL identically, so the positional label
+    // honestly reflects what the analysis knows.
+    assert!(reason.contains("WAR"), "reason: {reason}");
+    assert_eq!(r.war_deps.len(), 1);
+    assert!(r.raw_deps.is_empty());
+    // Distance not a single constant => None; the gcd/box test leaves all
+    // crossing directions open (`<=>`).
+    assert_eq!(r.war_deps[0].distance, None);
+    assert_eq!(r.war_deps[0].direction, "<=>");
 }
 
 // ---------------------------------------------------------------------------
@@ -422,7 +436,8 @@ fn pure_builtin_calls_do_not_veto() {
     let li = find_loops(&funcs[typed.main_idx()]);
     let reps = analyze(&funcs[typed.main_idx()], &li);
     assert!(
-        reps.iter().any(|r| matches!(r.verdict, Verdict::SafeParallel)),
+        reps.iter()
+            .any(|r| matches!(r.verdict, Verdict::SafeParallel)),
         "pure-builtin loop should remain SAFE, got {:?}",
         reps.iter().map(|r| r.verdict.clone()).collect::<Vec<_>>()
     );
@@ -441,11 +456,7 @@ fn pure_builtin_calls_do_not_veto() {
 fn matmul_loop_forest_has_real_depths() {
     let v = analyze_example("matmul");
     assert!(v.reports.len() >= 4, "4 loops in main: init/i/j/k");
-    let depths: Vec<(usize, u32)> = v
-        .reports
-        .iter()
-        .map(|r| (r.loop_id, r.depth))
-        .collect();
+    let depths: Vec<(usize, u32)> = v.reports.iter().map(|r| (r.loop_id, r.depth)).collect();
     // Exactly one outermost nest level-1 chain: init at depth 1, i at 1,
     // j inside i at 2, k inside j at 3.
     let mut d1 = 0;
@@ -505,9 +516,21 @@ fn is_innermost(v: &LoopVerdicts, fi: usize, id: usize) -> bool {
     let info = &v.loops[fi];
     !info.loops.iter().any(|c| {
         c.id != id
-            && c.blocks.len() < info.loops.iter().find(|l| l.id == id).expect("id").blocks.len()
+            && c.blocks.len()
+                < info
+                    .loops
+                    .iter()
+                    .find(|l| l.id == id)
+                    .expect("id")
+                    .blocks
+                    .len()
             && c.blocks.iter().all(|b| {
-                info.loops.iter().find(|l| l.id == id).expect("id").blocks.contains(b)
+                info.loops
+                    .iter()
+                    .find(|l| l.id == id)
+                    .expect("id")
+                    .blocks
+                    .contains(b)
             })
     })
 }

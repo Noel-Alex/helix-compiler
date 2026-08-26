@@ -153,11 +153,17 @@ pub struct KernelDef {
 // HELIX sources
 // ---------------------------------------------------------------------------
 
-const SAXPY_SRC: &str = r#"// saxpy: y = s*x + y -- memory-bound streaming kernel (~24 B/elem moved)
+const SAXPY_SRC: &str = r#"// saxpy: y = s*x + y -- memory-bound streaming kernel (~24 B/elem moved).
+// Seeded deterministically (sign/fraction mix) so no execution pass can fold
+// the loop or pass a parity check vacuously; mirrors rust_twins::saxpy_inputs.
 fn main() {
     let n = 33554432;
     let x: [f64] = zeros(n);
     let y: [f64] = zeros(n);
+    for i in 0..n {
+        x[i] = ((i * 17 + 3) % 251) as f64 / 17.0 - 4.0;
+        y[i] = ((i * 29 + 11) % 241) as f64 / 19.0 - 5.0;
+    }
     let s = 2.5;
     for i in 0..n {
         y[i] = s * x[i] + y[i];
@@ -166,11 +172,16 @@ fn main() {
 }
 "#;
 
-const SCALE_SRC: &str = r#"// scale: out = s*a -- independent iterations -> SAFE parallel (~16 B/elem)
+const SCALE_SRC: &str = r#"// scale: out = s*a -- independent iterations -> SAFE parallel (~16 B/elem).
+// Seeded deterministically (mirrors rust_twins::scale_inputs) so the checked
+// element is a nonzero signed fraction, not the all-zero vacuity.
 fn main() {
     let n = 33554432;
     let a: [f64] = zeros(n);
     let out: [f64] = zeros(n);
+    for i in 0..n {
+        a[i] = ((i * 13 + 5) % 199) as f64 / 7.0 - 12.0;
+    }
     for i in 0..n {
         out[i] = a[i] * 5.0;
     }
@@ -178,11 +189,18 @@ fn main() {
 }
 "#;
 
-const DOT_SRC: &str = r#"// dot product: +-reduction over products of two arrays (FP sum reassociates)
+const DOT_SRC: &str = r#"// dot product: +-reduction over products of two arrays (FP sum reassociates).
+// Both operands are seeded with sign-mixed fractions (mirroring
+// rust_twins::dot_inputs) so partial products cancel — a zero-initialized
+// pair would make every broken kernel print the "right" 0.
 fn main() {
     let n = 16777216;
     let a: [f64] = zeros(n);
     let b: [f64] = zeros(n);
+    for i in 0..n {
+        a[i] = ((i * 7 + 1) % 97) as f64 / 9.0 - 4.0;
+        b[i] = ((i * 11 + 2) % 89) as f64 / 11.0 - 3.0;
+    }
     let dot = 0.0;
     for i in 0..n {
         dot = dot + a[i] * b[i];
@@ -395,7 +413,10 @@ pub fn registry() -> Vec<KernelDef> {
             sizes: STREAM_SIZES,
             expected_verdict: ExpectedVerdict::SafeParallel,
             tolerance: Tolerance::Exact,
-            expected_printed: &["0.0"],
+            // a[42]: 42*13+5 = 551, 551 % 199 = 153 -> 153/7 - 12 ~= 9.857;
+            // out[42] = 5 * that ~= 49.286 (exact f64 pinned by the
+            // rust_twins::scale oracle test).
+            expected_printed: &["49.28571428571429"],
             correctness_only: false,
             interp_max_size: 262144,
         },
@@ -407,7 +428,11 @@ pub fn registry() -> Vec<KernelDef> {
             sizes: STREAM_SIZES,
             expected_verdict: ExpectedVerdict::SafeParallel,
             tolerance: Tolerance::Exact,
-            expected_printed: &["0.0"],
+            // x[7]: 7*17+3 = 122, 122 % 251 = 122 -> 122/17 - 4 ~= 3.176;
+            // y[7]: 7*29+11 = 214 -> 214/19 - 5 ~= 6.263;
+            // y'[7] = 2.5*x[7] + y[7] ~= 14.204 (exact f64 pinned by the
+            // rust_twins::saxpy oracle test).
+            expected_printed: &["14.204334365325078"],
             correctness_only: false,
             interp_max_size: 262144,
         },
@@ -419,7 +444,9 @@ pub fn registry() -> Vec<KernelDef> {
             sizes: &[65_536, 4_194_304],
             expected_verdict: ExpectedVerdict::ReductionParallel,
             tolerance: Tolerance::RelEps(1e-9),
-            expected_printed: &["0.0"],
+            // Interpreter sum over the seeded pair at n=4096; independently
+            // recomputed by rust_twins (see dot_inputs' oracle test).
+            expected_printed: &["5206.808080808095"],
             correctness_only: false,
             interp_max_size: 400000,
         },

@@ -15,7 +15,8 @@
 //! 3. **Sampling**: [`K`] = 15 timed samples, each `R` inner reps.
 //! 4. **Quality gate**: coefficient of variation = stddev/mean; above 5% the
 //!    whole sampling stage reruns **once** (methodology rec. 2) and the
-//!    tighter set wins.
+//!    strictly tighter set wins — a noisier rerun never replaces the
+//!    originals.
 //!
 //! # Interleaving
 //!
@@ -135,22 +136,27 @@ pub fn cv_of(values: &[f64]) -> Option<f64> {
 /// overshoots [`SAMPLE_MAX_MS`] it halves once to land inside the window
 /// (only exact when durations scale linearly, which they do here since each
 /// rep is identical work). Callers may pass `min_reps = 1`.
-#[must_use]
-pub fn pick_reps<F: FnMut(u32) -> Duration>(mut run_batch: F) -> u32 {
+///
+/// # Errors
+/// Propagates the first batch failure verbatim — a pilot whose code cannot
+/// execute has no rep count worth freezing.
+pub fn pick_reps<F: FnMut(u32) -> Result<Duration, String>>(
+    mut run_batch: F,
+) -> Result<u32, String> {
     let mut reps: u32 = 1;
     loop {
-        let t = run_batch(reps);
+        let t = run_batch(reps)?;
         if t.as_secs_f64() * 1_000.0 >= PILOT_TARGET_MS {
             // Overshoot correction: linear back-off toward the window.
             let secs = t.as_secs_f64();
             let ideal = (reps as f64 * (SAMPLE_MIN_MS / 1000.0) / secs).ceil();
             let clamped = ideal.clamp(1.0, (reps as f64) * (SAMPLE_MAX_MS / SAMPLE_MIN_MS));
-            return clamped.max(1.0) as u32;
+            return Ok(clamped.max(1.0) as u32);
         }
         // Cap the geometric growth: beyond ~2^24 reps something is wrong
         // (e.g. a closure that does nothing); bail out rather than spin.
         if reps >= 1 << 24 {
-            return reps;
+            return Ok(reps);
         }
         reps = reps.saturating_mul(2);
     }
@@ -172,7 +178,10 @@ fn time_batch(f: &dyn Fn(), reps: u32) -> Duration {
 /// codegen and microarchitectural state, not allocator growth.
 #[must_use]
 pub fn measure(f: impl Fn()) -> Measurement {
-    measure_with_reps(|r| time_batch(&f, r))
+    // Plain closures cannot fail; fallible variants call
+    // `measure_with_reps` directly and handle the error.
+    measure_with_reps(|r| Ok(time_batch(&f, r)))
+        .expect("infallible closure cannot fail")
 }
 
 /// Like [`measure`] but the closure receives the rep count (lets drivers
@@ -180,14 +189,19 @@ pub fn measure(f: impl Fn()) -> Measurement {
 ///
 /// The pilot runs first (picking `R`), then [`WARMUPS`] untimed batches at
 /// `R`, then up to two sampling rounds gated by the CV threshold.
-#[must_use]
-pub fn measure_with_reps(run: impl Fn(u32) -> Duration) -> Measurement {
+///
+/// # Errors
+/// Propagates the closure's first execution failure verbatim — a variant that
+/// cannot run must never contribute samples to any measurement.
+pub fn measure_with_reps(
+    run: impl Fn(u32) -> Result<Duration, String>,
+) -> Result<Measurement, String> {
     // -- pilot ---------------------------------------------------------
-    let reps = pick_reps(&run);
+    let reps = pick_reps(&run)?;
 
     // -- warmups (untimed) ----------------------------------------------
     for _ in 0..WARMUPS {
-        let _ = std::hint::black_box(run(reps));
+        std::hint::black_box(run(reps)?);
     }
 
     // -- sampling, with one CV-gated rerun -------------------------------
@@ -196,8 +210,9 @@ pub fn measure_with_reps(run: impl Fn(u32) -> Duration) -> Measurement {
     for attempt in 0..2 {
         let mut per_rep_ms = Vec::with_capacity(K_SAMPLES);
         for _ in 0..K_SAMPLES {
-            per_rep_ms
-                .push(black_box_duration(run(reps)).as_secs_f64() / f64::from(reps) * 1_000.0);
+            per_rep_ms.push(
+                black_box_duration(run(reps)?).as_secs_f64() / f64::from(reps) * 1_000.0,
+            );
         }
         let m = summarize(per_rep_ms, reps, reran_for_cv || attempt > 0);
         match &best {
@@ -213,12 +228,10 @@ pub fn measure_with_reps(run: impl Fn(u32) -> Duration) -> Measurement {
     }
     // Honesty: once a rerun ran, the SURVIVING measurement must record it
     // even when the original batch won (mirrors run_interleaved's else arm).
-    if reran_for_cv {
-        if let Some(m) = best.as_mut() {
-            m.reran_for_cv = true;
-        }
+    if reran_for_cv && let Some(m) = best.as_mut() {
+        m.reran_for_cv = true;
     }
-    best.unwrap_or_else(|| summarize(Vec::new(), reps, false))
+    Ok(best.unwrap_or_else(|| summarize(Vec::new(), reps, false)))
 }
 
 /// Small helper mirroring `std::hint::black_box` for durations so the
@@ -259,21 +272,35 @@ fn summarize(mut per_rep_ms: Vec<f64>, reps: u32, reran: bool) -> Measurement {
 /// variant proportionally instead of only whichever finished last.
 ///
 /// Returns one [`Measurement`] per variant, in input order.
-#[must_use]
-pub fn run_interleaved<F>(variants: &[&str], sample_once: F) -> Vec<Measurement>
+///
+/// # Errors
+/// Propagates the first failing variant's error text (tagged with the
+/// variant's name) — a variant that fails mid-sampling aborts the round
+/// instead of silently contributing garbage or missing samples.
+pub fn run_interleaved<F>(variants: &[&str], mut sample_once: F) -> Result<Vec<Measurement>, String>
 where
-    F: Fn(usize, u32) -> Duration,
+    F: FnMut(usize, u32) -> Result<Duration, String>,
 {
     // Per-variant pilot + warmup phase (untimed by us; the closures time
     // their own batches). Each variant pilots with its OWN index — rep
     // counts differ by orders of magnitude between interp and native.
+    let mut pilot_err = None;
     let reps: Vec<u32> = (0..variants.len())
-        .map(|vi| pick_reps(|r| sample_once(vi, r)))
+        .map(|vi| match pick_reps(|r| sample_once(vi, r)) {
+            Ok(r) => r,
+            Err(e) => {
+                pilot_err.get_or_insert_with(|| format!("{}: {e}", variants[vi]));
+                0
+            }
+        })
         .collect();
+    if let Some(e) = pilot_err {
+        return Err(e);
+    }
 
     for (vi, _) in variants.iter().enumerate() {
         for _ in 0..WARMUPS {
-            let _ = std::hint::black_box(sample_once(vi, reps[vi]));
+            std::hint::black_box(sample_once(vi, reps[vi])?);
         }
     }
 
@@ -281,26 +308,30 @@ where
     let mut buckets: Vec<Vec<f64>> = vec![Vec::with_capacity(K_SAMPLES); variants.len()];
     for _ in 0..K_SAMPLES {
         for (vi, _) in variants.iter().enumerate() {
-            let d = black_box_duration(sample_once(vi, reps[vi]));
+            let d = black_box_duration(sample_once(vi, reps[vi])?);
             buckets[vi].push(d.as_secs_f64() / f64::from(reps[vi]) * 1_000.0);
         }
     }
 
     // CV gate per variant: rerun just the offending variant's bucket once,
     // sampling that same variant's closure again.
-    buckets
+    Ok(buckets
         .into_iter()
         .zip(reps)
         .enumerate()
         .map(|(vi, (bucket, reps))| {
             let mut m = summarize(bucket, reps, false);
             if m.cv > CV_RERUN_THRESHOLD {
-                let retry: Vec<f64> = (0..K_SAMPLES)
-                    .map(|_| {
-                        black_box_duration(sample_once(vi, reps)).as_secs_f64() / f64::from(reps)
-                            * 1_000.0
+                let retry: Result<Vec<f64>, String> = (0..K_SAMPLES)
+                    .map(|_| -> Result<f64, String> {
+                        Ok(
+                            black_box_duration(sample_once(vi, reps)?).as_secs_f64()
+                                / f64::from(reps)
+                                * 1_000.0,
+                        )
                     })
                     .collect();
+                let retry = retry?;
                 let alt = summarize(retry, reps, true);
                 if alt.cv < m.cv {
                     m = alt;
@@ -308,9 +339,9 @@ where
                     m.reran_for_cv = true;
                 }
             }
-            m
+            Ok(m)
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?)
 }
 
 #[cfg(test)]
@@ -346,12 +377,18 @@ mod tests {
     fn pick_reps_scales_with_closure_cost() {
         // A closure costing ~10 ms per rep should settle near 100-250 ms /
         // 10 ms = 10-25 reps.
-        let cost = |reps: u32| Duration::from_nanos(u64::from(reps) * 10_000_000);
-        let r = pick_reps(cost);
+        let cost = |reps: u32| Ok(Duration::from_nanos(u64::from(reps) * 10_000_000));
+        let r = pick_reps(cost).unwrap();
         assert!((10..=25).contains(&r), "picked {r}");
         // An instant closure hits the growth cap instead of spinning forever.
-        let fast = pick_reps(|_: u32| Duration::ZERO);
+        let fast = pick_reps(|_: u32| Ok(Duration::ZERO)).unwrap();
         assert!(fast >= 1 << 20, "instant closure picked {fast}");
+    }
+
+    #[test]
+    fn pick_reps_propagates_batch_errors() {
+        let err = pick_reps(|_: u32| Err("boom".to_string())).unwrap_err();
+        assert_eq!(err, "boom");
     }
 
     #[test]
@@ -379,6 +416,188 @@ mod tests {
     }
 
     #[test]
+    fn failing_variant_aborts_the_round_with_its_name() {
+        // Variant 1 fails during its PILOT: the driver must surface the error
+        // (tagged with the variant's name), never fabricate measurements for
+        // it or silently drop it from the round.
+        let runs_before_err = std::cell::Cell::new(0u32);
+        let err = run_interleaved(&["good", "broken"], |vi, _| {
+            if vi == 1 {
+                Err("segv in jitted code".to_string())
+            } else {
+                runs_before_err.set(runs_before_err.get() + 1);
+                Ok(Duration::from_millis(1))
+            }
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("broken") && err.contains("segv"),
+            "error must name the failing variant and cause: {err}"
+        );
+    }
+
+    #[test]
+    fn mid_sampling_failure_propagates_too() {
+        // A variant that survives its pilot but fails once sampling starts:
+        // the whole round aborts rather than emitting a short bucket.
+        let calls = std::cell::Cell::new(0u32);
+        let err = run_interleaved(&["flaky"], |_, _| {
+            calls.set(calls.get() + 1);
+            // pilot(1 call reaching target is impossible; cap path) + warmups +
+            // a few samples, then fail.
+            if calls.get() > 10 {
+                Err("late crash".to_string())
+            } else {
+                Ok(Duration::from_millis(150))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err, "late crash");
+    }
+
+    // -- CV-rerun contract ----------------------------------------------------
+    //
+    // Regression tests for the adversarial-review finding: a CV-gated rerun
+    // must REPLACE the original samples only when the rerun is STRICTLY
+    // tighter, and must never keep a statistically worse set. The closures are
+    // fully scripted (call-count keyed), so both batches' statistics are
+    // known exactly and the winner is decidable without any real timing.
+    //
+    // Call layout for every script (reps freeze at 1 via the 150 ms pilot):
+    // call 0 = pilot, 1..=3 = warmups, 4..=18 = sample batch 1,
+    // 19.. = sample batch 2 (the rerun).
+
+    /// Batch alternating 80/120 ms: population stddev 20 over mean ~98.67,
+    /// CV ~0.20 — comfortably above [`CV_RERUN_THRESHOLD`].
+    fn noisy_80_120(n: usize) -> f64 {
+        if (n - 4) % 2 == 0 { 80.0 } else { 120.0 }
+    }
+
+    #[test]
+    fn cv_rerun_replaces_originals_when_strictly_tighter() {
+        let calls = std::cell::Cell::new(0usize);
+        let m = measure_with_reps(|_| {
+            let n = calls.get();
+            calls.set(n + 1);
+            let ms = match n {
+                0 => 150.0,
+                1..=3 => 100.0,
+                4..=18 => noisy_80_120(n),
+                _ => 90.0, // rerun: perfectly flat, CV 0
+            };
+            Ok(Duration::from_millis(ms as u64))
+        })
+        .unwrap();
+        assert!(m.reran_for_cv, "gate tripped; the rerun must be recorded");
+        assert!(
+            m.cv <= CV_RERUN_THRESHOLD,
+            "tight rerun must win: cv {}",
+            m.cv
+        );
+        assert_eq!(m.median_ms, 90.0, "stats must come from the rerun batch");
+        assert!(m.samples_ms.iter().all(|&x| x == 90.0));
+    }
+
+    #[test]
+    fn cv_rerun_never_keeps_a_statistically_worse_batch() {
+        // Inverse script: the rerun comes back noisier (60/140 -> CV ~0.41)
+        // than the originals (CV ~0.20). The ORIGINAL batch must survive
+        // untouched; only the honesty flag flips.
+        let calls = std::cell::Cell::new(0usize);
+        let m = measure_with_reps(|_| {
+            let n = calls.get();
+            calls.set(n + 1);
+            let ms = match n {
+                0 => 150.0,
+                1..=3 => 100.0,
+                4..=18 => noisy_80_120(n),
+                _ => {
+                    if n % 2 == 0 {
+                        60.0
+                    } else {
+                        140.0
+                    }
+                }
+            };
+            Ok(Duration::from_millis(ms as u64))
+        })
+        .unwrap();
+        assert!(m.reran_for_cv, "a rerun ran and must be recorded");
+        assert!(
+            m.cv > CV_RERUN_THRESHOLD,
+            "kept-batch honesty: cv {}",
+            m.cv
+        );
+        assert_eq!(
+            m.median_ms, 80.0,
+            "original batch must survive a noisier rerun (its median is 80)"
+        );
+        assert!(
+            m.samples_ms.iter().all(|&x| x == 80.0 || x == 120.0),
+            "no rerun sample may leak into the kept set"
+        );
+    }
+
+    #[test]
+    fn interleaved_cv_gate_replaces_bucket_when_retry_is_tighter() {
+        let flaky_calls = std::cell::Cell::new(0usize);
+        let out = run_interleaved(&["stable", "flaky"], |vi, _| {
+            if vi == 0 {
+                return Ok(Duration::from_millis(50)); // flat: never trips
+            }
+            let n = flaky_calls.get();
+            flaky_calls.set(n + 1);
+            let ms = match n {
+                0 => 150.0,
+                1..=3 => 100.0,
+                4..=18 => noisy_80_120(n),
+                _ => 90.0,
+            };
+            Ok(Duration::from_millis(ms as u64))
+        })
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(!out[0].reran_for_cv);
+        assert!(out[0].cv <= CV_RERUN_THRESHOLD);
+        assert!(out[1].reran_for_cv);
+        assert!(out[1].cv <= CV_RERUN_THRESHOLD, "{}", out[1].cv);
+        assert_eq!(out[1].median_ms, 90.0, "tight retry must replace");
+    }
+
+    #[test]
+    fn interleaved_cv_gate_keeps_bucket_when_retry_is_worse() {
+        let calls = std::cell::Cell::new(0usize);
+        let out = run_interleaved(&["lucky-noise"], |_, _| {
+            let n = calls.get();
+            calls.set(n + 1);
+            let ms = match n {
+                0 => 150.0,
+                1..=3 => 100.0,
+                4..=18 => noisy_80_120(n),
+                _ => {
+                    if n % 2 == 0 {
+                        60.0
+                    } else {
+                        140.0
+                    }
+                }
+            };
+            Ok(Duration::from_millis(ms as u64))
+        })
+        .unwrap();
+        let m = &out[0];
+        assert!(m.reran_for_cv, "the gate fired; flag must say so");
+        assert_eq!(
+            m.median_ms, 80.0,
+            "original bucket must survive a noisier retry (its median is 80)"
+        );
+        assert!(
+            m.samples_ms.iter().all(|&x| x == 80.0 || x == 120.0),
+            "retry samples must be discarded"
+        );
+    }
+
+    #[test]
     fn run_interleaved_returns_one_measurement_per_variant() {
         // Variant 0 "costs" 5 ms/rep, variant 1 costs 1 ms/rep.
         let out = run_interleaved(&["slow", "fast"], |vi, reps| {
@@ -387,8 +606,9 @@ mod tests {
             } else {
                 Duration::from_millis(1)
             };
-            per * reps
-        });
+            Ok::<Duration, String>(per * reps)
+        })
+        .unwrap();
         assert_eq!(out.len(), 2);
         assert!(
             out[0].median_ms > out[1].median_ms * 3.0,
@@ -406,8 +626,9 @@ mod tests {
         let seen = std::cell::RefCell::new(Vec::new());
         let out = run_interleaved(&["only"], |vi, reps| {
             seen.borrow_mut().push(vi);
-            Duration::from_millis(1) * reps.max(1)
-        });
+            Ok(Duration::from_millis(1) * reps.max(1))
+        })
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert!(seen.borrow().iter().all(|&vi| vi == 0), "bad index seen");
     }

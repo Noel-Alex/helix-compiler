@@ -1,0 +1,36 @@
+# CI for HELIX Lite — Windows only for now: CALL_CONV is WindowsFastcall, so
+# a Linux runner would not build the JIT; portability comes later.
+#
+# Test parallelism is capped (RUST_TEST_THREADS=4): the JIT's trap-recorder
+# tests flake under high thread counts on loaded CI machines.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      RUST_TEST_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo build --release
+        run: cargo build --release --workspace

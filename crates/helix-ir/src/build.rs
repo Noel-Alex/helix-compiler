@@ -39,14 +39,10 @@
 //! (`let y = x`) — HELIX has no move instruction. It lowers to the identity
 //! computation `y = x + 0`; downstream `copy_prop` removes the arithmetic.
 //!
-//! # Known upstream interface gap
-//!
-//! `helix_sema::TypedExprKind::Call` wraps a `CallTarget` that records the
-//! callee but **not the argument expressions** (sema type-checks arguments
-//! and discards them). Until sema is extended, this builder emits
-//! `Inst::Call` with an empty scalar `args` list; the callee, destination and
-//! array references (`zeros`) are modelled faithfully. Everything else about
-//! the lowering is complete.
+//! Calls lower completely: sema's [`helix_sema::CallTarget`] carries typed
+//! argument subtrees, and this builder evaluates them into SSA values for
+//! both user functions and builtins (with array references spelled through
+//! `arr_refs` for `zeros`).
 
 use std::collections::HashSet;
 
@@ -214,26 +210,19 @@ fn build_fn(program: &TypedProgram, fidx: usize) -> FuncIr {
     // Close the tail. Cases:
     //   * the body ended with `return` — control funneled into the exit block
     //     already;
-    //   * the body fell through — a value function is rejected by sema, but we
-    //     keep the IR total by jumping to the exit; a unit function gets the
-    //     implicit `return;`.
+    //   * the body fell through — legal only for a unit function, which gets
+    //     the implicit `return;`. Sema guarantees value functions never fall
+    //     off the end; a violation is a frontend bug and must not be masked by
+    //     synthesizing a zero.
     if !b.terminated() {
-        if f.ret == Ty::Unit {
-            let v = None;
-            b.finish_return(v);
-        } else {
-            let zero = b.val(f.ret);
-            b.emit(Inst::Const {
-                dst: zero,
-                c: match f.ret {
-                    Ty::I32 => Constant::I32(0),
-                    Ty::F32 => Constant::F32(0.0),
-                    Ty::F64 => Constant::F64(0.0),
-                    _ => Constant::I64(0),
-                },
-            });
-            b.finish_return(Some(zero));
+        if f.ret != Ty::Unit {
+            panic!(
+                "internal error: sema guaranteed all paths return; violated for '{}' (falls off end of a -> {:?} function)",
+                f.name, f.ret
+            );
         }
+        let v = None;
+        b.finish_return(v);
     }
     // Terminate the shared exit block now that every return edge is known.
     b.close_exit();
@@ -759,10 +748,16 @@ impl Builder {
         };
         self.branch(cond, then_b, else_b);
 
+        // Did control ever resume at the merge? With no else arm the false
+        // edge lands on the merge directly, so it stays live regardless of
+        // the then-branch; only an explicit arm that exits can leave it dead.
+        let mut merged = f.else_arm.is_none();
+
         self.cur = then_b;
         self.block(&f.then_blk);
         if !self.terminated() {
             self.jump(merge);
+            merged = true;
         }
 
         if let Some(arm) = &f.else_arm {
@@ -773,10 +768,19 @@ impl Builder {
             }
             if !self.terminated() {
                 self.jump(merge);
+                merged = true;
             }
         }
 
         self.cur = merge;
+        if !merged {
+            // Both arms exited: the merge is unreachable, and execution can
+            // never resume after the `if`. Terminate it like any other return
+            // site so the builder's every-block-terminated invariant holds and
+            // the enclosing block stops emitting (statements here are dead).
+            // to_ssa / simplify_cfg strip the dead region afterwards.
+            self.finish_return(None);
+        }
     }
 
     /// Canonical for-loop lowering (see module docs). `start` defines the iv
