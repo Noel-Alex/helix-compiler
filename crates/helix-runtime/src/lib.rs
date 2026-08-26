@@ -55,6 +55,11 @@ use schedule::SchedKind;
 /// Byte stride between per-participant reduction accumulator cells.
 pub const REDUCTION_CELL_STRIDE: usize = reduction::CELL_STRIDE;
 
+/// Byte offset of the accumulator field INSIDE a participant cell (word 0
+/// holds the shared-ctx pointer). Single source of truth: helix-backend's
+/// emitter and dispatcher must import this constant, never restate it.
+pub const REDUCTION_ACC_OFFSET: usize = reduction::ACC_OFFSET;
+
 /// Iterations below this per participant are not worth a fork/join.
 ///
 /// Public mirror of [`config::GRAIN`] so benches/docs can cite one number:

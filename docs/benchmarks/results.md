@@ -1,7 +1,7 @@
 # Benchmark Campaign Results (2026-08-25, laptop run)
 
 Machine: user's Windows 11 laptop · rustc 1.98.0 · Cranelift 0.135 · measured STREAM-triad
-ceiling **23.1 GB/s** (single-threaded, in-process). Raw JSON:
+ceiling **23.1 GiB/s** (single-threaded, in-process). Raw JSON:
 [data/campaign.json](data/campaign.json) · figures: [figs/](figs/) · protocol:
 [ methodology.md](methodology.md).
 
@@ -23,12 +23,14 @@ dot@65K 21.5→1.4 ms, matmul@128 1412.6→5.6 ms.
 ## Parallel scaling (the headline chart)
 
 - **saxpy @16M f64**: peaks at **4.13× with 8 threads**, then decays (16T: 4.01×,
-  32T: 2.52×). Textbook bandwidth-bound behavior: 24 MB moved per pass ÷ measured time ≈
-  **9.9 GB/s at 1 thread → ~41 GB/s apparent at 8 threads** — wait, above the triad
-  ceiling? No: saxpy reads two arrays and writes one (3 streams), the triad ceiling is
-  itself a 3-stream kernel; the 1-thread saxpy baseline already achieves ~500 MB/47.9 ms
-  ≈ 10 GB/s of pure DRAM traffic, and 8 threads push total traffic to ~2.2 GB / 11.6 ms —
-  consistent with saturating the same ceiling that limits everyone.
+  32T: 2.52×). Textbook bandwidth-bound behavior: one saxpy pass over N=16,777,216
+  f64 elements moves exactly 24 B/elem (read x, read y, write y) = **402.7 MB
+  (384 MiB) total per pass regardless of thread count** — threads divide the work,
+  they do not multiply the traffic. The 1-thread baseline's ~47.9 ms therefore
+  corresponds to ≈8.4 GiB/s, and the 4.13× point reaches ≈34.7 GiB/s against the
+  measured triad reference of 23.1 GiB/s @1T / higher @8T — saxpy at 8 threads
+  saturating past its own single-thread triad row is expected, which is why the
+  campaign now records ceilings at BOTH widths (`triad_ceilings`).
 - **dot product @4.2M**: best scaling kernel — **4.70× @ 24 threads** (read-only traffic,
   less write-allocate pressure).
 - **minmax**: flat ~1.0× — the loop carries TWO accumulators (lo+hi), which the region

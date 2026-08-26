@@ -99,7 +99,9 @@ pub(crate) const NTHREADS_HINT: i64 = 8;
 #[allow(dead_code)] // self-documenting counterpart of the accumulator offset
 const CELL_CTX_OFF: i64 = 0;
 /// Byte offset of the private accumulator inside a participant cell.
-const CELL_ACC_OFF: i64 = 8;
+///
+/// Single source of truth: imported from helix-runtime (see REDUCTION_ACC_OFFSET).
+const CELL_ACC_OFF: i64 = helix_runtime::REDUCTION_ACC_OFFSET as i64;
 
 // ---------------------------------------------------------------------------
 // Host-symbol registration (engine side)
@@ -659,14 +661,8 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
     };
     // Split view: the first three fields feed seed/capture bookkeeping; the
     // fourth is the chain result the latch must store back to the private cell.
-    let acc3: Option<(ValueId, LocalId, ValueId)> = match &acc {
-        Some((d, v, e, _)) => Some((*d, *v, *e)),
-        None => None,
-    };
-    let acc_back: Option<ValueId> = match &acc {
-        Some((_, _, _, b)) => Some(*b),
-        None => None,
-    };
+    let acc3: Option<(ValueId, LocalId, ValueId)> = acc.as_ref().map(|(d, v, e, _)| (*d, *v, *e));
+    let acc_back: Option<ValueId> = acc.as_ref().map(|(_, _, _, b)| *b);
 
     // ---- arrays + scalar uses inside the loop ----------------------------------
     let mut arrs: Vec<LocalId> = Vec::new();
@@ -765,16 +761,21 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
         next_off += 8;
     }
 
-    // Reduction seed bookkeeping: which scalar word holds the seed.
+    // Reduction seed bookkeeping: which scalar word holds the seed. The
+    // width/floatness describe the ACCUMULATOR (the cell field being seeded),
+    // not the capture slot — captures are widened to 8-byte words for every
+    // scalar type, but an f32 accumulator's cell field is 4 bytes wide.
     let seed = acc3.and_then(|(_, _, entry_arg)| {
-        layout
-            .scalars
-            .iter()
-            .position(|(sid, _, _, _)| *sid == entry_arg.0)
-            .map(|k| {
-                let (_, w, f, off) = layout.scalars[k];
-                (layout.seed_word_at(off), w, f)
-            })
+        spec.map(|s| (s.width, s.float)).and_then(|(aw, af)| {
+            layout
+                .scalars
+                .iter()
+                .position(|(sid, _, _, _)| *sid == entry_arg.0)
+                .map(|k| {
+                    let (_, _, _, off) = layout.scalars[k];
+                    (layout.seed_word_at(off), aw, af)
+                })
+        })
     });
 
     // ---- bounds -----------------------------------------------------------------
@@ -786,8 +787,9 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
     let (end_ssa, end_const) = bound_of(end_val);
 
     // ---- build the body IR ---------------------------------------------------------
-    let (body, prebind) =
-        build_body_ir(ir, hdr, &loop_set, latch, iv_phi, &acc3, acc_back, spec, &layout)?;
+    let (body, prebind) = build_body_ir(
+        ir, hdr, &loop_set, latch, iv_phi, &acc3, acc_back, spec, &layout,
+    )?;
 
     planned.exit = exit_b;
     planned.body = Some(body);
@@ -1149,7 +1151,10 @@ fn build_body_ir(
         return None; // body IR failed verification
     }
     if std::env::var_os("HELIX_DUMP_BODY").is_some() {
-        eprintln!("=== extracted body ===\n{}", helix_ir::print_ir(&body, true));
+        eprintln!(
+            "=== extracted body ===\n{}",
+            helix_ir::print_ir(&body, true)
+        );
     }
     Some((body, prebind))
 }

@@ -77,10 +77,13 @@ Full tables + methodology: [docs/benchmarks/results.md](docs/benchmarks/results.
 ## Try it
 
 ```bash
-cargo run --release -p helix-cli -- observe     # the Observatory web UI
-helix run examples/saxpy.hx                     # interpreter
-helix run --backend jit examples/saxpy.hx       # JIT (identical output)
-helix selftest                                  # differential gauntlet
+# one-time: put `helix` on your PATH (or prefix every command with cargo run --release -p helix-cli --)
+cargo install --path crates/helix-cli
+
+helix observe            # the Observatory web UI (blocks this terminal; Ctrl-C to stop)
+helix run examples/saxpy.hx                    # interpreter
+helix run --backend jit examples/saxpy.hx      # JIT (identical output)
+helix selftest           # differential gauntlet
 ```
 
 Handy controls:
