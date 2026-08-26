@@ -164,8 +164,11 @@ fn min_div_minus_one_overflow_edge_traps() {
 #[test]
 fn healthy_program_records_no_trap() {
     let src = "fn main() {\n    let a: [i64] = zeros(2);\n    a[1] = 6;\n    print(a[1]);\n    print(8 / 2);\n}\n";
-    let _guard = helix_backend::testutil::serial_lock();
+    // jit_prints holds serial_lock for its whole run (std Mutex is not
+    // reentrant — acquiring it here too would self-deadlock). The recorder
+    // check afterwards re-takes the lock briefly; no engine is running then.
     assert_eq!(jit_prints(src), vec!["6", "4"]);
+    let _guard = helix_backend::testutil::serial_lock();
     assert_eq!(
         helix_backend::testutil::take_last_trap(),
         None,

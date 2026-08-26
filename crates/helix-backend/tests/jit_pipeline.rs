@@ -595,7 +595,8 @@ fn parallel_dot_reduction_int_exact() {
 fn parallel_dot_reduction_f64_within_eps() {
     // FP reduction: parallel combination may reassociate, so compare against
     // the sequential sum within a tight relative epsilon.
-    let _guard = helix_backend::testutil::serial_lock();
+    // (No direct serial_lock here — jit_lines_with_plan already holds it,
+    // and std::sync::Mutex is not reentrant.)
     let src = r#"
         fn main() {
             let n = 100000;
@@ -666,7 +667,8 @@ fn helix_nthreads_1_and_8_identical_integer_output() {
             print(a[99999]);
         }
     "#;
-    let _guard = helix_backend::testutil::serial_lock();
+    // jit_lines_with_plan holds serial_lock itself; no direct acquisition
+    // here (std Mutex is not reentrant — a second lock self-deadlocks).
     unsafe { std::env::set_var("HELIX_NTHREADS", "1") };
     let one = jit_lines_with_plan(src).0;
     unsafe { std::env::set_var("HELIX_NTHREADS", "8") };
@@ -1002,7 +1004,7 @@ fn f32_min_reduction_seed_survives_roundtrip() {
 /// mask a bit-pattern bug.
 #[test]
 fn f32_sum_reduction_round_trips_native_width() {
-    let _guard = helix_backend::testutil::serial_lock();
+    // jit_lines_with_plan holds serial_lock; do not re-acquire.
     let src = r#"
         fn main() {
             let n = 100;
