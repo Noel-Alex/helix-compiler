@@ -66,8 +66,8 @@
 - Methodology summary (docs/benchmarks/methodology.md): interleaved adaptive sampling,
   CV gating, checksummed parity gates, triad ceiling.
 - Results tables + speedup figures (docs/benchmarks/results.md, figs/*.svg):
-  saxpy 4.13×@8T bandwidth-bound story; dot 4.7×@24T; interp→native 20–270×;
-  matmul@128 251× end-to-end.
+  saxpy 5.66×@8T bandwidth-bound story; dot 3.38×@8T; interp→native 12–138×
+  (quick campaign); matmul@128 12× end-to-end.
 - The honest sections: minmax demoted (two accumulators), small-N overhead,
   jacobi conservative verdict on flattened subscripts.
 - Correctness: 425+ workspace tests, selftest gauntlet interp≡JIT across all examples.

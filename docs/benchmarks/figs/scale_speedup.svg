@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" font-family="ui-monospace,Consolas" font-size="12">
+<text x="320.0" y="20" text-anchor="middle" fill="#e6edf3">scale: speedup vs threads</text>
+<rect width="640" height="400" fill="#161b22"/>
+<line x1="60" y1="350.0" x2="620" y2="350.0" stroke="#30363d"/><text x="52" y="354.0" text-anchor="end" fill="#8b949e">0</text>
+<line x1="60" y1="246.7" x2="620" y2="246.7" stroke="#30363d"/><text x="52" y="250.7" text-anchor="end" fill="#8b949e">2</text>
+<line x1="60" y1="143.3" x2="620" y2="143.3" stroke="#30363d"/><text x="52" y="147.3" text-anchor="end" fill="#8b949e">4</text>
+<line x1="60" y1="40.0" x2="620" y2="40.0" stroke="#30363d"/><text x="52" y="44.0" text-anchor="end" fill="#8b949e">6</text>
+<line x1="77.5" y1="298.3" x2="620.0" y2="-1303.3" stroke="#E5D75A" stroke-dasharray="6 4" stroke-width="1.5"/>
+<polyline points="77.5,298.3 95.0,252.9 130.0,176.6 200.0,53.5 340.0,58.8 480.0,61.7 620.0,73.4" fill="none" stroke="#00C896" stroke-width="2.5"/>
+<circle cx="77.5" cy="298.3" r="4" fill="#00C896"/><text x="77.5" y="288.3" text-anchor="middle" fill="#e6edf3">1.0x</text>
+<circle cx="95.0" cy="252.9" r="4" fill="#00C896"/><text x="95.0" y="242.9" text-anchor="middle" fill="#e6edf3">1.9x</text>
+<circle cx="130.0" cy="176.6" r="4" fill="#00C896"/><text x="130.0" y="166.6" text-anchor="middle" fill="#e6edf3">3.4x</text>
+<circle cx="200.0" cy="53.5" r="4" fill="#00C896"/><text x="200.0" y="43.5" text-anchor="middle" fill="#e6edf3">5.7x</text>
+<circle cx="340.0" cy="58.8" r="4" fill="#00C896"/><text x="340.0" y="48.8" text-anchor="middle" fill="#e6edf3">5.6x</text>
+<circle cx="480.0" cy="61.7" r="4" fill="#00C896"/><text x="480.0" y="51.7" text-anchor="middle" fill="#e6edf3">5.6x</text>
+<circle cx="620.0" cy="73.4" r="4" fill="#00C896"/><text x="620.0" y="63.4" text-anchor="middle" fill="#e6edf3">5.4x</text>
+<text x="77.5" y="368" text-anchor="middle" fill="#8b949e">1T</text>
+<text x="95.0" y="368" text-anchor="middle" fill="#8b949e">2T</text>
+<text x="130.0" y="368" text-anchor="middle" fill="#8b949e">4T</text>
+<text x="200.0" y="368" text-anchor="middle" fill="#8b949e">8T</text>
+<text x="340.0" y="368" text-anchor="middle" fill="#8b949e">16T</text>
+<text x="480.0" y="368" text-anchor="middle" fill="#8b949e">24T</text>
+<text x="620.0" y="368" text-anchor="middle" fill="#8b949e">32T</text>
+<text x="320.0" y="392" text-anchor="middle" fill="#8b949e">threads</text>
+</svg>

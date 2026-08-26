@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="224" font-family="ui-monospace,Consolas" font-size="13">
+<rect width="720" height="224" fill="#161b22"/>
+<text x="360.0" y="26" text-anchor="middle" fill="#e6edf3">small_n: median time by execution tier</text>
+<text x="190" y="247.8" text-anchor="end" fill="#e6edf3">interp (0.53 ms)</text>
+<rect x="200" y="224" width="430.0" height="34" fill="#E8630A" rx="3"><animate attributeName="width" from="0" to="430.0" dur="0.5s" fill="freeze"/></rect>
+<text x="190" y="295.8" text-anchor="end" fill="#e6edf3">native-seq (0.02 ms)</text>
+<rect x="200" y="272" width="18.1" height="34" fill="#8b949e" rx="3"><animate attributeName="width" from="0" to="18.1" dur="0.5s" fill="freeze"/></rect>
+<text x="190" y="343.8" text-anchor="end" fill="#e6edf3">native-par (0.14 ms)</text>
+<rect x="200" y="320" width="109.0" height="34" fill="#56B4E9" rx="3"><animate attributeName="width" from="0" to="109.0" dur="0.5s" fill="freeze"/></rect>
+</svg>

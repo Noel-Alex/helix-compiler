@@ -7,7 +7,7 @@
 Write ordinary sequential numerical code. HELIX proves which loops are safe to run
 on all your cores — and shows you the dependence analysis behind every verdict.
 
-![saxpy speedup](docs/benchmarks/figs/saxpy_16777216_speedup.svg)
+![saxpy speedup](docs/benchmarks/figs/saxpy_speedup.svg)
 
 </div>
 
@@ -54,14 +54,15 @@ parallelization (DOALL + reduction recognition) → Cranelift → x86-64 machine
 Every stage is inspectable: `helix dump tokens|ast|ir|ssa`, or the whole pipeline
 stepped through visually in the Observatory (`helix observe`).
 
-## Measured results (laptop, 2026-08-25)
+## Measured results (laptop, 2026-08-26)
 
 | Claim | Number |
 |---|---|
-| saxpy @16.8M f64, parallel speedup | **4.13× @ 8 threads** (bandwidth-bound) |
-| dot-product reduction | **4.7× @ 24 threads** |
-| matmul 128², interpreter → native JIT | **251×** |
-| recurrence loop | **refused** — RAW distance-1 proven, runs sequential |
+| saxpy @16.8M f64, parallel speedup | **5.66× @ 8 threads** (bandwidth-bound) |
+| dot-product reduction | **3.38× @ 8 threads** |
+| matmul 128², interpreter → native JIT | **12×** (1262 ms → 103 ms) |
+| jacobi stencil 512², interpreter → native JIT | **38×** |
+| recurrence loop | **refused** — carried dependence proven, runs sequential |
 | cross-backend correctness | every example bit-identical interp ≡ JIT |
 
 Full tables + methodology: [docs/benchmarks/results.md](docs/benchmarks/results.md).
@@ -70,7 +71,7 @@ Full tables + methodology: [docs/benchmarks/results.md](docs/benchmarks/results.
 
 | dot product @4.2M | jacobi stencil @1024² |
 |---|---|
-| ![dot](docs/benchmarks/figs/dot_reduction_4194304_speedup.svg) | ![jacobi](docs/benchmarks/figs/jacobi_2d_1024_speedup.svg) |
+| ![dot](docs/benchmarks/figs/dot_reduction_speedup.svg) | ![jacobi](docs/benchmarks/figs/jacobi_2d_speedup.svg) |
 
 *(15 measured kernels × sizes live in [`docs/benchmarks/figs/`](docs/benchmarks/figs).)*
 

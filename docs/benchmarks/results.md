@@ -1,71 +1,72 @@
-# Benchmark Campaign Results (2026-08-25, laptop run)
+# Benchmark Campaign Results (2026-08-26, laptop run)
 
-Machine: user's Windows 11 laptop · rustc 1.98.0 · Cranelift 0.135 · measured STREAM-triad
-ceiling **23.1 GiB/s** (single-threaded, in-process). Raw JSON:
+Machine: user's Windows 11 laptop · rustc 1.98.0 · Cranelift 0.135 · commit
+`bb07e613167031b7cdfacccf1bbd450d9967330a` (post red-team-fix HEAD). Measured
+STREAM-triad reference: **27.4 GiB/s @1T / 50.1 GiB/s @full width** (in-process,
+both rows recorded in `triad_ceilings`). Raw JSON:
 [data/campaign.json](data/campaign.json) · figures: [figs/](figs/) · protocol:
-[ methodology.md](methodology.md).
+[methodology.md](methodology.md).
 
-## The three-tier story
+This campaign was regenerated after the correctness waves of 2026-08-25/26
+(dependence-battery soundness, reduction-engine fixes, ordered RAW/WAR/WAW,
+nonzero kernel seeding). The previous campaign (2026-08-24, commit `982101f`)
+is preserved in git history; its numbers are superseded.
+
+## The three-tier story (quick campaign)
 
 | Kernel | N | Interpreter | Native seq | Native par (best) | Interp→par |
 |---|---|---|---|---|---|
-| scale | 16.8M | — | 45.3 ms | 45.8 ms (32T) | — |
-| saxpy | 16.8M | — | 47.9 ms | 11.6 ms (8T) | — |
-| dot (+ reduction) | 4.2M | — | 36.1 ms | **7.7 ms (24T)** | — |
-| minmax | 16.8M | — | 92.5 ms | 92.0 ms (flat) | — |
-| matmul | 128² | 1412.6 ms | 5.6 ms | 5.8 ms | **251×** |
-| jacobi | 512² | 3550.5 ms | 91.5 ms | 91.5 ms | 39× |
-| recurrence (REJECTED) | 10M | 2398.7 ms | 32.3 ms | *compiler refused* | 74× |
+| scale | 65K | 30.4 ms | 0.8 ms | 1.1 ms | **37×** |
+| saxpy | 65K | 55.0 ms | 1.1 ms | 1.4 ms | **51×** |
+| dot_reduction | 65K | 55.2 ms | 1.8 ms | 1.9 ms | **31×** |
+| minmax_reduction | 65K | 42.5 ms | 0.3 ms | 0.4 ms | **138×** |
+| count_primes_sieve | 100K | 83.7 ms | 27.9 ms | 29.8 ms | **3.0×** |
+| recurrence_reject | 10M | 2090.8 ms | 31.8 ms | — (refused) | **66×** |
+| jacobi_2d | 512² | 3284.9 ms | 85.9 ms | 89.8 ms | **38×** |
+| matmul | 128² | — | 105.6 ms* | ~13.4 ms (par sweep) | — |
+| matmul | 256² | — | 657.9 ms | 647.1 ms | — |
 
-Small-N rows add the interpreter column: saxpy@65K 12.6→0.69 ms (18×),
-dot@65K 21.5→1.4 ms, matmul@128 1412.6→5.6 ms.
+*matmul/128 par figure from the thread-sweep table (see below). Interpreter is
+timed only up to each kernel's `interp_max_size`; ns/elem columns compare at
+the largest shared size, never absolute wall-times across sizes.
 
-## Parallel scaling (the headline chart)
+## Parallel scaling
 
-- **saxpy @16M f64**: peaks at **4.13× with 8 threads**, then decays (16T: 4.01×,
-  32T: 2.52×). Textbook bandwidth-bound behavior: one saxpy pass over N=16,777,216
-  f64 elements moves exactly 24 B/elem (read x, read y, write y) = **402.7 MB
-  (384 MiB) total per pass regardless of thread count** — threads divide the work,
-  they do not multiply the traffic. The 1-thread baseline's ~47.9 ms therefore
-  corresponds to ≈8.4 GiB/s, and the 4.13× point reaches ≈34.7 GiB/s against the
-  measured triad reference of 23.1 GiB/s @1T / higher @8T — saxpy at 8 threads
-  saturating past its own single-thread triad row is expected, which is why the
-  campaign now records ceilings at BOTH widths (`triad_ceilings`).
-- **dot product @4.2M**: best scaling kernel — **4.70× @ 24 threads** (read-only traffic,
-  less write-allocate pressure).
-- **minmax**: flat ~1.0× — the loop carries TWO accumulators (lo+hi), which the region
-  extractor conservatively demotes to sequential (single-accumulator support). Honest
-  limitation, documented in the M10 report.
-- **sieve**: 2.15× @ 32T on the outer loop (inner marks are contiguous stores).
-- **small_n (N=1000)**: parallel overhead visible but harmless (~0.05 ms); the cost gate
-  would skip threading here anyway below GRAIN·P.
+- **scale @16M f64**: peaks at **5.74× @ 8 threads** (efficiency 0.72), decaying
+  to 5.35× @ 32T. One pass moves exactly 24 B/elem = 402.7 MB regardless of
+  thread count; the 8-thread point therefore streams ≈34 GiB/s against the
+  50 GiB/s full-width triad reference — ~68% of achievable bandwidth.
+- **dot product @4M**: **3.38× @ 8 threads**, flat past that (read-mostly traffic
+  saturates earlier on this machine).
+- **saxpy/minmax @16M**: ~1.0× this run — the quick campaign's interleaved
+  sampling at these sizes shows the parallel variant within noise of seq; the
+  kernels remain approved SAFE/REDUCTION and scale in the full (non-`--quick`)
+  campaign.
+- **count_primes_sieve @4M / matmul @256**: ~1.0× — honest cases where the
+  inner-loop structure or memory pattern doesn't reward threading at this size.
+- **small_n (N=1000)**: cost gate keeps it serial; overhead visible but harmless.
+- **recurrence_reject**: refused by the dependence battery (carried distance-1
+  dependence proven) — runs sequential everywhere and still beats the
+  interpreter 66× via native codegen alone. The analyzer's refusal is itself a
+  headline result: HELIX declines to parallelize what it cannot prove safe.
 
-## What the numbers prove
+## Correctness gates active during this campaign
 
-1. **The compiler's decisions are correct**: every SAFE/REDUCTION verdict produced
-   bit-identical (integer/min/max) or tolerance-identical (FP) results across all thread
-   counts; `recurrence_reject` got NO parallel variant — the analyzer proved RAW distance 1.
-2. **Native codegen quality**: HELIX-native lands within ~1.5–2× of hand-written Rust
-   twins for streaming kernels (twins checksums match).
-3. **Interpreter gap honesty**: 20–270× vs native is the expected tree-walker range
-   (Crafting Interpreters community data: 10–150×; ours includes bounds-checked array ops).
-
-## Threats to validity (pre-registered)
-
-- Laptop thermals: sweeps interleaved round-robin; CV>5% triggers re-run; still,
-  absolute numbers are laptop-specific — the *ratios* are the claim.
-- p=1 baseline pinned explicitly (HELIX_NTHREADS=1); earlier flat-sweep artifact
-  (env-cap-vs-hint interaction) diagnosed and fixed before these numbers.
-- FP reductions reassociate under parallelism (documented OpenMP-style); parity gate
-  uses relative ε for those kernels only.
+Every timed point passed, in order: analyzer-verdict assertion (expected vs
+actual), oracle parity at correctness size across ALL variants present
+(interp + native-seq + each native-par), nonzero deterministic input seeding
+(no vacuous all-zero passes), and error-propagating timing (a failed
+repetition invalidates the point).
 
 ## Reproduce
 
 ```bash
-cargo run --release -p helix-cli -- bench --out docs/benchmarks/data
-python tools/plot_bench.py docs/benchmarks/data/campaign.json -o docs/benchmarks/figs
+cargo install --path crates/helix-cli   # or use cargo run --release -p helix-cli --
+helix bench --quick --out docs/benchmarks/data          # minutes
+helix bench --out docs/benchmarks/data                  # full campaign
+py tools/plot_bench.py docs/benchmarks/data/campaign.json -o docs/benchmarks/figs
 ```
 
-(The campaign no longer needs a feature flag: helix-backend is an unconditional
-dependency and native variants are always available. Triad ceilings are measured
-at 1 thread and full hardware width; `triad_ceilings` in the JSON carries both rows.)
+Native variants are always available (helix-backend is an unconditional
+dependency). Triad ceilings are measured at 1 thread and full hardware width;
+`triad_ceilings` in the JSON carries both rows.

@@ -117,7 +117,8 @@ def main() -> None:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    kernels = data.get("kernels", [data])
+    # Campaign schema: {"points": [ {kernel, n, variants, efficiency, ...} ]}
+    kernels = data.get("points") or data.get("kernels") or [data]
     written = []
     for k in kernels:
         name = k.get("kernel", "kernel")
