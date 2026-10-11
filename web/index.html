@@ -3,26 +3,40 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
 <title>HELIX Observatory — automatic parallelizing compiler</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1117'/%3E%3Cpath d='M10 6v20M22 6v20M10 16h12' stroke='%2300c896' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2358f4ef'/%3E%3Cpath d='M7 26V8h18v18M7 12h18M11 17h10M16 26V17' fill='none' stroke='%2313232a' stroke-width='3' stroke-linecap='square'/%3E%3Cpath d='m10 24 12-16m-3 0 5-4m-2 7-4-1' fill='none' stroke='%23ffe35b' stroke-width='2'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+<!--
+THESIS: HELIX is a 16-colour compiler machine; it refuses the generic dashboard and makes every pipeline stage feel like a hardware screen with a job.
+OWN-WORLD: a bright cyan TempleOS-era poster field, yellow/black bitmap lettering, a sword-and-temple compiler mark, readable paper work surfaces, and fixed evidence regions.
+STORY: choose code, run the pipeline, move screen by screen through the proof, and inspect why parallelization was accepted or refused.
+FIRST VIEWPORT: machine header above an example/source bay and one large artifact display; the eight-stage selector is the keyboard-like hinge between them.
+FORM: bolder challenger, TempleOS-era cyan poster field; seed 49d1dabc.
+FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance.
+-->
 
 <header class="topbar">
   <div class="wordmark" title="HELIX Lite — automatic parallelizing compiler">
-    <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 4v24M23 4v24M9 16h14" /></svg>
-    <span class="wm-helix">HELIX</span><span class="wm-lite">LITE</span>
+    <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+      <path class="mark-temple" d="M6 27V8h20v19M6 12h20M11 17h10M16 27V17" />
+      <path class="mark-sword" d="m9 24 13-16m-4 0 5-4m-2 7-4-1" />
+    </svg>
+    <span class="wm-helix">HELIX</span><span class="wm-lite">LITE / OBSERVATORY</span>
   </div>
   <div class="topbar-sep"></div>
   <h1 class="crumb">Observatory<span id="top-example" class="crumb-example"></span></h1>
   <div class="topbar-spacer"></div>
+  <div id="chip-fixture" class="chip chip-fixture hidden" title="served by the Node fixture fallback, not the Rust observer">FIXTURE FALLBACK</div>
+  <div id="chip-mode" class="chip chip-mode hidden" title="where compilation and execution run"></div>
   <div id="chip-backend" class="chip chip-mono hidden" title="execution backend chosen by the planner"></div>
   <div id="chip-checksum" class="chip chip-mono hidden" title="checksum of program output"></div>
-  <button id="btn-recompile" class="btn hidden" title="re-run the compile pipeline on this example">&#x21bb; recompile</button>
+  <a id="btn-about" class="btn btn-about" href="/about" title="learn how the HELIX compiler works">How HELIX works</a>
+  <button id="btn-recompile" class="btn hidden" title="re-run the compile pipeline on this example">Recompile</button>
   <a id="btn-export" class="btn hidden" title="open this example's artifact as a standalone offline HTML page"
-     target="_blank" rel="noopener">&#x2913; export</a>
+     target="_blank" rel="noopener">Export artifact</a>
 </header>
 
 <div class="shell">
@@ -34,11 +48,11 @@
       <ul id="example-list" class="example-list"><li class="rail-note">loading&hellip;</li></ul>
     </section>
     <section class="rail-sec rail-grow">
-      <h2 class="rail-title">Custom source</h2>
-      <textarea id="custom-src" class="custom-src" spellcheck="false"
+      <h2 class="rail-title" id="custom-src-label">Custom source</h2>
+      <textarea id="custom-src" class="custom-src" spellcheck="false" aria-labelledby="custom-src-label"
         placeholder="// HELIX source &#10;// fn main() { ... }&#10;&#10;for i in 0..n {&#10;    y[i] = s * x[i] + y[i];&#10;}"></textarea>
-      <button id="btn-compile" class="btn btn-primary">Compile &amp; Run &#x25b6;</button>
-      <p class="rail-note">POSTs the buffer to <code>/api/run</code> and renders the returned artifact.</p>
+      <button id="btn-compile" class="btn btn-primary">Run pipeline</button>
+      <p class="rail-note" id="rail-mode-note">POSTs the buffer to <code>/api/run</code>. After it compiles, open BENCH to measure a bounded interpreter run.</p>
     </section>
   </aside>
 
@@ -50,6 +64,8 @@
     </nav>
 
     <div id="diag-banner" class="diag-banner hidden"></div>
+
+    <section id="exec-readout" class="exec-readout panel" aria-live="polite" aria-label="Execution readout"></section>
 
     <section id="stage" class="stage" tabindex="-1">
 
@@ -171,7 +187,7 @@
         <div class="panel panel-fill">
           <div class="panel-head">
             <span class="panel-title">Loop analysis</span>
-            <span class="panel-sub">dependence testing &amp; parallelization verdicts</span>
+            <span class="panel-sub">dependence testing &amp; parallelization verdicts &middot; plan widths are proposals; see Benchmark for measured participants</span>
           </div>
           <div class="scrollfill"><div id="loop-list" class="looplist"></div></div>
           <div id="loops-empty" class="empty hidden"></div>
@@ -187,16 +203,18 @@
             <label class="toggle"><input type="checkbox" id="bench-logscale"> log scale</label>
           </div>
           <div class="scrollfill benchwrap">
+            <div id="bench-comparison" class="bench-comparison" aria-label="Benchmark comparisons"></div>
             <div id="bench-chart" class="bench-chart"></div>
             <div id="bench-eff" class="effwrap"></div>
           </div>
-          <div id="bench-empty" class="empty hidden"></div>
+          <div id="bench-empty" class="empty bench-empty hidden"></div>
+          <section id="bench-local" class="bench-local hidden" aria-label="Local browser measurement"></section>
         </div>
       </div>
 
     </section>
 
-    <footer class="footer">HELIX Lite — automatic parallelizing compiler</footer>
+    <footer class="footer"><span>HELIX Lite — automatic parallelizing compiler</span><a href="/about">About the compiler</a></footer>
   </main>
 </div>
 

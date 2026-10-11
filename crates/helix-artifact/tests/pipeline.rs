@@ -3,7 +3,7 @@
 //! language semantics dictate (valid programs reach `exec`; broken ones stop
 //! at diagnostics).
 //!
-//! Tests build with [`helix_observe::BuildOpts::without_execution`]: the
+//! Tests build with [`helix_artifact::BuildOpts::without_execution`]: the
 //! examples ship at benchmark sizes and the reference interpreter needs
 //! 30–130 s per big kernel. Execution itself is covered by helix-engine's
 //! own suite plus one small end-to-end run here.
@@ -11,8 +11,9 @@
 mod common;
 
 use common::{all_example_names, example_source};
-use helix_observe::artifact::VerdictLabel;
-use helix_observe::{BuildOpts, build_artifact, build_artifact_with_opts};
+use helix_artifact::artifact::VerdictLabel;
+use helix_artifact::pipeline::INTERACTIVE_WORK_BUDGET;
+use helix_artifact::{BuildOpts, build_artifact, build_artifact_with_opts};
 
 /// Builds without running the interpreter (fast — no benchmark-size loops).
 fn fast(name: &str) -> String {
@@ -56,7 +57,13 @@ fn every_example_builds_without_panic() {
 #[test]
 fn small_valid_examples_reach_exec_stage() {
     // Small programs: full pipeline including interpretation.
-    for name in ["ssa_demo", "div_guard", "casts_demo", "const_globals"] {
+    for name in [
+        "ssa_demo",
+        "div_guard",
+        "casts_demo",
+        "const_globals",
+        "jacobi_2d",
+    ] {
         let art = build_artifact(name, &example_source(name));
         assert!(art.diags_sem.is_empty(), "{name}: unexpected sema diags");
         let exec = art
@@ -67,6 +74,78 @@ fn small_valid_examples_reach_exec_stage() {
         assert!(exec.checksum.starts_with("0x"), "{name}: checksum format");
         assert!(!exec.printed.is_empty(), "{name}: these demos all print");
     }
+}
+
+#[test]
+fn nested_benchmark_examples_do_not_block_the_observer() {
+    for name in ["matmul", "minmax_reduction"] {
+        let src = example_source(name);
+        let art = build_artifact(name, &src);
+        let exec = art
+            .exec
+            .as_ref()
+            .expect("large examples still expose exec state");
+        assert!(
+            exec.printed
+                .iter()
+                .any(|line| line.contains("estimated work exceeds")),
+            "{name}: observer should skip benchmark-sized execution"
+        );
+        assert!(
+            exec.checksum.is_empty(),
+            "{name}: skipped execution must not claim a checksum"
+        );
+    }
+}
+
+#[test]
+fn work_estimate_counts_syntax_and_nesting_not_comments_or_sibling_loops() {
+    use helix_artifact::pipeline::estimated_work;
+    let single = "fn main() { for i in 0..100 { print(i); } }";
+    assert_eq!(estimated_work(single), 100);
+    assert_eq!(
+        estimated_work(&format!("// for 999999999999999\n{single}")),
+        100
+    );
+    assert_eq!(
+        estimated_work("fn main() { for i in 0..100 { print(i); } for j in 0..100 { print(j); } }"),
+        200
+    );
+    assert_eq!(
+        estimated_work("fn main() { for i in 0..100 { for j in 0..100 { print(j); } } }"),
+        10_000
+    );
+    assert_eq!(
+        estimated_work(
+            "const N: i64 = 100; fn main() { let n = N + 1; for i in 1..n { print(i); } }"
+        ),
+        101
+    );
+    assert_eq!(
+        estimated_work("fn main() { let n = 1; n = 1000000000; for i in 0..n { print(i); } }"),
+        u64::MAX
+    );
+    assert_eq!(
+        estimated_work("fn run(n: i64) { for i in 0..n { print(i); } } fn main() {}"),
+        u64::MAX
+    );
+    assert!(estimated_work(&example_source("jacobi_2d")) < 5_000_000);
+    assert!(estimated_work(&example_source("matmul")) > 5_000_000);
+    // zeros() initializes every element: allocation-only programs must not
+    // hide their cost from the interactive budgets.
+    assert_eq!(
+        estimated_work("fn main() { let a: [i64] = zeros(50); print(a[0]); }"),
+        51
+    );
+    assert!(
+        estimated_work("fn main() { let a: [i64] = zeros(99999999); print(a[0]); }")
+            > INTERACTIVE_WORK_BUDGET
+    );
+    // Unresolvable length fails closed like unknown loop bounds.
+    assert_eq!(
+        estimated_work("fn main() { let n = 2; n = 3; let a: [i64] = zeros(n); print(a[0]); }"),
+        u64::MAX
+    );
 }
 
 #[test]
@@ -107,7 +186,7 @@ fn syntax_error_artifact_carries_diags_lex_and_tokens() {
 #[test]
 fn saxpy_produces_full_stack_with_safe_verdict() {
     let json = fast("saxpy");
-    let art: helix_observe::CompileArtifact = serde_json::from_str(&json).expect("round-trips");
+    let art: helix_artifact::CompileArtifact = serde_json::from_str(&json).expect("round-trips");
 
     let ir_pre = art.ir_pre_ssa.as_ref().expect("pre-SSA");
     let ir_ssa = art.ir_ssa.as_ref().expect("SSA");
@@ -141,7 +220,7 @@ fn saxpy_produces_full_stack_with_safe_verdict() {
 #[test]
 fn reductions_and_rejections_are_classified_correctly() {
     // dot product → +-reduction.
-    let dot: helix_observe::CompileArtifact =
+    let dot: helix_artifact::CompileArtifact =
         serde_json::from_str(&fast("dot_reduction")).expect("ok");
     let dloops = dot.loops.clone().expect("dot loops");
     assert!(
@@ -151,7 +230,7 @@ fn reductions_and_rejections_are_classified_correctly() {
     );
 
     // minmax → min/max reductions.
-    let mm: helix_observe::CompileArtifact =
+    let mm: helix_artifact::CompileArtifact =
         serde_json::from_str(&fast("minmax_reduction")).expect("ok");
     let mloops = mm.loops.clone().expect("minmax loops");
     assert!(
@@ -160,7 +239,7 @@ fn reductions_and_rejections_are_classified_correctly() {
     );
 
     // distance-1 RAW recurrence MUST stay sequential.
-    let rec: helix_observe::CompileArtifact =
+    let rec: helix_artifact::CompileArtifact =
         serde_json::from_str(&fast("recurrence_reject")).expect("ok");
     let rloops = rec.loops.clone().expect("recurrence loops");
     assert!(
@@ -170,7 +249,7 @@ fn reductions_and_rejections_are_classified_correctly() {
     );
 
     // matmul mixes DOALL rows with an inner k-reduction.
-    let mmul: helix_observe::CompileArtifact = serde_json::from_str(&fast("matmul")).expect("ok");
+    let mmul: helix_artifact::CompileArtifact = serde_json::from_str(&fast("matmul")).expect("ok");
     let muloops = mmul.loops.clone().expect("matmul loops");
     assert!(muloops.iter().any(|l| l.verdict == VerdictLabel::Safe));
     assert!(muloops.iter().any(|l| l.verdict == VerdictLabel::Reduction));

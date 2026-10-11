@@ -27,12 +27,16 @@ fn examples_dir() -> PathBuf {
 
 /// Spawns the router on 127.0.0.1:0 and returns its bound address.
 async fn spawn() -> SocketAddr {
+    spawn_with_examples(examples_dir()).await
+}
+
+async fn spawn_with_examples(dir: PathBuf) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("ephemeral bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
-        axum::serve(listener, router(Some(examples_dir())))
+        axum::serve(listener, router(Some(dir)))
             .await
             .expect("serve");
     });
@@ -127,14 +131,76 @@ async fn static_assets_serve_with_correct_mime() {
     let addr = spawn().await;
     for (path, want) in [
         ("/", "text/html"),
+        ("/about", "text/html"),
         ("/app.js", "text/javascript"),
         ("/style.css", "text/css"),
+        ("/about.css", "text/css"),
+        ("/about.js", "text/javascript"),
+        ("/wasm/helix-browser.js", "text/javascript"),
+        ("/wasm/helix-worker.js", "text/javascript"),
+        ("/wasm/helix-lab.wasm", "application/wasm"),
+        ("/assets/helix-loop-observatory.png", "image/png"),
         ("/vendor/d3.v7.min.js", "text/javascript"),
     ] {
         let (status, ctype, body) = http(addr, "GET", path, None).await;
         assert_eq!(status, 200, "{path}");
         assert!(ctype.starts_with(want), "{path}: got {ctype}");
         assert!(!body.is_empty(), "{path}: non-empty");
+    }
+}
+
+#[tokio::test]
+async fn benchmark_index_exposes_recorded_campaign_provenance() {
+    let addr = spawn().await;
+    let (status, ctype, body) = http(addr, "GET", "/api/benchmarks", None).await;
+    assert_eq!(status, 200);
+    assert!(ctype.starts_with("application/json"));
+    let index: serde_json::Value = serde_json::from_str(&body).expect("benchmark index json");
+    assert_eq!(index["schema"], "helix-campaign-v1");
+    assert_eq!(index["point_count"], 17);
+    assert!(
+        index["kernels"]
+            .as_array()
+            .is_some_and(|kernels| { kernels.iter().any(|kernel| kernel["name"] == "saxpy") })
+    );
+    assert!(index["points"].as_array().is_some_and(|points| {
+        points.iter().any(|point| {
+            point["kernel"] == "scale"
+                && point["n"] == 65536
+                && point["variants"]
+                    .as_array()
+                    .is_some_and(|variants| variants.len() == 3)
+        })
+    }));
+    assert!(index["machine"]["cpu_brand"].as_str().is_some());
+    assert!(index["examples"].as_array().is_some_and(|examples| {
+        examples
+            .iter()
+            .any(|example| example["name"] == "casts_demo" && example["sample_count"] == 7)
+    }));
+}
+
+#[tokio::test]
+async fn benchmark_index_preserves_probe_provenance() {
+    let addr = spawn().await;
+    let (_, _, body) = http(addr, "GET", "/api/benchmarks", None).await;
+    let index: serde_json::Value = serde_json::from_str(&body).expect("index");
+    let catalog: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/benchmarks/data/example-probes.json"
+    ))
+    .expect("probe catalog");
+    let provenance = &index["probe_provenance"];
+    assert_eq!(provenance["schema"], catalog["schema"]);
+    assert_eq!(provenance["timestamp_utc"], catalog["timestamp_utc"]);
+    assert_ne!(provenance["timestamp_utc"], index["timestamp_utc"]);
+    assert_eq!(provenance["git_rev"], catalog["machine"]["git_rev"]);
+    for field in [
+        "cpu_brand",
+        "logical_cores",
+        "physical_cores",
+        "rustc_version",
+    ] {
+        assert_eq!(provenance["machine"][field], catalog["machine"][field]);
     }
 }
 
@@ -160,6 +226,62 @@ async fn artifact_route_returns_full_document() {
     assert_eq!(art["example"], "saxpy");
     assert!(art["cfg"]["functions"].as_array().is_some());
     assert!(art["loops"].as_array().is_some_and(|l| !l.is_empty()));
+    // The teaching example omits the measured campaign's initialization loop.
+    assert!(
+        art["bench"].is_null(),
+        "a matching name is not measured-source identity"
+    );
+}
+
+#[tokio::test]
+async fn non_kernel_bundled_example_exposes_recorded_interpreter_probe() {
+    let addr = spawn().await;
+    let (status, _ctype, body) = http(addr, "GET", "/api/artifact?example=casts_demo", None).await;
+    assert_eq!(status, 200);
+    let art: serde_json::Value = serde_json::from_str(&body).expect("artifact json");
+    assert_eq!(art["bench"]["kernel"], "casts_demo");
+    assert_eq!(art["bench"]["variants"][0]["name"], "interp-local");
+    assert_eq!(
+        art["bench"]["variants"][0]["samples"]
+            .as_array()
+            .map(Vec::len),
+        Some(7)
+    );
+    assert!(
+        art["bench"]["efficiency"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+}
+
+#[tokio::test]
+async fn mounted_examples_require_recorded_source_identity() {
+    let sources: serde_json::Value = serde_json::from_str(include_str!(
+        "../../helix-artifact/src/recorded-sources.json"
+    ))
+    .expect("recorded sources");
+    let dir = std::env::temp_dir().join(format!("helix-observe-identity-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("test examples dir");
+    let addr = spawn_with_examples(dir.clone()).await;
+    let saxpy = sources["campaign"]["saxpy"]
+        .as_str()
+        .unwrap()
+        .replace("33554432", "64");
+    let probe = sources["probes"]["casts_demo"].as_str().unwrap();
+    for (name, source) in [("saxpy", saxpy.as_str()), ("casts_demo", probe)] {
+        for (text, measured) in [
+            (format!("// presentation-only comment\n{source}"), true),
+            (format!("{source}\nfn unmeasured() {{ print(1); }}"), false),
+        ] {
+            std::fs::write(dir.join(format!("{name}.hx")), text).expect("example");
+            let (status, _, body) =
+                http(addr, "GET", &format!("/api/artifact?example={name}"), None).await;
+            assert_eq!(status, 200);
+            let artifact: serde_json::Value = serde_json::from_str(&body).expect("artifact");
+            assert_eq!(!artifact["bench"].is_null(), measured, "{name}");
+        }
+    }
+    std::fs::remove_dir_all(dir).expect("remove test examples");
 }
 
 #[tokio::test]
@@ -211,6 +333,33 @@ async fn run_post_accepts_raw_source_without_json_envelope() {
         http(addr, "POST", "/api/run", Some("fn main() { print(7); }")).await;
     assert_eq!(status, 200);
     let art: serde_json::Value = serde_json::from_str(&body).expect("artifact");
+    assert_eq!(art["exec"]["printed"][0], "7");
+}
+
+#[tokio::test]
+async fn benchmark_post_measures_custom_source_without_inventing_parallel_data() {
+    let addr = spawn().await;
+    let src = "fn main() { print(7); }";
+    let payload = serde_json::to_string(&serde_json::json!({ "source": src })).expect("body");
+
+    let (status, ctype, body) = http(addr, "POST", "/api/benchmark", Some(&payload)).await;
+    assert_eq!(status, 200);
+    assert!(ctype.starts_with("application/json"));
+    let art: serde_json::Value = serde_json::from_str(&body).expect("artifact");
+    assert_eq!(art["example"], "<adhoc>");
+    assert_eq!(art["bench"]["kernel"], "<adhoc>");
+    assert_eq!(art["bench"]["variants"][0]["name"], "interp-local");
+    assert_eq!(
+        art["bench"]["variants"][0]["samples"]
+            .as_array()
+            .map(Vec::len),
+        Some(7)
+    );
+    assert!(
+        art["bench"]["efficiency"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
     assert_eq!(art["exec"]["printed"][0], "7");
 }
 
@@ -274,5 +423,21 @@ async fn export_route_inlines_artifact_into_standalone_html() {
         body.contains("__INLINE_ARTIFACT_JSON__"),
         "artifact embedded"
     );
-    assert!(body.contains("/app.js"), "real UI still loads");
+    // The saved file must boot with no server: every asset the shell loads is
+    // inlined (style sheet, both scripts, fonts as data: URIs) — no absolute
+    // asset URLs may remain for the file:// origin to fail on.
+    assert!(!body.contains(r#"src="/"#), "no external script tags");
+    assert!(
+        !body.contains(r#"href="/style.css""#),
+        "style sheet inlined"
+    );
+    assert!(
+        body.contains("renderExecReadout"),
+        "app.js source inlined into the export"
+    );
+    assert!(body.contains("data-observe-export"), "fetch shim present");
+    assert!(
+        body.contains("data:font/ttf;base64,"),
+        "fonts inlined as data URIs"
+    );
 }

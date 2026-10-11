@@ -7,22 +7,19 @@
 //! anything else (loads, calls, iteration-varying phis) returns `None` and the
 //! dependence battery falls back to a conservative "dependence exists".
 //!
-//! ## Loop invariants and the symbolic-constant collapse
+//! ## Loop invariants
 //!
-//! Real kernels index arrays through values computed *outside* the analyzed
-//! loop (`ibase = i * N` feeding an inner `k` loop). Such values are constant
-//! across the loop's iterations, so for dependence purposes they behave like
-//! symbolic constants. Rather than inventing a symbol type, every invariant
-//! sub-expression collapses to the constant `0`: two occurrences of the *same*
-//! `ValueId` on the source and sink sides still compare equal (which is what
-//! distance-0 reasoning needs), while two different invariants spuriously
-//! compare equal too. The latter can only ever *manufacture* a suspected
-//! dependence, never hide a real one — the conservative direction. Constant
-//! literals keep their true values, so `a[i-1]`-style offsets stay exact.
+//! Integer literals defined outside the loop keep their exact values. Other
+//! outside definitions and parameters have coefficient zero but unknown offset.
+//! This can prove a sole write injective, not a read/write dependence distance.
+//! ponytail: symbolic offsets stay unknown until symbolic affine forms exist.
 
-use crate::deps::Affine;
+use crate::Bound;
+use crate::canon;
+use crate::deps::{Affine, IterRange};
 use crate::loops::Loop;
 use helix_ir::{Constant, FuncIr, Inst, ValueId};
+use helix_sema::Ty;
 use std::collections::HashMap;
 
 /// One memory access inside a loop body.
@@ -35,18 +32,31 @@ pub struct Access {
     /// `(loop-block ordinal, instruction ordinal)` — program order within the
     /// loop body, used to order dependence pairs and label RAW vs WAR.
     pub site: (u32, u32),
-    /// Affine form w.r.t. the induction value, when extractable.
+    /// Affine form with an exact offset, for dependence-distance testing.
     pub affine: Option<Affine>,
+    /// IV coefficient only when injectivity is proven: no-wrap arithmetic,
+    /// or an odd coefficient in a single machine-width modular affine form.
+    /// The latter covers translations by unknown invariant offsets.
+    pub iv_coefficient: Option<i128>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Form {
+    a: i128,
+    b: Option<i128>,
+    /// Every intermediate operation agrees with mathematical integer arithmetic.
+    exact: bool,
 }
 
 /// Collect and classify all array accesses in `loop_`, in program order.
 ///
 /// `iv_value` is the SSA name of the induction variable inside the loop
-/// (the header φ result). Indices defined outside the loop are invariant
-/// (see the module docs); only their constant-ness matters for the battery.
+/// (the header φ result). Outside-loop integer literals stay exact; other
+/// invariant values remain unknown (see the module docs).
 pub fn collect(func: &FuncIr, loop_: &Loop, iv_value: ValueId) -> Vec<Access> {
     let mut out = Vec::new();
-    let mut memo: HashMap<ValueId, Option<Affine>> = HashMap::new();
+    let mut memo: HashMap<ValueId, Option<Form>> = HashMap::new();
+    let range = iv_range(func, loop_, iv_value);
     for (bi, &blk) in loop_.blocks.iter().enumerate() {
         let bd = func.block(blk);
         for (ii, inst) in bd.insts.iter().enumerate() {
@@ -55,12 +65,24 @@ pub fn collect(func: &FuncIr, loop_: &Loop, iv_value: ValueId) -> Vec<Access> {
                 Inst::Store { arr, idx, .. } => (*arr, *idx, true),
                 _ => continue,
             };
-            let affine = classify(func, loop_, iv_value, idx, &mut memo, 0);
+            let cx = Ctxt {
+                func,
+                loop_,
+                iv: iv_value,
+                range,
+            };
+            let form = cx.classify(idx, &mut memo, 0);
             out.push(Access {
                 arr,
                 is_write,
                 site: (bi as u32, ii as u32),
-                affine,
+                affine: form
+                    .filter(|f| f.exact)
+                    .and_then(|f| f.b.map(|b| Affine { a: f.a, b })),
+                // Odd multiplication is a permutation modulo 2^width. Even
+                // strides need a no-wrap proof; a nonzero integer coefficient
+                // alone says nothing about collisions in machine arithmetic.
+                iv_coefficient: form.filter(|f| f.exact || f.a % 2 != 0).map(|f| f.a),
             });
         }
     }
@@ -76,24 +98,29 @@ pub fn collect(func: &FuncIr, loop_: &Loop, iv_value: ValueId) -> Vec<Access> {
 ///    (constants/arithmetic only; loads and calls are runtime values);
 /// 3. a φ inside the loop → affine only when every incoming argument folds to
 ///    the *same* coefficient-free form (an if-join of invariants);
-/// 4. anything defined outside the loop → invariant, collapsed to `{0, 0}`;
-/// 5. no def at all (function parameter) → invariant, `{0, 0}`.
+/// 4. outside-loop integer literal → `{0, value}`;
+/// 5. any other outside definition or function parameter → `{0, ?}`.
 ///
 /// The recursion depth cap breaks cycles through self-referential φ shapes
 /// (the latch increment feeds the header φ it reads).
 fn classify(
-    func: &FuncIr,
-    loop_: &Loop,
-    iv: ValueId,
+    cx: &Ctxt<'_, '_>,
     v: ValueId,
-    memo: &mut HashMap<ValueId, Option<Affine>>,
+    memo: &mut HashMap<ValueId, Option<Form>>,
     depth: u32,
-) -> Option<Affine> {
+) -> Option<Form> {
+    let Ctxt {
+        func, loop_, iv, ..
+    } = *cx;
     if depth > 64 {
         return None;
     }
     if v == iv {
-        return Some(Affine { a: 1, b: 0 });
+        return Some(Form {
+            a: 1,
+            b: Some(0),
+            exact: true,
+        });
     }
     if let Some(hit) = memo.get(&v) {
         return *hit;
@@ -123,22 +150,18 @@ fn classify(
         }
     }
     if !found_inside {
-        // Defined outside the loop (or not at all): loop-invariant by
-        // definition. A *literal constant* keeps its value — offsets like
-        // `i - 1` and multipliers like `SIZE` must stay numerically exact for
-        // the SIV battery. A genuinely symbolic invariant (a load, a call
-        // result, a parameter) has no usable numeric identity, so it
-        // collapses to the symbolic constant 0: two occurrences of the same
-        // ValueId still compare equal, and the collapse can only ever
-        // manufacture a suspected dependence, never hide one (module docs).
-        let inv = match inside_inst_anywhere(func, v) {
-            Some(Inst::Const { c, .. }) => {
-                const_i128(c).map_or(Affine { a: 0, b: 0 }, |b| Affine { a: 0, b })
-            }
-            _ => Affine { a: 0, b: 0 },
-        };
-        memo.insert(v, Some(inv));
-        return Some(inv);
+        // Invariance proves coefficient zero, but only literals give an
+        // exact offset. Never feed an unknown offset to distance testing.
+        let inv = Some(Form {
+            a: 0,
+            exact: true,
+            b: match inside_inst_anywhere(func, v) {
+                Some(Inst::Const { c, .. }) => const_i128(c),
+                _ => None,
+            },
+        });
+        memo.insert(v, inv);
+        return inv;
     }
 
     let result = if let Some(args) = inside_phi_args {
@@ -160,37 +183,67 @@ fn classify(
         }
         // Otherwise: affine only when every arm agrees on one invariant form
         // (an if-join of invariants).
-        let mut agreed: Option<Affine> = None;
+        let mut agreed: Option<Form> = None;
         for (_, arm) in args {
-            let a = classify(func, loop_, iv, *arm, memo, depth + 1)?;
+            let a = cx.classify(*arm, memo, depth + 1)?;
             match agreed {
                 None => agreed = Some(a),
                 Some(f) if f == a => {}
                 _ => return None,
             }
         }
-        agreed.filter(|f| f.a == 0)
+        agreed.filter(|f| f.a == 0 && f.b.is_some() && f.exact)
     } else {
-        let cx = Ctxt { func, loop_, iv };
         match inside_inst.expect("inside def found above") {
-            Inst::Const { c, .. } => const_i128(c).map(|x| Affine { a: 0, b: x }),
-            Inst::Bin { op, a, b, .. } => bin_affine(&cx, *op, *a, *b, memo, depth),
+            Inst::Const { c, .. } => const_i128(c).map(|x| Form {
+                a: 0,
+                b: Some(x),
+                exact: true,
+            }),
+            Inst::Bin { op, a, b, .. }
+                if func.val_ty(v) == func.val_ty(*a) && func.val_ty(*a) == func.val_ty(*b) =>
+            {
+                bin_affine(cx, *op, *a, *b, memo, depth)
+            }
             Inst::Unary { op, a, .. } => {
                 let inner = cx.classify(*a, memo, depth + 1)?;
+                // Do not carry a modular form through a width change.
+                if func.val_ty(v) != func.val_ty(*a) {
+                    return None;
+                }
                 match op {
-                    helix_ir::UnOp::Neg => Some(Affine {
-                        a: -inner.a,
-                        b: -inner.b,
+                    helix_ir::UnOp::Neg => Some(Form {
+                        a: inner.a.checked_neg()?,
+                        b: inner.b.and_then(i128::checked_neg),
+                        exact: inner.exact,
                     }),
                     helix_ir::UnOp::Not => None,
                 }
             }
-            // Loads, casts and calls produce runtime values with no affine
-            // relation to the induction variable.
+            // A same-type cast is the copy identity build.rs emits for plain
+            // variable copies (`let j = i`); it is transparent. Other casts
+            // and calls/loads produce runtime values with no affine relation
+            // to the induction variable.
+            Inst::Cast { val, to, .. } if Some(*to) == func.types.val_ty(*val) => {
+                cx.classify(*val, memo, depth + 1)
+            }
             _ => None,
         }
     };
 
+    let result = result.and_then(|mut f| {
+        let limits = integer_range(func.val_ty(v)?)?;
+        // The same-width modular form is useful for sole-write injectivity,
+        // but NEVER for mathematical distance/divisibility/range proofs.
+        f.exact &= f.b.is_some_and(|b| {
+            [cx.range.lo, cx.range.hi].into_iter().all(|i| {
+                f.a.checked_mul(i)
+                    .and_then(|x| x.checked_add(b))
+                    .is_some_and(|x| limits.lo <= x && x <= limits.hi)
+            })
+        });
+        Some(f)
+    });
     memo.insert(v, result);
     result
 }
@@ -203,16 +256,17 @@ struct Ctxt<'f, 'l> {
     func: &'f FuncIr,
     loop_: &'l Loop,
     iv: ValueId,
+    range: IterRange,
 }
 
 impl Ctxt<'_, '_> {
     fn classify(
         &self,
         v: ValueId,
-        memo: &mut HashMap<ValueId, Option<Affine>>,
+        memo: &mut HashMap<ValueId, Option<Form>>,
         depth: u32,
-    ) -> Option<Affine> {
-        classify(self.func, self.loop_, self.iv, v, memo, depth)
+    ) -> Option<Form> {
+        classify(self, v, memo, depth)
     }
 }
 
@@ -221,35 +275,98 @@ fn bin_affine(
     op: helix_ir::BinOp,
     a: ValueId,
     b: ValueId,
-    memo: &mut HashMap<ValueId, Option<Affine>>,
+    memo: &mut HashMap<ValueId, Option<Form>>,
     depth: u32,
-) -> Option<Affine> {
+) -> Option<Form> {
     use helix_ir::BinOp as B;
     let l = cx.classify(a, memo, depth + 1)?;
     let r = cx.classify(b, memo, depth + 1)?;
+    let exact = l.exact && r.exact;
     match (op, l, r) {
-        (B::Add, x, y) => Some(Affine {
-            a: x.a + y.a,
-            b: x.b + y.b,
+        (B::Add, x, y) => Some(Form {
+            exact,
+            a: x.a.checked_add(y.a)?,
+            b: x.b.zip(y.b).and_then(|(x, y)| x.checked_add(y)),
         }),
-        (B::Sub, x, y) => Some(Affine {
-            a: x.a - y.a,
-            b: x.b - y.b,
+        (B::Sub, x, y) => Some(Form {
+            exact,
+            a: x.a.checked_sub(y.a)?,
+            b: x.b.zip(y.b).and_then(|(x, y)| x.checked_sub(y)),
         }),
-        // Multiplication is affine only when at most one factor varies with
-        // the induction variable and that factor's coefficient is constant;
-        // checked arithmetic guards pathological coefficient products.
-        (B::Mul, x, y) if x.a == 0 && y.a == 0 => Some(Affine { a: 0, b: x.b * y.b }),
-        (B::Mul, x, y) if x.a == 0 && x.b.checked_mul(y.a).is_some() => Some(Affine {
-            a: x.b * y.a,
-            b: x.b * y.b,
+        (B::Mul, x, y) if x.a == 0 && y.a == 0 => Some(Form {
+            exact,
+            a: 0,
+            b: x.b.zip(y.b).and_then(|(x, y)| x.checked_mul(y)),
         }),
-        (B::Mul, x, y) if y.a == 0 && y.b.checked_mul(x.a).is_some() => Some(Affine {
-            a: y.b * x.a,
-            b: y.b * x.b,
+        // A symbolic multiplier could be zero: require an exact constant
+        // factor when the other operand varies with the induction variable.
+        (B::Mul, x, y) if x.a == 0 => Some(Form {
+            exact,
+            a: x.b?.checked_mul(y.a)?,
+            b: x.b.zip(y.b).and_then(|(x, y)| x.checked_mul(y)),
+        }),
+        (B::Mul, x, y) if y.a == 0 => Some(Form {
+            exact,
+            a: y.b?.checked_mul(x.a)?,
+            b: x.b.zip(y.b).and_then(|(x, y)| x.checked_mul(y)),
         }),
         _ => None,
     }
+}
+
+fn integer_range(ty: Ty) -> Option<IterRange> {
+    let (lo, hi) = match ty {
+        Ty::I64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        Ty::I32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        _ => return None,
+    };
+    Some(IterRange { lo, hi })
+}
+
+/// Overapproximate all executed IV values, using each known bound separately.
+/// Unlike dependence refutation, no-wrap checking needs only an enclosure.
+fn iv_range(func: &FuncIr, lp: &Loop, iv: ValueId) -> IterRange {
+    let mut range = integer_range(func.val_ty(iv).unwrap_or(Ty::I64)).unwrap_or(IterRange {
+        lo: i128::from(i64::MIN),
+        hi: i128::from(i64::MAX),
+    });
+    if let Some(c) = canon::canon(func, lp)
+        && c.iv_value_in_loop == iv
+    {
+        // Canonical for loops execute only while iv < end. Even a symbolic
+        // end cannot exceed the signed type maximum.
+        range.hi -= 1;
+        let start_lo = match c.start {
+            Bound::Const(lo) => i128::from(lo),
+            Bound::Sym(v) => bound_range(func, ValueId(v), 0).lo,
+        };
+        range.lo = range.lo.max(start_lo);
+        if let Bound::Const(hi) = c.end {
+            range.hi = range.hi.min(i128::from(hi) - 1);
+        }
+    }
+    range
+}
+
+/// Casts stay symbolic in canonical bounds. A widening cast can still give
+/// no-wrap checking a safe enclosure without inventing an exact trip window.
+fn bound_range(func: &FuncIr, v: ValueId, depth: u32) -> IterRange {
+    let limits = integer_range(func.val_ty(v).unwrap_or(Ty::I64)).unwrap_or(IterRange {
+        lo: i128::from(i64::MIN),
+        hi: i128::from(i64::MAX),
+    });
+    if depth < 64
+        && let Some(Inst::Cast { val, to, .. }) = func.inst_defining(v)
+        && let (Some(from), Some(to)) = (
+            func.val_ty(*val).and_then(integer_range),
+            integer_range(*to),
+        )
+        && to.lo <= from.lo
+        && from.hi <= to.hi
+    {
+        return bound_range(func, *val, depth + 1);
+    }
+    limits
 }
 
 fn const_i128(c: &Constant) -> Option<i128> {
@@ -260,9 +377,7 @@ fn const_i128(c: &Constant) -> Option<i128> {
     }
 }
 
-/// Whole-function definition lookup for values outside the analyzed loop —
-/// the fallback that keeps *constants* numerically exact under the invariant
-/// collapse (see `classify`).
+/// Whole-function definition lookup for integer literals outside the loop.
 fn inside_inst_anywhere(func: &FuncIr, v: ValueId) -> Option<&Inst> {
     func.inst_defining(v)
 }

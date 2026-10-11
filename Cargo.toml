@@ -9,7 +9,10 @@ members = [
     "crates/helix-runtime",
     "crates/helix-engine",
     "crates/helix-bench",
+    "crates/helix-artifact",
     "crates/helix-observe",
+    "crates/helix-wasm",
+    "crates/helix-wasm-backend",
     "crates/helix-cli",
 ]
 
@@ -28,7 +31,9 @@ helix-backend  = { path = "crates/helix-backend" }
 helix-runtime  = { path = "crates/helix-runtime" }
 helix-engine   = { path = "crates/helix-engine" }
 helix-bench    = { path = "crates/helix-bench" }
+helix-artifact = { path = "crates/helix-artifact" }
 helix-observe  = { path = "crates/helix-observe" }
+helix-wasm-backend = { path = "crates/helix-wasm-backend" }
 
 # Cranelift — pin ALL members of the family to one identical minor.
 # They share ir::* types; mixed minors fail to compile with confusing errors.

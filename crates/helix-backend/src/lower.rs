@@ -547,11 +547,15 @@ pub(crate) fn translate_fn_rt(
         builder.ins().call(fref, &params);
         // Terminate with the signature's zero values (never reached by a
         // healthy program: the host has already recorded the error and will
-        // exit before control could continue). HELIX returns are scalars,
-        // so `iconst` covers every possible type here.
+        // exit before control could continue). Float returns need floating-
+        // point constants; integer and bool returns use `iconst`.
         let zeros: Vec<CValue> = ret_tys
             .iter()
-            .map(|&t| builder.ins().iconst(t, 0))
+            .map(|&t| match t {
+                types::F32 => const_value(&mut builder, &Constant::F32(0.0)),
+                types::F64 => const_value(&mut builder, &Constant::F64(0.0)),
+                _ => builder.ins().iconst(t, 0),
+            })
             .collect();
         builder.ins().return_(&zeros);
     }
@@ -811,7 +815,8 @@ fn guarded_divrem(
     let code_ovf = b.ins().iconst(types::I64, PanicCode::IdivOverflow.code());
     let code_div0 = b.ins().iconst(types::I64, PanicCode::DivByZero.code());
     let code = b.ins().select(nz, code_ovf, code_div0);
-    guard_split(b, lw, ok, code, zero, zero)?;
+    let payload_zero = b.ins().iconst(types::I64, 0);
+    guard_split(b, lw, ok, code, payload_zero, payload_zero)?;
 
     let q = if rem {
         b.ins().srem(dividend, divisor)

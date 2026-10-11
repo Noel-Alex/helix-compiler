@@ -111,6 +111,10 @@ fn interp_variant_compiles_and_executes_isolated_units() {
 
 #[test]
 fn native_variant_construction_matches_interp() {
+    // The JIT host heap and the trap recorder are process-global, and this
+    // binary's tests share threads: one thread's heap reset would free
+    // another's live arrays.
+    let _guard = helix_backend::testutil::serial_lock();
     match helix_bench::native_availability() {
         NativeAvailability::Ready => {
             // Real JIT construction: tiny program must run and agree with the
@@ -141,12 +145,16 @@ fn native_variant_construction_matches_interp() {
 
 #[test]
 fn campaign_json_shape_round_trips() {
+    // Campaigns build and run native variants, which touch process-global JIT
+    // host state; serialize against the other campaign tests in this binary.
+    let _guard = helix_backend::testutil::serial_lock();
     let config = BenchConfig {
         thread_sweep: vec![1],
         max_threads: 1,
         skip_triad: true,
         triad_n: 1024,
         only_kernels: vec!["small_n".to_string()],
+        quick: false,
     };
     let report = run_campaign(&config);
 
@@ -206,7 +214,9 @@ fn campaign_publishes_triad_at_one_thread_and_hw_width() {
         skip_triad: false,
         triad_n: 1 << 14,
         only_kernels: vec!["small_n".to_string()],
+        quick: false,
     };
+    let _guard = helix_backend::testutil::serial_lock();
     let report = run_campaign(&config);
     assert!(!report.triad_ceilings.is_empty(), "triad must be measured");
     assert_eq!(report.triad_ceilings[0].threads, 1);
@@ -219,10 +229,12 @@ fn campaign_publishes_triad_at_one_thread_and_hw_width() {
         // row may honestly be slower. The fix under test is that BOTH widths
         // get measured and published, not which one wins.
     }
-    assert!(report
-        .triad_ceilings
-        .iter()
-        .all(|t| t.gib_per_sec.is_finite() && t.gib_per_sec > 0.0));
+    assert!(
+        report
+            .triad_ceilings
+            .iter()
+            .all(|t| t.gib_per_sec.is_finite() && t.gib_per_sec > 0.0)
+    );
     // Legacy field mirrors row 0 so old readers keep working.
     assert_eq!(
         report.triad_ceiling.map(|t| t.gib_per_sec),
@@ -259,12 +271,16 @@ fn read_json_accepts_legacy_single_row_triad_schema() {
     std::fs::write(&path, legacy).unwrap();
     let back = helix_bench::read_json(&path).unwrap();
     assert_eq!(back.triad_ceiling.unwrap().gib_per_sec, 33.5);
-    assert!(back.triad_ceilings.is_empty(), "legacy file has no new field");
+    assert!(
+        back.triad_ceilings.is_empty(),
+        "legacy file has no new field"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn campaign_includes_expected_verdict_labels() {
+    let _guard = helix_backend::testutil::serial_lock();
     let config = BenchConfig {
         skip_triad: true,
         triad_n: 1024,

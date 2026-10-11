@@ -1,0 +1,98 @@
+# Deploy the Observatory to GitHub Pages.
+#
+# Pages serves only static files — and that is the whole point here. The wasm
+# bridge (`web/wasm/helix-lab.wasm`, built in this workflow) does all of the
+# compilation in the browser: lexer, parser, checker, IR/SSA, optimization,
+# WebAssembly emission, the reference interpreter, and the compiled-module run.
+# The repository's examples are shipped as plain sources under
+# `web/data/examples/<name>.hx`, which the static mode fetches at runtime. No
+# server of any kind is involved once the page is live; the Rust Observatory
+# process stays a local-only convenience.
+
+name: Deploy Pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    env:
+      RUST_TEST_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo build wasm lab
+        run: cargo build --release --target wasm32-unknown-unknown -p helix-wasm
+
+      # Pages must ship the current compiler, so the freshly built module
+      # replaces the committed one inside this runner's copy only.
+      - name: ship built wasm as web/wasm/helix-lab.wasm
+        shell: pwsh
+        run: |
+          $built = "target/wasm32-unknown-unknown/release/helix_wasm.wasm"
+          if (!(Test-Path $built)) { throw "build did not produce $built" }
+          if ((Get-Item $built).Length -eq 0) { throw "$built is empty" }
+          New-Item -ItemType Directory -Force web/wasm | Out-Null
+          Copy-Item $built web/wasm/helix-lab.wasm
+          Write-Output "deployed $((Get-Item web/wasm/helix-lab.wasm).Length) bytes"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: node web/app.test.mjs
+        run: node web/app.test.mjs
+
+      - name: node web/wasm/helix-browser.test.mjs
+        run: node web/wasm/helix-browser.test.mjs
+
+      # Static mode fetches /data/examples/<name>.hx, so the examples travel
+      # with the site.
+      - name: stage examples for static mode
+        shell: pwsh
+        run: |
+          if (!(Test-Path examples)) { throw "missing examples/ directory" }
+          New-Item -ItemType Directory -Force web/data | Out-Null
+          Remove-Item -Recurse -Force web/data/examples -ErrorAction SilentlyContinue
+          Copy-Item -Recurse examples web/data/examples
+
+      - name: upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -410,16 +410,42 @@ fn const_fold_integer_wrapping_unchanged_by_float_fix() {
         ),
         Some(helix_ir::Constant::I64(0))
     );
-    // Integers fold at i64 width regardless of literal class (pre-existing
-    // widening design) — pinned so the float-width fix cannot drift it.
+    // Narrow integers keep their width and wrap at the i32 boundary.
     assert_eq!(
         fold_bin(
             BinOp::Add,
             helix_ir::Constant::I32(i32::MAX),
             helix_ir::Constant::I32(1)
         ),
-        Some(helix_ir::Constant::I64(2147483648))
+        Some(helix_ir::Constant::I32(i32::MIN))
     );
+}
+
+#[test]
+fn const_fold_i32_preserves_width_and_runtime_boundaries() {
+    use helix_ir::{Constant, passes::fold_bin};
+    use helix_syntax::BinOp::*;
+
+    for (op, a, b, expected) in [
+        (Sub, i32::MIN, 1, Constant::I32(i32::MAX)),
+        (Mul, i32::MAX, 2, Constant::I32(-2)),
+        (Div, -7, 2, Constant::I32(-3)),
+        (Rem, -7, 2, Constant::I32(-1)),
+        (Lt, i32::MIN, i32::MAX, Constant::Bool(true)),
+    ] {
+        assert_eq!(
+            fold_bin(op, Constant::I32(a), Constant::I32(b)),
+            Some(expected)
+        );
+    }
+    for op in [Div, Rem] {
+        assert_eq!(
+            fold_bin(op, Constant::I32(i32::MIN), Constant::I32(-1)),
+            None
+        );
+        assert_eq!(fold_bin(op, Constant::I32(7), Constant::I32(0)), None);
+    }
+    assert_eq!(fold_bin(Add, Constant::I32(1), Constant::I64(1)), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -705,5 +731,79 @@ fn licm_still_forwards_multiple_jump_preds_and_hoists() {
     assert!(
         pre.is_some(),
         "hoisted add lives in the forwarding preheader"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. short-circuit operators inside call arguments reserve their $sc cell
+// ---------------------------------------------------------------------------
+
+#[test]
+fn short_circuit_inside_call_arguments_constructs_and_verifies() {
+    // scan_expr used to skip Call subtrees, so `print(true && false)` popped
+    // from an empty $sc reservation and panicked ("short-circuit reservation").
+    let src = r#"
+        fn id(p: bool) -> bool { return p; }
+        fn main() {
+            print(true && false);
+            print(false || id(true));
+            print(id(true) && id(false));
+        }
+    "#;
+    let f = compile(src).into_iter().next().unwrap();
+    verify(&f).unwrap_or_else(|e| panic!("verify pre-SSA: {e}"));
+    let mut ssa = f;
+    to_ssa(&mut ssa);
+    run_passes_to_fixpoint(&mut ssa);
+    verify(&ssa).unwrap_or_else(|e| panic!("verify post-SSA: {e}"));
+}
+
+// ---------------------------------------------------------------------------
+// 6. float copies preserve -0.0 (same-type cast, not x + 0.0)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn float_copies_use_identity_cast_not_zero_add() {
+    let src = r#"
+        fn main() {
+            let x: f64 = 0.0;
+            let y: f64 = x;
+            print(y);
+        }
+    "#;
+    let f = compile(src).into_iter().next().unwrap();
+    // The copy of a variable initialization must be a same-type Cast; the old
+    // `src + 0.0` shape both erased -0.0 and folded away.
+    let has_cast = f.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                helix_ir::Inst::Cast {
+                    to: helix_sema::Ty::F64,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(
+        has_cast,
+        "float copy must be Inst::Cast:\n{}",
+        print_ir(&f, true)
+    );
+    let has_zero_add = f.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                helix_ir::Inst::Bin {
+                    op: helix_syntax::BinOp::Add,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(
+        !has_zero_add,
+        "no Add may back a plain variable copy:\n{}",
+        print_ir(&f, true)
     );
 }

@@ -132,6 +132,140 @@ fn loop_sums_array_elements() {
 }
 
 #[test]
+fn for_loop_end_is_evaluated_once() {
+    let src = r#"
+        fn main() {
+            let n = 3;
+            let count = 0;
+            for i in 0..n {
+                n = 0;
+                count = count + 1;
+            }
+            print(count);
+        }
+    "#;
+    let (got, _) = assert_parity(src);
+    assert_eq!(got, vec!["3"]);
+}
+
+#[test]
+fn optimized_i32_arithmetic_preserves_width() {
+    let src = r#"
+        fn main() {
+            let max: i32 = 2147483647;
+            let min = max + 1;
+            print(min);
+            print(min - 1);
+            print(max * 2);
+            print((min + 1) / 2);
+            print((min + 1) % 2);
+        }
+    "#;
+    let (expected, _) = assert_parity(src);
+    assert_eq!(
+        expected,
+        vec!["-2147483648", "2147483647", "-2", "-1073741823", "-1"]
+    );
+    let mut irs = compile_ir(src);
+    for f in &mut irs {
+        helix_ir::run_passes_to_fixpoint(f);
+    }
+    let engine = JitEngine::compile(&irs, &helix_backend::ParallelPlan::default(), false)
+        .expect("optimized JIT compile");
+    let (got, result) = helix_backend::engine::capture_prints(|| engine.run_main());
+    result.expect("optimized JIT run");
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn narrowing_bound_and_wrapping_indices_stay_sequential() {
+    let cases = [
+        (
+            "let raw = 4294967297;
+          let start = raw as i32 as i64;
+          for i in start..4 { a[i] = a[i - 1] + 1; }",
+            "3",
+        ),
+        (
+            "for i in 1..4 { a[(i * 4294967296) * 4294967296] = i; }",
+            "0",
+        ),
+        (
+            "for i in 1..4 { a[((i as i32 * 65536) * 65536) as i64] = i; }",
+            "0",
+        ),
+        (
+            "for i in 1..4 {
+            a[i] = a[((i + 9223372036854775807) + 9223372036854775807) + 1] + 1;
+          }",
+            "3",
+        ),
+        (
+            "for i in 1..4 {
+            a[i] = i;
+            a[((i + 9223372036854775807) + 9223372036854775807) + 1] = 9;
+          }",
+            "3",
+        ),
+    ];
+    for (body, last) in cases {
+        let src = format!("fn main() {{ let a: [i64] = zeros(4); {body} print(a[3]); }}");
+        assert!(analyze_plan(&compile_ir(&src)).regions.is_empty(), "{body}");
+        // Explicitly sequential JIT: never execute a suspect parallel plan.
+        let (got, _) = assert_parity(&src);
+        assert_eq!(got, vec![last]);
+    }
+}
+
+#[test]
+fn wrapping_indices_and_narrowed_start_stay_sequential() {
+    let cases = [
+        (
+            "fn main() {
+                let a: [i64] = zeros(1);
+                for i in 0..4 { a[(i * 4294967296) * 4294967296] = i; }
+                print(a[0]);
+            }",
+            "3",
+        ),
+        (
+            "fn main() {
+                let raw = 4294967297;
+                let start = raw as i32 as i64;
+                let a: [i64] = zeros(4);
+                for i in start..4 { a[i] = a[i - 1] + 1; }
+                print(a[3]);
+            }",
+            "3",
+        ),
+        (
+            "fn main() {
+                let a: [i64] = zeros(4);
+                for i in 1..4 {
+                    a[i] = a[((i + 9223372036854775807) + 9223372036854775807) + 1] + 1;
+                }
+                print(a[3]);
+            }",
+            "3",
+        ),
+        (
+            "fn main() {
+                let a: [i64] = zeros(1);
+                for i in 0..4 { a[((i as i32 * 65536) * 65536) as i64] = i; }
+                print(a[0]);
+            }",
+            "3",
+        ),
+    ];
+    for (src, expected) in cases {
+        assert!(analyze_plan(&compile_ir(src)).regions.is_empty());
+        // Explicitly use the sequential harness, never a speculative plan.
+        let (got, _) = assert_parity(src);
+        assert_eq!(got, vec![expected]);
+    }
+}
+
+#[test]
 fn ssa_demo_shape_prints_10() {
     let src = include_str!("../../../examples/ssa_demo.hx");
     let (got, _) = assert_parity(src);
@@ -447,6 +581,42 @@ fn division_guards_allow_normal_values() {
 }
 
 #[test]
+fn regression_i32_divrem_panic_payload_width() {
+    let src = r#"
+        fn main() {
+            let a: i32 = 8;
+            let b: i32 = 3;
+            print(a / b);
+            print(a % b);
+        }
+    "#;
+    let (got, _) = assert_parity(src);
+    assert_eq!(got, vec!["2", "2"]);
+}
+
+#[test]
+fn regression_float_returns_with_panic_guards() {
+    let src = r#"
+        fn first32(a: [f32], n: i64) -> f32 {
+            return a[n / 2];
+        }
+        fn first64(a: [f64], n: i64) -> f64 {
+            return a[n / 2];
+        }
+        fn main() {
+            let a: [f32] = zeros(1);
+            let b: [f64] = zeros(1);
+            a[0] = 1.25;
+            b[0] = 2.5;
+            print(first32(a, 0));
+            print(first64(b, 0));
+        }
+    "#;
+    let (got, _) = assert_parity(src);
+    assert_eq!(got, vec!["1.25", "2.5"]);
+}
+
+#[test]
 fn i32_min_div_minus_one_guard_matches_interp_width() {
     // The i32 edge traps at i32 width (interpreter semantics), exercised via
     // a cast chain so both backends see identical values. Sema types unannotated
@@ -565,6 +735,38 @@ fn parallel_saxpy_small_matches_interpreter_checksum() {
     "#;
     let out = assert_parallel_parity(src, 2); // init loop + saxpy loop
     assert_eq!(out[0], "18.5");
+}
+
+#[test]
+fn regression_parallel_f32_capture_native_width() {
+    let src = r#"
+        fn main() {
+            let a: [f32] = zeros(50000);
+            let scale: f32 = 1.25;
+            for i in 0..50000 {
+                a[i] = scale * (i as f32);
+            }
+            print(a[7]);
+            print(a[49999]);
+        }
+    "#;
+    let out = assert_parallel_parity(src, 1);
+    assert_eq!(out, vec!["8.75", "62498.75"]);
+}
+
+#[test]
+fn regression_parallel_reduction_seed_counted_once() {
+    let src = r#"
+        fn main() {
+            let s = 7;
+            for i in 0..100000 {
+                s = s + 1;
+            }
+            print(s);
+        }
+    "#;
+    let out = assert_parallel_parity(src, 1);
+    assert_eq!(out, vec!["100007"]);
 }
 
 #[test]
@@ -889,13 +1091,12 @@ fn array_only_parallel_region_writes_correctly() {
 // Regression: zeros() inside an approved DOALL loop (compile-failure fix)
 // ---------------------------------------------------------------------------
 
-/// `zeros` inside an otherwise-approvable DOALL loop used to pass the
-/// extractor's builtin whitelist and then fail the WHOLE JIT compile: the
-/// freshly allocated array has no parent-side fat pointer to stash
-/// (`emit_region_dispatch` → `lookup_array` → "array local lN referenced
-/// before allocation"), because its defining call lives in the orphaned loop
-/// blocks. Extraction now demotes any region containing `zeros` to the
-/// sequential path, so the program compiles and stays differential.
+/// `zeros` inside a loop: the freshly allocated array has no parent-side fat
+/// pointer to stash, so the backend's extractor demotes any region containing
+/// it. Analysis now also vetoes the shape up front — accesses through a
+/// per-iteration allocation cannot be proven independent, so the plan carries
+/// 0 regions. This pins BOTH halves of the contract: the conservative veto,
+/// and correct sequential-JIT output that still matches the interpreter.
 #[test]
 fn zeros_inside_parallel_loop_still_correct() {
     let src = r#"
@@ -903,39 +1104,113 @@ fn zeros_inside_parallel_loop_still_correct() {
             let n = 100;
             let out: [i64] = zeros(n);
             for i in 0..n {
-                let t: [i64] = zeros(8);
-                t[3] = i * 2;
-                out[i] = t[3] + t[4];
+                let t: [i64] = zeros(n + 1);
+                t[i] = i * 2;
+                out[i] = t[i] + t[n];
             }
             print(out[50]);
             print(out[99]);
         }
     "#;
-    // The analysis layer still APPROVES the loop (zeros is a pure builtin
-    // and the fresh array carries no cross-iteration dependence): demotion
-    // is the backend's extraction-time decision, invisible to the plan.
     let irs = compile_ir(src);
     let plan = analyze_plan(&irs);
-    assert_eq!(
-        plan.regions.len(),
-        1,
-        "DOALL shape must remain analysis-approved"
+    assert!(
+        plan.regions.is_empty(),
+        "per-iteration allocation must be conservatively vetoed"
     );
 
-    // The full planned pipeline must COMPILE (it used to abort in the parent
-    // stash emission) and match the interpreter byte-for-byte.
+    // The program must still COMPILE and match the interpreter byte-for-byte
+    // on the sequential path the veto selects.
     let ast = helix_syntax::parse_str(src).expect("parse");
     let typed = helix_sema::check(&ast).expect("sema");
     let interp = helix_engine::run_with_source(src, &typed)
         .expect("interp run")
         .printed;
-    let engine =
-        JitEngine::compile(&irs, &to_backend_plan(&plan), false).expect("zeros-in-region compile");
+    let engine = JitEngine::compile(&irs, &helix_backend::ParallelPlan::default(), false)
+        .expect("sequential compile");
     let (lines, result) = helix_backend::engine::capture_prints(|| engine.run_main());
     result.expect("run");
     assert_eq!(lines, interp);
-    // t[4] is always 0, so out[i] = i*2 ⇒ 100 and 198.
+    // t[n] is always 0, so out[i] = i*2 ⇒ 100 and 198.
     assert_eq!(interp, vec!["100", "198"]);
+}
+
+// ---------------------------------------------------------------------------
+// False-veto relaxations must survive the backend's own extraction gate
+// ---------------------------------------------------------------------------
+
+/// A dead loop-header temporary (overwritten before any read every iteration)
+/// used to force SEQUENTIAL in analysis AND a backend gate veto. Both sides
+/// now ignore provably unused header phis; the loop must actually parallelize
+/// and stay byte-for-byte differential.
+#[test]
+fn dead_header_temporary_still_parallelizes() {
+    let src = r#"
+        fn main() {
+            let a: [i64] = zeros(64);
+            for i in 0..64 {
+                let t = i * 2;
+                a[i] = t;
+            }
+            print(a[7]);
+            print(a[63]);
+        }
+    "#;
+    let irs = compile_ir(src);
+    let plan = analyze_plan(&irs);
+    assert_eq!(
+        plan.regions.len(),
+        1,
+        "dead header temp must not veto DOALL"
+    );
+    let ast = helix_syntax::parse_str(src).expect("parse");
+    let typed = helix_sema::check(&ast).expect("sema");
+    let interp = helix_engine::run_with_source(src, &typed)
+        .expect("interp run")
+        .printed;
+    let engine = JitEngine::compile(&irs, &to_backend_plan(&plan), false).expect("compile");
+    let (lines, result) = helix_backend::engine::capture_prints(|| engine.run_main());
+    result.expect("run");
+    assert_eq!(lines, interp);
+    assert_eq!(interp, vec!["14", "126"]);
+}
+
+/// A sole write `a[i+k]` with a loop-invariant parameter k is translation by
+/// k — injective, no self-overlap. Both the analysis (IV coefficient) and the
+/// backend gate must approve it, with output parity.
+#[test]
+fn invariant_offset_sole_write_still_parallelizes() {
+    let src = r#"
+        fn fill(k: i64, a: [i64]) {
+            for i in 0..10 {
+                a[i + k] = i;
+            }
+        }
+        fn main() {
+            let buf: [i64] = zeros(20);
+            fill(5, buf);
+            print(buf[5]);
+            print(buf[14]);
+            print(buf[4]);
+        }
+    "#;
+    let irs = compile_ir(src);
+    let plan = analyze_plan(&irs);
+    assert_eq!(
+        plan.regions.len(),
+        1,
+        "invariant-offset sole write must not veto DOALL"
+    );
+    let ast = helix_syntax::parse_str(src).expect("parse");
+    let typed = helix_sema::check(&ast).expect("sema");
+    let interp = helix_engine::run_with_source(src, &typed)
+        .expect("interp run")
+        .printed;
+    let engine = JitEngine::compile(&irs, &to_backend_plan(&plan), false).expect("compile");
+    let (lines, result) = helix_backend::engine::capture_prints(|| engine.run_main());
+    result.expect("run");
+    assert_eq!(lines, interp);
+    assert_eq!(interp, vec!["0", "9", "0"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,4 +1349,32 @@ fn i32_sum_reduction_matches_interpreter() {
     // Hand-computed: 76 full cycles of 0..=12 sum to 76*78, the trailing 12
     // partials add 66, plus the seed 7.
     assert_eq!(out[0], "6001", "i32 reduction printed {}", out[0]);
+}
+
+// ---------------------------------------------------------------------------
+// Negative zero must survive copies (build.rs copy_value uses a same-type
+// cast, not `x + 0.0`, which would canonicalize -0.0 to +0.0).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn float_copies_preserve_negative_zero_both_widths() {
+    // 1/x distinguishes -0.0 (-inf) from +0.0 (+inf). `x * -1.0` mints the
+    // negative zero at runtime; plain `let` copies must not launder it.
+    let src = r#"
+        fn main() {
+            let a: f64 = 0.0;
+            let na: f64 = a * -1.0;
+            let b: f64 = na;
+            print(1.0 / b);
+
+            let c: f32 = -0.0 as f32;
+            let d: f32 = c;
+            let e: f64 = d as f64;
+            print(1.0 / e);
+        }
+    "#;
+    let (jitd, interp) = assert_parity(src);
+    assert!(jitd[0].contains("-inf"), "f64 copy lost -0.0: {jitd:?}");
+    assert!(jitd[1].contains("-inf"), "f32 copy lost -0.0: {jitd:?}");
+    let _ = interp;
 }

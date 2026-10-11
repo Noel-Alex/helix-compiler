@@ -13,6 +13,7 @@ helix-syntax = { workspace = true }
 helix-sema = { workspace = true }
 helix-ir = { workspace = true }
 helix-analysis = { workspace = true }
+helix-artifact = { workspace = true }
 helix-backend = { workspace = true }
 helix-runtime = { workspace = true }
 helix-engine = { workspace = true }

@@ -6,8 +6,7 @@
 //! - `dump <stage> <file.hx>` — print a pipeline stage (tokens|ast|ir|ssa)
 //!   for eyeballing and golden tests
 //!
-//! The JIT backend (`--backend jit`) and the Observatory server live in later
-//! milestones; the argument surface already reserves them.
+//! Use `run --backend jit` for native execution and `observe` for the Observatory.
 
 use std::path::PathBuf;
 
@@ -67,7 +66,7 @@ fn dispatch(args: &[String]) -> i32 {
 fn print_subcommand_help(cmd: &str) {
     let text = match cmd {
         "run" => {
-            "helix run <file.hx> [options]\n\nExecutes a HELIX program.\n\n  --backend <interp|jit>   backend choice; default interp.\n                           --backend=jit also accepted. The JIT compiles\n                           through Cranelift and parallelizes approved loops.\n  --threads <n> (-t)       cap parallel loops at n threads for this run.\n  --unchecked              strip array bounds checks (JIT only).\n\nExit codes: 0 ok · 1 runtime/compile error · 2 bad arguments."
+            "helix run <file.hx> [options]\n\nExecutes a HELIX program.\n\n  --backend <interp|jit>   backend choice; default interp.\n                           --backend=jit also accepted. The JIT compiles\n                           through Cranelift using the shared pipeline\n                           (parse → check → IR → SSA → optimizer → analysis),\n                           so eligible approved loops may run in parallel,\n                           with sequential fallback.\n  --threads <n> (-t)       cap parallel loops at n threads for this run.\n  --unchecked              strip array bounds checks (JIT only).\n\nSuccessful runs print stats to stderr. Interp reports execution ms\n(including checksum work, excluding stdout replay), printed line count, and a\nchecksum of printed lines plus arrays still visible at the end of main. JIT\nreports a compile-to-run total (shared pipeline, Cranelift compile, and run),\ncompile ms, run ms, and planned parallel regions, not dispatches; run ms\nincludes streamed stdout. Matching stdout is not equivalent checksum evidence;\nthe JIT reports no checksum. --threads N pins N participants, clamped only by\nthe machine's hardware.\n\nExit codes: 0 ok · 1 runtime/compile/file or usage error · 2 unknown backend."
         }
         "check" => {
             "helix check <file.hx>\n\nType-checks only; prints diagnostics with source carets.\nExit codes: 0 ok · 1 diagnostics found."
@@ -79,10 +78,10 @@ fn print_subcommand_help(cmd: &str) {
             "helix loops <file.hx>\n\nRuns loop detection + the dependence battery and prints one verdict\nper loop:\n  SAFE         iterations proven independent -> DOALL parallel\n  REDUCTION(op) associative accumulation -> private partials + combine\n  SEQUENTIAL   refused; the reason line names the carrying access pair"
         }
         "bench" => {
-            "helix bench [--quick] [--out <dir>]\n\nRuns the benchmark campaign: interleaved sampling, CV-gated reruns,\nchecksummed parity gates, and analyzer-verdict assertions.\n  --quick     smaller sizes for fast turnaround\n  --out <dir> output directory (default docs/benchmarks/data)"
+            "helix bench [--quick] [--out <dir>]\n\nRuns the benchmark campaign: interleaved sampling, CV-gated reruns,\nchecksummed parity gates, and analyzer-verdict assertions.\n  --quick     smoke run — smallest size per kernel, a {1, hardware} thread\n              sweep, and 5 samples per variant. Same code path, far less\n              wall-clock; it publishes no publishable numbers.\n  --out <dir> output directory (default docs/benchmarks/data)"
         }
         "observe" => {
-            "helix observe [--port <n>] [--no-open]\n\nLaunches the Observatory web UI at http://127.0.0.1:<port> (default 8931)\nand opens a browser tab unless --no-open is given."
+            "helix observe [--host <addr>] [--port <n>] [--no-open]\n\nLaunches the Observatory web UI at the selected address (default 127.0.0.1:8931)\nand opens a browser tab unless --no-open is given."
         }
         "selftest" => {
             "helix selftest\n\nDifferential gauntlet: every examples/*.hx runs through BOTH backends;\nprinted output must be byte-identical. Exit 1 on any mismatch."
@@ -121,16 +120,19 @@ USAGE:
 RUN OPTIONS:
     --backend <interp|jit>   execution backend (default: interp).
                              `--backend=jit` also accepted. The JIT compiles
-                             through Cranelift and parallelizes approved loops.
+                             through Cranelift; eligible approved loops may run
+                             in parallel, with sequential fallback.
     --unchecked              strip array bounds checks (JIT only); division
                              guards always remain.
 
 BENCH OPTIONS:
-    --quick                  smaller sizes, faster turnaround
+    --quick                  smoke run: smallest size per kernel, a
+                             {{1, hardware}} thread sweep, 5 samples per variant
     --out <dir>              output directory (default: docs/benchmarks/data)
 
 OBSERVE OPTIONS:
     --port <n>               port to bind (default: 8931)
+    --host <addr>            IP address to bind (default: 127.0.0.1)
     --no-open                do not open a browser tab automatically
 
 ENVIRONMENT (all optional):
@@ -230,13 +232,27 @@ fn cmd_run(rest: &[String]) -> i32 {
         Err(code) => return code,
     };
     if backend == "jit" {
-        return run_jit(&src, &program, unchecked);
+        // `frontend` already ran so diagnostics render with carets; the shared
+        // pipeline below re-derives the compile from the source text so the
+        // JIT path and every other consumer execute the identical stage
+        // sequence, optimizer included.
+        return run_jit(&src, unchecked);
     }
+    let start = std::time::Instant::now();
     match helix_engine::run_with_source(&src, &program) {
         Ok(out) => {
+            let elapsed = start.elapsed();
             for line in &out.printed {
                 println!("{line}");
             }
+            // Stats go to stderr so piped/compared stdout stays byte-identical
+            // across backends (selftest contract).
+            eprintln!(
+                "[interp] {:.1} ms · {} lines · checksum 0x{:016x}",
+                elapsed.as_secs_f64() * 1_000.0,
+                out.printed.len(),
+                out.checksum
+            );
             0
         }
         // Buffered lines go to stdout BEFORE the error (stderr), exactly as
@@ -251,47 +267,68 @@ fn cmd_run(rest: &[String]) -> i32 {
     }
 }
 
-/// JIT execution path: lower -> analyze -> plan -> compile -> run.
-fn run_jit(_src: &str, program: &TypedProgram, unchecked: bool) -> i32 {
-    let mut funcs = helix_ir::build(program);
-    for f in &mut funcs {
-        helix_ir::to_ssa(f);
-    }
-    // Analysis + plan (regions only when parallelization is sound).
-    let mut loops_per_fn = Vec::new();
-    let mut reports_per_fn = Vec::new();
-    for f in &funcs {
-        let li = helix_analysis::find_loops(f);
-        let reps = helix_analysis::analyze(f, &li);
-        loops_per_fn.push(li);
-        reports_per_fn.push(reps);
-    }
-    let plan = helix_analysis::build_plan(&funcs, &loops_per_fn, &reports_per_fn);
+/// JIT execution path: shared compile pipeline → plan → Cranelift compile → run.
+///
+/// The pipeline is [`helix_artifact::prepare_pipeline`] — the same sequence
+/// the Observatory artifact and the benchmark campaign run — so the native
+/// path executes post-SSA, post-optimizer IR and its parallel plan is derived
+/// from that IR rather than from a stage the user was never shown.
+fn run_jit(src: &str, unchecked: bool) -> i32 {
+    let jit_start = std::time::Instant::now();
+    let units = match helix_artifact::prepare_pipeline(src) {
+        Ok(u) => u,
+        Err(msg) => {
+            eprintln!("jit compile error: {msg}");
+            return 1;
+        }
+    };
 
     // Production JIT runs use the engine's normal error path: the first
     // runtime guard prints `runtime error: ...` and exits with status 1
     // (helix_panic). The test-only trap recorder must stay disarmed here —
     // arming it made guards record-and-RESUME, so a trapping program kept
     // executing on dummy values and printed garbage after the error.
-    let engine = match helix_backend::JitEngine::compile(&funcs, &to_backend_plan(&plan), unchecked)
-    {
+    let compile_start = std::time::Instant::now();
+    let engine = match helix_backend::JitEngine::compile(
+        &units.funcs,
+        &helix_bench::to_backend_plan(&units.plan),
+        unchecked,
+    ) {
         Ok(e) => e,
         Err(msg) => {
             eprintln!("jit compile error: {msg}");
             return 1;
         }
     };
+    let compile_elapsed = compile_start.elapsed();
     // Prints stream straight to stdout as the JITed code runs (the engine's
     // default sink). Capturing them and replaying after run_main would LOSE
     // every line on a trap: helix_panic exits the process inside run_main,
     // before the replay loop. Streaming keeps stdout identical to the
     // interpreter on trapping programs.
+    let run_start = std::time::Instant::now();
     let result = engine.run_main();
-    if let Err(msg) = result {
-        eprintln!("{msg}");
-        return 1;
+    let run_elapsed = run_start.elapsed();
+    let total_elapsed = jit_start.elapsed();
+    match result {
+        Ok(()) => {
+            // Total starts at the shared pipeline (the CLI's diagnostic-only
+            // `frontend` pass already ran outside it). Plan size is not a
+            // dispatch count: regions can fall back or never run.
+            eprintln!(
+                "[jit] compile-to-run total {:.1} ms (compile {:.1} ms, run {:.1} ms) · planned parallel regions {}",
+                total_elapsed.as_secs_f64() * 1_000.0,
+                compile_elapsed.as_secs_f64() * 1_000.0,
+                run_elapsed.as_secs_f64() * 1_000.0,
+                units.plan.regions.len()
+            );
+            0
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            1
+        }
     }
-    0
 }
 
 fn cmd_check(path: Option<&String>) -> i32 {
@@ -381,21 +418,32 @@ fn print_diag_src(src: &str, filename: &str, span: Span, msg: &str) {
 // loops: dependence verdicts per loop
 // ---------------------------------------------------------------------------
 
+/// `helix loops <file.hx>`: dependence verdicts per loop.
+///
+/// Runs the SHARED compile pipeline, so the verdicts describe the same
+/// post-SSA, post-optimizer IR the JIT compiles and the Observatory shows.
+/// Judging a pre-optimizer snapshot here would let the command contradict
+/// `helix run --backend jit` about which loops are parallel.
 fn cmd_loops(path: &str) -> i32 {
-    let program = match frontend(path) {
-        Ok(p) => p,
-        Err(code) => return code,
+    let src = std::fs::read_to_string(PathBuf::from(path)).unwrap_or_default();
+    let units = match helix_artifact::prepare_pipeline(&src) {
+        Ok(u) => u,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return 1;
+        }
     };
-    let funcs = helix_ir::build(&program);
-    for f in &funcs {
-        let mut f = clone_fn(f);
-        helix_ir::to_ssa(&mut f);
-        let li = helix_analysis::find_loops(&f);
+    for (f, li) in units.funcs.iter().zip(&units.loops) {
         if li.loops.is_empty() {
             continue;
         }
         println!("==== {} loop analysis ====", f.name);
-        for rep in helix_analysis::analyze(&f, &li) {
+        for rep in units
+            .reports
+            .iter()
+            .flatten()
+            .filter(|rep| li.loops.iter().any(|l| l.id == rep.loop_id))
+        {
             println!("{}", rep.summary_line());
             for line in &rep.accesses {
                 println!("    {line}");
@@ -413,10 +461,6 @@ fn cmd_loops(path: &str) -> i32 {
     0
 }
 
-fn clone_fn(f: &helix_ir::FuncIr) -> helix_ir::FuncIr {
-    f.clone()
-}
-
 // ---------------------------------------------------------------------------
 // bench / observe / selftest
 // ---------------------------------------------------------------------------
@@ -429,7 +473,7 @@ fn cmd_bench(args: &[String]) -> i32 {
         .and_then(|i| args.get(i + 1))
         .map_or_else(|| PathBuf::from("docs/benchmarks/data"), PathBuf::from);
     std::fs::create_dir_all(&out).expect("create bench dir");
-    match helix_bench::campaign_main(&out) {
+    match helix_bench::campaign_main_with(&out, quick) {
         Ok(()) => {
             if !quick {
                 println!("campaign complete — JSONs in {}", out.display());
@@ -445,10 +489,14 @@ fn cmd_bench(args: &[String]) -> i32 {
 
 fn cmd_observe(args: &[String]) -> i32 {
     let mut port: u16 = 8931;
+    let mut host = "127.0.0.1";
     let mut open = true;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--host" => {
+                host = it.next().map(String::as_str).unwrap_or(host);
+            }
             "--port" => {
                 port = it.next().and_then(|v| v.parse().ok()).unwrap_or(port);
             }
@@ -464,7 +512,13 @@ fn cmd_observe(args: &[String]) -> i32 {
         .canonicalize()
         .ok();
     let cfg = helix_observe::ServeConfig {
-        addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        addr: match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => std::net::SocketAddr::from((ip, port)),
+            Err(_) => {
+                eprintln!("error: invalid observe host '{host}'");
+                return 2;
+            }
+        },
         open_browser: open,
         examples_dir,
     };
@@ -515,18 +569,17 @@ fn cmd_selftest() -> i32 {
         };
         // Interpreter oracle.
         let interp = helix_engine::run_with_source(&src, &program);
-        // JIT.
-        let mut funcs = helix_ir::build(&program);
-        for f in &mut funcs {
-            helix_ir::to_ssa(f);
-        }
-        let li: Vec<_> = funcs.iter().map(helix_analysis::find_loops).collect();
-        let reps: Vec<_> = funcs
-            .iter()
-            .zip(&li)
-            .map(|(f, l)| helix_analysis::analyze(f, l))
-            .collect();
-        let plan = helix_analysis::build_plan(&funcs, &li, &reps);
+        // JIT: the SAME shared compile pipeline every other consumer runs, so
+        // the differential comparison is against the compiler as shipped, not
+        // a hand-inlined second copy of the stage order.
+        let units = match helix_artifact::prepare_pipeline(&src) {
+            Ok(u) => u,
+            Err(msg) => {
+                println!("  FAIL {name}: jit pipeline: {msg}");
+                fail += 1;
+                continue;
+            }
+        };
 
         // The recorder stays DISARMED in selftest too: with it armed, a JIT
         // run that hits a runtime guard records-and-resumes and reports Ok,
@@ -536,8 +589,11 @@ fn cmd_selftest() -> i32 {
         // (the deliberately-trapping ones are frontend rejects), so no
         // example should ever reach a guard. If one does, the abort IS the
         // signal; the harness treats a missing exit as a failure upstream.
-        let engine = match helix_backend::JitEngine::compile(&funcs, &to_backend_plan(&plan), false)
-        {
+        let engine = match helix_backend::JitEngine::compile(
+            &units.funcs,
+            &helix_bench::to_backend_plan(&units.plan),
+            false,
+        ) {
             Ok(e) => e,
             Err(msg) => {
                 println!("  FAIL {name}: jit compile: {msg}");
@@ -551,7 +607,7 @@ fn cmd_selftest() -> i32 {
             (Ok(i), Ok(())) => {
                 if i.printed == jit_prints {
                     println!(
-                        "  ok   {name} ({} lines, checksum {:016x})",
+                        "  ok   {name} ({} lines, interp checksum {:016x})",
                         i.printed.len(),
                         i.checksum
                     );
@@ -580,31 +636,4 @@ fn cmd_selftest() -> i32 {
     }
     println!("selftest: {pass} passed, {fail} failed");
     if fail > 0 { 1 } else { 0 }
-}
-
-/// Convert an analysis plan to the backend's seam type (M10: the fields map
-/// 1:1 and reduction operators pass through so min/max regions combine with
-/// the right monoid).
-fn to_backend_plan(p: &helix_analysis::ParallelPlan) -> helix_backend::ParallelPlan {
-    use helix_backend::engine::helix_analysis_stub::ReductionOp as BOp;
-    let mut out = helix_backend::ParallelPlan::default();
-    for r in &p.regions {
-        out.regions.push(helix_backend::RegionDesc {
-            func_idx: r.func_idx,
-            header: r.header,
-            kind: match r.kind {
-                helix_analysis::RegionKind::DoAll => helix_backend::RegionKind::DoAll,
-                helix_analysis::RegionKind::Reduction(op) => {
-                    helix_backend::RegionKind::Reduction(match op {
-                        helix_analysis::ReductionOp::Add => BOp::Add,
-                        helix_analysis::ReductionOp::Mul => BOp::Mul,
-                        helix_analysis::ReductionOp::Min => BOp::Min,
-                        helix_analysis::ReductionOp::Max => BOp::Max,
-                    })
-                }
-            },
-            body_fn_name: r.body_fn_name.clone(),
-        });
-    }
-    out
 }

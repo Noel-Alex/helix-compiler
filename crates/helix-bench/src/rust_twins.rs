@@ -196,7 +196,7 @@ mod tests {
         let n = 1024;
         let (x, mut y) = saxpy_inputs(n);
         for i in 0..n {
-            y[i] = 2.5 * x[i] + y[i];
+            y[i] += 2.5 * x[i];
         }
         assert_eq!(fmt_f64(y[7]), "14.204334365325078");
     }

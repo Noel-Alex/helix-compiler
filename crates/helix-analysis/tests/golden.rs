@@ -184,20 +184,17 @@ fn gcd_box_test_is_sequential() {
     let Verdict::Sequential(reason) = &r.verdict else {
         panic!("expected Sequential, got {:?}", r.verdict);
     };
-    // a[2i] = a[i] + 1: the battery leaves the pair UNSOLVED (distance None,
-    // directions `<=>`), so the kind follows ordered body position: the READ
-    // a[i] is spelled before the WRITE a[2*i] => WAR (anti). Physically this
-    // loop only flows forward (element 2j is written at iter j, read at iter
-    // 2j), but proving that needs the iteration range, which symbolic bounds
-    // withhold; both kinds veto DOALL identically, so the positional label
-    // honestly reflects what the analysis knows.
-    assert!(reason.contains("WAR"), "reason: {reason}");
+    // With a symbolic end, 2*i may wrap, so the no-wrap gate rejects the
+    // subscript before the mathematical gcd/box battery can classify it.
+    // Read-before-write body order supplies the conservative WAR label.
+    assert!(
+        reason.contains("unanalyzable subscript"),
+        "reason: {reason}"
+    );
     assert_eq!(r.war_deps.len(), 1);
     assert!(r.raw_deps.is_empty());
-    // Distance not a single constant => None; the gcd/box test leaves all
-    // crossing directions open (`<=>`).
     assert_eq!(r.war_deps[0].distance, None);
-    assert_eq!(r.war_deps[0].direction, "<=>");
+    assert_eq!(r.war_deps[0].direction, "*");
 }
 
 // ---------------------------------------------------------------------------
@@ -219,16 +216,30 @@ fn matmul_inner_k_loop_is_add_reduction() {
         .collect();
     assert_eq!(reds.len(), 1, "exactly the k-loop reduces: {reds:?}");
     assert_eq!(reds[0].1, ReductionOp::Add);
-    // Every other loop is plain-safe here.
-    for r in &v.reports {
-        if r.loop_id != reds[0].0 {
-            assert!(
-                matches!(r.verdict, Verdict::SafeParallel),
-                "{}",
-                r.summary_line()
-            );
-        }
-    }
+    // Within the j-loop, c[ibase+j]'s offset ibase is invariant (symbolic,
+    // no exact offset) but the IV coefficient is 1 — translation by j is
+    // injective, so the sole write cannot self-overlap and j is DOALL-safe.
+    // In the i-loop the subscript depends on j, not i (coefficient unknown):
+    // still sequential there. Init is safe.
+    let others: Vec<_> = v
+        .reports
+        .iter()
+        .filter(|r| r.loop_id != reds[0].0)
+        .collect();
+    assert_eq!(
+        others
+            .iter()
+            .filter(|r| matches!(r.verdict, Verdict::SafeParallel))
+            .count(),
+        2
+    );
+    assert_eq!(
+        others
+            .iter()
+            .filter(|r| matches!(r.verdict, Verdict::Sequential(_)))
+            .count(),
+        1
+    );
 }
 
 #[test]

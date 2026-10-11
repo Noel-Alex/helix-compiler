@@ -3,6 +3,10 @@
 #
 # Test parallelism is capped (RUST_TEST_THREADS=4): the JIT's trap-recorder
 # tests flake under high thread counts on loaded CI machines.
+#
+# The same Windows job also guards the wasm32 surface (artifact check, wasm lab
+# build) and the node tests that exercise the shipped browser asset — the JIT
+# desktop steps stay untouched because the JIT only builds on Windows.
 
 name: CI
 
@@ -22,6 +26,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -34,3 +39,33 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release --workspace
+
+      # wasm32 surface: the browser lab links these two crates, so they must
+      # keep compiling without the host-only facilities.
+      - name: cargo check wasm32
+        run: cargo check -p helix-artifact -p helix-wasm --target wasm32-unknown-unknown
+
+      # Build the shipped browser compiler. CI never overwrites the committed
+      # asset (only the Pages deploy ships a freshly built one); it just proves
+      # the wasm build still succeeds and the committed asset is present.
+      - name: cargo build wasm lab
+        run: cargo build --release --target wasm32-unknown-unknown -p helix-wasm
+
+      - name: committed wasm asset present
+        shell: pwsh
+        run: |
+          $wasm = "web/wasm/helix-lab.wasm"
+          if (!(Test-Path $wasm)) { throw "missing $wasm — the node tests and the Observatory serve the committed asset" }
+          $size = (Get-Item $wasm).Length
+          if ($size -eq 0) { throw "$wasm is empty" }
+          Write-Output "$wasm committed ($size bytes)"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: node web/app.test.mjs
+        run: node web/app.test.mjs
+
+      - name: node web/wasm/helix-browser.test.mjs
+        run: node web/wasm/helix-browser.test.mjs

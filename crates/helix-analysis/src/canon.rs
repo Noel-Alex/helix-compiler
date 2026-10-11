@@ -101,15 +101,12 @@ pub fn canon(func: &FuncIr, lp: &Loop) -> Option<CanonicalLoop> {
         let Some(Inst::Bin { op, a, b, .. }) = find_def(func, *cond) else {
             continue;
         };
-        if !matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
-            continue;
-        }
-        let (iv_side, other) = if *a == phi.dst {
-            (*a, *b)
-        } else if *b == phi.dst {
-            (*b, *a)
-        } else {
-            continue;
+        // Bounds below describe an ascending, exclusive-end window. Other
+        // comparisons cannot justify that window (or its no-wrap enclosure).
+        let (iv_side, other) = match op {
+            BinOp::Lt if *a == phi.dst => (*a, *b),
+            BinOp::Gt if *b == phi.dst => (*b, *a),
+            _ => continue,
         };
 
         return Some(CanonicalLoop {
@@ -146,5 +143,33 @@ fn const_i64(func: &FuncIr, v: ValueId) -> Option<i64> {
 }
 
 fn bound_of(func: &FuncIr, v: ValueId) -> Bound {
-    const_i64(func, v).map_or(Bound::Sym(v.0), Bound::Const)
+    if let Some(c) = const_i64(func, v) {
+        return Bound::Const(c);
+    }
+    // `let y = x` lowers to a same-type `y = cast(x)` copy (build.rs); the
+    // old pre-cast builder shape was `y = x + 0`. Both are copy identities;
+    // the optimization pipeline removes them, but the CLI/JIT path analyzes
+    // pre-optimization SSA. Peeling them recovers the copied constant,
+    // keeping the dependence battery's exact-window proof domain.
+    match find_def(func, v) {
+        Some(Inst::Cast { val, to, .. }) if Some(*to) == func.types.val_ty(*val) => {
+            return bound_of(func, *val);
+        }
+        Some(Inst::Bin {
+            op: BinOp::Add,
+            a,
+            b,
+            ..
+        }) => {
+            for (other, side) in [(a, b), (b, a)] {
+                if const_i64(func, *side) == Some(0)
+                    && let Some(c) = const_i64(func, *other)
+                {
+                    return Bound::Const(c);
+                }
+            }
+        }
+        _ => {}
+    }
+    Bound::Sym(v.0)
 }

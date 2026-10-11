@@ -24,6 +24,69 @@ fn analyze_src(src: &str) -> Vec<helix_analysis::LoopReport> {
     analyze(&funcs[0], &li)
 }
 
+fn assert_no_plan(src: &str) -> Vec<helix_analysis::LoopReport> {
+    let prog = parse_str(src).expect("parse");
+    let typed = helix_sema::check(&prog).expect("check");
+    let mut funcs = helix_ir::build(&typed);
+    for f in &mut funcs {
+        helix_ir::to_ssa(f);
+    }
+    let loops: Vec<_> = funcs.iter().map(find_loops).collect();
+    let reports: Vec<_> = funcs
+        .iter()
+        .zip(&loops)
+        .map(|(f, l)| analyze(f, l))
+        .collect();
+    assert!(
+        reports
+            .iter()
+            .flatten()
+            .any(|r| matches!(r.verdict, Verdict::Sequential(_)))
+    );
+    assert!(
+        helix_analysis::build_plan(&funcs, &loops, &reports)
+            .regions
+            .is_empty(),
+        "{reports:?}"
+    );
+    reports.into_iter().flatten().collect()
+}
+
+#[test]
+fn narrowing_start_bound_preserves_distance_one_recurrence() {
+    let reps = assert_no_plan(
+        "fn main() {
+            let raw = 4294967297;
+            let start = raw as i32 as i64;
+            let a: [i64] = zeros(4);
+            for i in start..4 { a[i] = a[i - 1] + 1; }
+        }",
+    );
+    assert_eq!(reps[0].bounds, Some(("n".into(), "4".into())));
+    assert_eq!(reps[0].raw_deps.len(), 1, "{reps:?}");
+    assert_eq!(reps[0].raw_deps[0].distance, Some(1));
+}
+
+#[test]
+fn wrapping_subscripts_never_enter_parallel_plan() {
+    // All expressions execute safely over tiny arrays. No parallel execution
+    // is needed to show the collisions that integer affine algebra misses.
+    for body in [
+        "a[(i * 4294967296) * 4294967296] = i;",
+        "a[((i as i32 * 65536) * 65536) as i64] = i;",
+        // Wrapped odd translation is injective alone, but not disjoint from
+        // the other site: its huge mathematical offset would hide distance 1.
+        "a[i] = a[((i + 9223372036854775807) + 9223372036854775807) + 1] + 1;",
+        "a[i] = i; a[((i + 9223372036854775807) + 9223372036854775807) + 1] = 9;",
+        // A wrapped invariant multiplier must not become an exact offset.
+        "a[i * (4294967296 * 4294967296)] = i;",
+    ] {
+        assert_no_plan(&format!(
+            "fn main() {{ let a: [i64] = zeros(4); for i in 1..4 {{ {body} }} }}"
+        ));
+    }
+}
+
 fn all_edges(r: &helix_analysis::LoopReport) -> usize {
     r.raw_deps.len() + r.war_deps.len() + r.waw_deps.len()
 }
@@ -49,7 +112,7 @@ fn accumulator_used_elsewhere_disqualifies_reduction() {
     );
     assert!(
         reps.iter()
-            .all(|r| !matches!(r.verdict, Verdict::ReductionParallel(_))),
+            .all(|r| matches!(r.verdict, Verdict::Sequential(_))),
         "extra use of accumulator must veto: {reps:?}"
     );
 }
@@ -89,8 +152,8 @@ fn self_squaring_is_not_a_mul_reduction() {
     );
     assert!(
         reps.iter()
-            .all(|r| !matches!(r.verdict, Verdict::ReductionParallel(_))),
-        "x = x*x must not approve"
+            .all(|r| matches!(r.verdict, Verdict::Sequential(_))),
+        "x = x*x must stay sequential: {reps:?}"
     );
 }
 
@@ -160,7 +223,7 @@ fn mul_reduction_recognized() {
 }
 
 #[test]
-fn max_reduction_recognized_when_dominant() {
+fn coupled_minmax_recurrences_stay_sequential() {
     let reps = analyze_src(
         "fn main() {
             let n = 10;
@@ -174,13 +237,11 @@ fn max_reduction_recognized_when_dominant() {
             print(hi);
         }",
     );
-    // `lo` feeds `hi`, which serializes them; only ONE clean recognition may
-    // be reported and it must not claim both.
-    let reds: Vec<_> = reps
-        .iter()
-        .filter(|r| matches!(r.verdict, Verdict::ReductionParallel(_)))
-        .collect();
-    assert_eq!(reds.len(), 1);
+    // `lo` feeds `hi`, so recognizing hi does not exempt lo's carried state.
+    assert!(
+        matches!(reps[0].verdict, Verdict::Sequential(_)),
+        "{reps:?}"
+    );
 }
 
 #[test]
@@ -240,10 +301,7 @@ fn anti_and_output_dependences_are_reported_separately() {
     // `a[i] = ...` overwrote — an ANTI (WAR) dependence, solved negative.
     // The pre-fix classifier labeled every mixed pair RAW, hiding it.
     assert_eq!(r.war_deps.len(), 1, "a[i+1] read vs a[i] overwrite: WAR");
-    assert!(matches!(
-        r.verdict,
-        Verdict::Sequential(_)
-    ));
+    assert!(matches!(r.verdict, Verdict::Sequential(_)));
     // No flow edge exists in this loop: the only same-iteration mixed pair
     // (write a[i+1], read a[i+1]) is loop-independent and dropped, and the
     // carried pair is anti. RAW must stay empty.
@@ -365,6 +423,57 @@ fn distance_zero_same_iteration_pairs_are_not_carried() {
     let r = &reps[0];
     assert_eq!(all_edges(r), 0, "same-iteration traffic is not carried");
     assert!(matches!(r.verdict, Verdict::SafeParallel));
+}
+
+#[test]
+fn constant_address_read_modify_write_is_sequential() {
+    let reps = analyze_src(
+        "fn main() {
+            let a: [i64] = zeros(1);
+            for i in 0..8 {
+                a[0] = a[0] + i;
+            }
+        }",
+    );
+    let r = &reps[0];
+    assert!(matches!(r.verdict, Verdict::Sequential(_)), "{r:?}");
+    assert_eq!(r.war_deps.len(), 1);
+    assert_eq!(r.war_deps[0].distance, None);
+    assert_eq!(r.war_deps[0].direction, "<=>");
+}
+
+#[test]
+fn symbolic_invariant_offset_is_unknown_and_sequential() {
+    let reps = analyze_src(
+        "fn shift(k: i64) {
+            let a: [i64] = zeros(16);
+            for i in 1..16 {
+                a[i] = a[i - k];
+            }
+        }
+        fn main() { shift(1); }",
+    );
+    let r = &reps[0];
+    assert!(r.accesses.iter().any(|a| a == "READ a[?]"), "{r:?}");
+    assert!(matches!(r.verdict, Verdict::Sequential(_)), "{r:?}");
+    assert_eq!(r.war_deps[0].distance, None);
+}
+
+#[test]
+fn single_overlapping_write_is_sequential() {
+    for idx in ["0", "i % 2"] {
+        let reps = analyze_src(&format!(
+            "fn main() {{
+                let a: [i64] = zeros(2);
+                for i in 0..8 {{
+                    a[{idx}] = i;
+                }}
+            }}"
+        ));
+        let r = &reps[0];
+        assert!(matches!(r.verdict, Verdict::Sequential(_)), "{idx}: {r:?}");
+        assert!(r.notes.iter().any(|n| n.contains("overlap")), "{r:?}");
+    }
 }
 
 #[test]
@@ -506,6 +615,139 @@ fn plan_regions_match_approved_verdicts() {
     assert_eq!(reg.func_idx, 0);
 }
 
+// ---------------------------------------------------------------------------
+// False-veto regressions (2026-09-17 hardening overreach)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unused_if_join_header_phi_does_not_veto() {
+    // `t` is assigned before the loop and on one arm of an `if` inside it,
+    // and never read anywhere. SSA (semi-pruned) merges the two versions in
+    // a loop-header φ, but that φ's result is dead — no value crosses an
+    // iteration boundary through it, so it must not veto DOALL.
+    let reps = analyze_src(
+        "fn main() {
+            let n = 16;
+            let a: [i64] = zeros(n);
+            let t = 0;
+            for i in 0..n {
+                a[i] = i;
+                if i < 2 {
+                    t = i;
+                }
+            }
+        }",
+    );
+    let r = &reps[0];
+    assert!(
+        !r.notes.iter().any(|n| n.contains("loop-carried scalar")),
+        "dead if-join header phi must not be reported: {r:?}"
+    );
+    assert!(
+        matches!(r.verdict, Verdict::SafeParallel),
+        "{}",
+        r.summary_line()
+    );
+}
+
+#[test]
+fn same_block_redefined_temporary_does_not_veto() {
+    // `t` is declared outside and overwritten at the top of every iteration
+    // before any read. Def-before-use in one block keeps it out of the
+    // semi-pruned global set: no header phi exists at all. Pins that this
+    // shape stays DOALL-safe (paired with unused_if_join_... which covers
+    // the phi-merging spelling).
+    let reps = analyze_src(
+        "fn main() {
+            let n = 32;
+            let a: [i64] = zeros(n);
+            let t = 0;
+            for i in 0..n {
+                t = i * 2;
+                a[i] = t + 1;
+            }
+        }",
+    );
+    let r = &reps[0];
+    assert!(
+        !r.notes.iter().any(|n| n.contains("loop-carried scalar")),
+        "unused header phi must not be reported: {r:?}"
+    );
+    assert!(
+        matches!(r.verdict, Verdict::SafeParallel),
+        "{}",
+        r.summary_line()
+    );
+}
+
+#[test]
+fn live_out_temporary_header_phi_still_vetoes() {
+    // Same shape, but the final `t` escapes the loop: plain DOALL would lose
+    // the last value, so the header phi must keep vetoing.
+    let reps = analyze_src(
+        "fn main() {
+            let n = 32;
+            let a: [i64] = zeros(n);
+            let t = 0;
+            for i in 0..n {
+                t = i * 2;
+                a[i] = t + 1;
+            }
+            print(t);
+        }",
+    );
+    let r = &reps[0];
+    assert!(
+        matches!(r.verdict, Verdict::Sequential(_)),
+        "live-out carried scalar must stay sequential: {r:?}"
+    );
+}
+
+#[test]
+fn symbolic_invariant_sole_write_offset_is_parallel() {
+    // Sole write a[i+k] = i with parameter k: translation by i is injective
+    // (distinct iterations hit distinct slots) whatever k is, so the write
+    // cannot self-overlap. The IV coefficient — not literalness of k — is
+    // decisive for WRITE/WRITE self-overlap. Symbolic offsets still block
+    // READ dependence distances (see symbolic_invariant_offset_is_unknown...).
+    let reps = analyze_src(
+        "fn shift(k: i64) {
+            let a: [i64] = zeros(32);
+            for i in 0..30 - k {
+                a[i + k] = i;
+            }
+        }
+        fn main() { shift(1); }",
+    );
+    let r = &reps[0];
+    assert!(
+        matches!(r.verdict, Verdict::SafeParallel),
+        "{}",
+        r.summary_line()
+    );
+}
+
+#[test]
+fn zeros_in_loop_body_vetoes_parallelization() {
+    // Per-iteration allocation: a fresh array identity every iteration that
+    // no cross-iteration model covers. Contract (AGENTS.md): vetoed up front.
+    let reps = analyze_src(
+        "fn main() {
+            let n = 8;
+            for i in 0..n {
+                let a: [i64] = zeros(n);
+                a[i] = i;
+            }
+        }",
+    );
+    let r = &reps[0];
+    assert!(
+        matches!(r.verdict, Verdict::Sequential(_)),
+        "zeros inside the loop must force Sequential: {r:?}"
+    );
+    assert!(r.notes.iter().any(|n| n.contains("zeros")), "{r:?}");
+}
+
 #[test]
 fn summary_line_format_matches_contract() {
     let reps = analyze_src(
@@ -536,5 +778,29 @@ fn summary_line_format_matches_contract() {
     assert!(
         line.starts_with("Loop #1: RAW 1 / WAR 0 / WAW 0 => SEQUENTIAL ("),
         "{line}"
+    );
+}
+
+#[test]
+fn copied_iv_stays_affine_through_cast_copy() {
+    // build.rs copy_value now emits `let j = i` as a same-type Cast, and the
+    // loop-bound snapshot wraps `n` in a cast too. access.rs classifies casts
+    // as non-affine and canon.rs::bound_of only peeled the old `x + 0` shape,
+    // so pre-optimization analysis lost both provable shapes. Pin them.
+    let reps = analyze_src(
+        "fn fill(n: i64) {
+            let a: [i64] = zeros(n);
+            for i in 0..n {
+                let j = i;
+                a[j] = i;
+            }
+        }
+        fn main() { fill(16); }",
+    );
+    let r = &reps[0];
+    assert!(
+        matches!(r.verdict, Verdict::SafeParallel),
+        "copied IV index must stay DOALL: {}",
+        r.summary_line()
     );
 }

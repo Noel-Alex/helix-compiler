@@ -11,7 +11,8 @@
 use serde::{Deserialize, Serialize};
 
 /// One dimension of a subscript: value = a*i + b (i = the loop index).
-/// Coefficients already normalized to this form by access extraction.
+/// Coefficients already normalized to this form by access extraction, which
+/// must prove every intermediate operation free of machine-integer wrapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Affine {
     pub a: i128,
@@ -142,6 +143,18 @@ pub enum Domain {
 /// `domain` constrains both source and sink iterations of THIS loop level —
 /// see [`Domain`] for what a `Symbolic` domain may and may not prove.
 pub fn test_dimension(src: Affine, dst: Affine, domain: Domain) -> DepOutcome {
+    // ponytail: larger normalized coefficients fall back conservatively;
+    // arbitrary-precision dependence arithmetic would recover those cases.
+    if [src.a, src.b, dst.a, dst.b]
+        .into_iter()
+        .any(|x| i64::try_from(x).is_err())
+        || matches!(domain, Domain::Bounded(r) if i64::try_from(r.lo).is_err() || i64::try_from(r.hi).is_err())
+    {
+        return DepOutcome::Dependence {
+            distance: None,
+            dirs: vec![DirVec::star()],
+        };
+    }
     // Exact window only when the loop bounds are compile-time constants; a
     // `None` range FORBIDS every refutation below that consults `range.lo` /
     // `range.hi` (see [`Domain`] for the proof policy).
@@ -154,8 +167,8 @@ pub fn test_dimension(src: Affine, dst: Affine, domain: Domain) -> DepOutcome {
     if src.a == 0 && dst.a == 0 {
         return if src.b == dst.b {
             DepOutcome::Dependence {
-                distance: Some(0),
-                dirs: vec![DirVec::exact(Dir::Eq)],
+                distance: None,
+                dirs: vec![DirVec::star()],
             }
         } else {
             DepOutcome::Independent
@@ -169,10 +182,13 @@ pub fn test_dimension(src: Affine, dst: Affine, domain: Domain) -> DepOutcome {
             return DepOutcome::Independent; // divisibility: bound-free algebra
         }
         let d = delta / src.a; // matched-pair gap: first-op iter − second-op iter
-        // d must be representable: no real i64 iteration space spans a pair
-        // farther apart than i64::MIN..i64::MAX trips — bound-free argument.
+        // Signed i64 endpoints can be more than i64::MAX iterations apart.
+        // An unrepresentable report distance is not an independence proof.
         if d > i64::MAX as i128 || d < i64::MIN as i128 {
-            return DepOutcome::Independent;
+            return DepOutcome::Dependence {
+                distance: None,
+                dirs: vec![DirVec::star()],
+            };
         }
         let dv = i64::try_from(d).expect("checked above");
         // Bounds: source at i, sink at i + d; both must lie in [lo, hi] for
@@ -285,8 +301,12 @@ pub fn test_dimension(src: Affine, dst: Affine, domain: Domain) -> DepOutcome {
         }
         return DepOutcome::Independent;
     }
-    // Unsolvable Diophantine equation => independent (bound-free algebra).
-    DepOutcome::Independent
+    // Divisibility already established solvability. Failure to represent a
+    // convenient particular solution cannot refute a dependence.
+    DepOutcome::Dependence {
+        distance: None,
+        dirs: vec![DirVec::star()],
+    }
 }
 
 fn gcd(a: i128, b: i128) -> i128 {
@@ -314,9 +334,10 @@ fn solve_diophantine(lhs_a: i128, rhs_a: i128, k: i128) -> Option<(i128, i128)> 
     }
     let scale = k / gg;
     // lhs_a * (old_s*scale) - rhs_a * j = k has solution i = old_s*scale.
-    let i0 = old_s * scale;
-    // Corresponding j from the equation itself.
-    let j_num = lhs_a * i0 - k;
+    let i0 = old_s.checked_mul(scale)?;
+    // Corresponding j from the equation itself. Even i64 coefficients can
+    // require a particular solution whose intermediate product exceeds i128.
+    let j_num = lhs_a.checked_mul(i0)?.checked_sub(k)?;
     debug_assert!(j_num % rhs_a == 0);
     let j0 = j_num / rhs_a;
     Some((i0, j0))
@@ -428,7 +449,7 @@ pub fn test_pair(
                     }
                 }
                 distance = match (distance, dist) {
-                    (Some(acc), Some(x)) => Some(acc + x), // 1-D nesting: distances add
+                    (Some(acc), Some(x)) => acc.checked_add(x), // unrepresentable distance stays unknown
                     _ => None,
                 };
             }
@@ -461,10 +482,49 @@ mod tests {
     }
 
     fn outcome_is_independent(src: Affine, dst: Affine) -> bool {
-        matches!(
-            test_dimension(src, dst, bd(R)),
-            DepOutcome::Independent
-        )
+        matches!(test_dimension(src, dst, bd(R)), DepOutcome::Independent)
+    }
+
+    #[test]
+    fn oversized_algebra_and_distances_stay_conservative() {
+        assert!(matches!(
+            test_pair(
+                &[Affine { a: 1, b: 0 }; 2],
+                &[Affine {
+                    a: 1,
+                    b: i64::MAX as i128
+                }; 2],
+                Domain::Symbolic,
+            ),
+            DepOutcome::Dependence { distance: None, .. }
+        ));
+        for (src, dst) in [
+            (Affine { a: i128::MAX, b: 0 }, Affine { a: i128::MIN, b: 1 }),
+            (
+                Affine {
+                    a: 1,
+                    b: i64::MIN as i128,
+                },
+                Affine { a: 1, b: 0 },
+            ),
+            // Coprime large coefficients make the particular-solution
+            // multiplication overflow i128, despite a valid dependence.
+            (
+                Affine {
+                    a: 7540113804746346429,
+                    b: i64::MIN as i128,
+                },
+                Affine {
+                    a: 4660046610375530309,
+                    b: i64::MAX as i128,
+                },
+            ),
+        ] {
+            assert!(matches!(
+                test_dimension(src, dst, Domain::Symbolic),
+                DepOutcome::Dependence { .. }
+            ));
+        }
     }
 
     #[test]
@@ -473,10 +533,15 @@ mod tests {
             Affine { a: 0, b: 3 },
             Affine { a: 0, b: 5 }
         ));
-        assert!(!outcome_is_independent(
-            Affine { a: 0, b: 3 },
-            Affine { a: 0, b: 3 }
-        ));
+        for domain in [bd(R), Domain::Symbolic] {
+            assert_eq!(
+                test_dimension(Affine { a: 0, b: 3 }, Affine { a: 0, b: 3 }, domain),
+                DepOutcome::Dependence {
+                    distance: None,
+                    dirs: vec![DirVec::star()],
+                }
+            );
+        }
     }
 
     #[test]
@@ -842,8 +907,7 @@ mod tests {
             Domain::Symbolic,
         ) {
             DepOutcome::Dependence {
-                distance: Some(1),
-                ..
+                distance: Some(1), ..
             } => {}
             other => panic!("expected distance-1 through pair, got {other:?}"),
         }

@@ -109,6 +109,20 @@ pub fn fold_bin(op: BinOp, x: Constant, y: Constant) -> Option<Constant> {
         };
     }
 
+    if x.ty() != y.ty() {
+        return None; // Mixed widths require an explicit cast.
+    }
+    if let (Constant::I32(a), Constant::I32(b)) = (x, y) {
+        if matches!(op, Div | Rem) && a == i32::MIN && b == -1 {
+            return None; // Preserve the native-width runtime overflow trap.
+        }
+        // Widening then truncating preserves i32 wrapping for +, -, and *.
+        return fold_bin_int(op, a as i64, b as i64).map(|c| match c {
+            Constant::I64(v) => Constant::I32(v as i32),
+            other => other, // Comparisons remain bools.
+        });
+    }
+
     match (x.as_num()?, y.as_num()?) {
         (crate::ir::Num::I(a), crate::ir::Num::I(b)) => fold_bin_int(op, a, b),
         (crate::ir::Num::F32(a), crate::ir::Num::F32(b)) => fold_bin_f32(op, a, b),

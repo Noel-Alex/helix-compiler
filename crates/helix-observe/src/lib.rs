@@ -1,26 +1,22 @@
-//! # helix-observe — the Observatory artifact builder and HTTP server
+//! # helix-observe — the Observatory HTTP server
 //!
-//! Stage 7 of the HELIX pipeline: turns one compile into a single
-//! self-contained [`CompileArtifact`] JSON document (tokens, AST, IR dumps,
-//! per-pass snapshots, laid-out CFGs, dominator trees, loop verdicts,
-//! execution output) and serves it — plus the web UI — over HTTP.
+//! Stage 7 of the HELIX pipeline: serves the browser UI plus the JSON API the
+//! UI already speaks. Every artifact document it returns is built by
+//! [`helix_artifact`], so the compile pipeline itself has no server
+//! dependency and can also run inside wasm32 for the browser lab.
 //!
 //! ```text
-//! source ──pipeline──▶ CompileArtifact ──axum──▶ http://127.0.0.1:8931/
-//!                          │
-//!                          └──dot──▶ Graphviz .dot (publication figures)
+//! source ──helix-artifact──▶ CompileArtifact ──axum──▶ http://127.0.0.1:8931/
+//!                                     │
+//!                                     └──dot──▶ Graphviz .dot (publication figures)
 //! ```
 //!
 //! ## Module map
 //!
-//! * [`artifact`] — the wire data contract (`docs/notes/artifact-schema.md`
-//!   is normative; field names there are frozen). Everything derives serde so
-//!   the whole artifact serializes with one call.
-//! * [`layout`] — server-side tidy layout. The browser paints coordinates,
-//!   never computes them: an AST Reingold–Tilford tree plus per-function CFG
-//!   layering/routing live here.
-//! * [`pipeline`] — `build_artifact(example, source)`: runs the real compiler
-//!   front to back, snapshotting each stage and stopping at the first failure.
+//! * [`layout`] — browser-side tidy AST layout. The browser paints
+//!   coordinates, never computes them: a Reingold–Tilford-flavoured layered
+//!   tree over the display hierarchy produced from a serde `Program`. The CFG
+//!   layout lives in `helix-artifact` because the artifact needs it.
 //! * [`dot`] — Graphviz escape hatch mirroring the built-in layout.
 //! * [`server`] — axum router: static UI assets (embedded via
 //!   `include_bytes!`), `/api/examples`, `/api/artifact?example=…`,
@@ -35,26 +31,25 @@
 //! AST plus underlined diagnostics; success yields the full stack including
 //! interpreter output. The artifact is always valid JSON for its prefix.
 //!
-//! **Layout is a pure function.** `cfg_layout` consumes only the IR and loop
-//! info, so identical compiles produce byte-identical artifacts — golden-test
-//! friendly and cacheable without invalidation subtleties.
-//!
 //! **No panics across the boundary.** Every stage that could fail returns
 //! rather than unwraps; the server maps unexpected failures to a 500 JSON
 //! body instead of dropping the connection.
 
 #![forbid(unsafe_code)]
 
-pub mod artifact;
 pub mod dot;
 pub mod layout;
-pub mod pipeline;
 pub mod server;
 
 // -- Contract surface --------------------------------------------------------
 
-pub use artifact::CompileArtifact;
+// The artifact pipeline is shared with the wasm32 browser lab; re-exported so
+// `helix_observe::build_artifact` and friends keep working for API consumers.
 pub use dot::cfg_to_dot;
-pub use layout::{LaidOutNode, TreeNode, ast_tree, cfg_layout, program_to_tree};
-pub use pipeline::{BuildOpts, MAX_SOURCE_BYTES, build_artifact, build_artifact_with_opts};
+pub use helix_artifact::{
+    BuildOpts, CUSTOM_BENCH_SAMPLE_COUNT, CUSTOM_BENCH_WORK_BUDGET, CompileArtifact,
+    INTERACTIVE_WORK_BUDGET, MAX_SOURCE_BYTES, artifact_for_example, bench_index, build_artifact,
+    build_artifact_with_opts, cfg_layout, estimated_work, measure_interpreter,
+};
+pub use layout::{LaidOutNode, TreeNode, ast_tree, program_to_tree};
 pub use server::{ServeConfig, serve};

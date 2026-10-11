@@ -5,7 +5,8 @@
 //! globals; the reviewer's red-team item #10 asks for the harder guarantee —
 //! the CLI driver itself must behave identically whichever backend you pick:
 //!
-//! * valid programs: byte-identical stdout, exit 0, empty stderr;
+//! * valid programs: byte-identical stdout, exit 0, stderr carries each
+//!   backend's one-run stats line (`[interp] …` / `[jit] …`);
 //! * trapping programs: identical stdout prefix (lines printed before the
 //!   trap), exit code 1 on both, stderr naming a runtime error on both.
 //!
@@ -203,6 +204,73 @@ fn run_backend(file: &std::path::Path, backend: &str) -> (i32, String, String) {
 }
 
 #[test]
+fn jit_timing_boundaries_exclude_execution_from_compile() {
+    // Check the actual call site without sleeps, scheduler-dependent thresholds,
+    // or a clock abstraction added solely for this regression.
+    //
+    // The pipeline boundary is the SHARED compile sequence
+    // (`helix_artifact::prepare_pipeline`), which subsumes the old
+    // IR-build → analyze → plan steps. What this pins is unchanged: compile is
+    // timed on its own, and neither the pipeline nor the Cranelift compile
+    // leaks into the run measurement.
+    let source = include_str!("../src/main.rs");
+    let run_jit = source
+        .split_once("fn run_jit(")
+        .unwrap()
+        .1
+        .split_once("\nfn cmd_check(")
+        .unwrap()
+        .0;
+    let boundaries = [
+        "let jit_start = std::time::Instant::now();",
+        "helix_artifact::prepare_pipeline(",
+        "let compile_start = std::time::Instant::now();",
+        "helix_backend::JitEngine::compile(",
+        "let compile_elapsed = compile_start.elapsed();",
+        "let run_start = std::time::Instant::now();",
+        "let result = engine.run_main();",
+        "let run_elapsed = run_start.elapsed();",
+        "let total_elapsed = jit_start.elapsed();",
+        "total_elapsed.as_secs_f64()",
+        "compile_elapsed.as_secs_f64()",
+        "run_elapsed.as_secs_f64()",
+    ];
+    let mut remaining = run_jit;
+    for boundary in boundaries {
+        remaining = remaining
+            .split_once(boundary)
+            .unwrap_or_else(|| panic!("missing or out-of-order timing boundary: {boundary}"))
+            .1;
+    }
+    assert_eq!(run_jit.matches("compile_start.elapsed()").count(), 1);
+}
+
+#[test]
+fn run_help_explains_measurement_scope() {
+    let out = Command::new(HELIX)
+        .args(["run", "--help"])
+        .output()
+        .expect("spawn helix help");
+    assert!(out.status.success());
+    let help = String::from_utf8(out.stdout).expect("UTF-8 help");
+    for contract in [
+        "shared pipeline",
+        "compile-to-run total",
+        "excluding stdout replay",
+        "includes streamed stdout",
+        "planned parallel regions, not dispatches",
+        "arrays still visible at the end of main",
+        "the JIT reports no checksum",
+        "pins N participants",
+    ] {
+        assert!(
+            help.contains(contract),
+            "missing measurement contract: {contract}"
+        );
+    }
+}
+
+#[test]
 fn backends_agree_as_subprocesses() {
     for case in CASES {
         let file = write_temp_program(case.name, case.src);
@@ -222,8 +290,31 @@ fn backends_agree_as_subprocesses() {
                 "{ctx}: stdout must be identical across backends"
             );
             assert_eq!(interp_out, case.expected_stdout, "{ctx}: stdout content");
-            assert_eq!(interp_err, "", "{ctx}: interp stderr should be empty");
-            assert_eq!(jit_err, "", "{ctx}: jit stderr should be empty");
+            // The one-run stats line (backend, wall-clock, checksum) lives on
+            // stderr so compared stdout stays byte-identical across backends.
+            assert!(
+                interp_err.starts_with("[interp]") && interp_err.contains(" ms"),
+                "{ctx}: interp stderr should carry the stats line, got: {interp_err}"
+            );
+            let (total_ms, rest) = jit_err
+                .trim()
+                .strip_prefix("[jit] compile-to-run total ")
+                .and_then(|s| s.split_once(" ms (compile "))
+                .expect("JIT stats name the total's compile-to-run scope");
+            let (compile_ms, rest) = rest.split_once(" ms, run ").expect("compile and run stats");
+            let (run_ms, regions) = rest
+                .split_once(" ms) · planned parallel regions ")
+                .expect("region count is planned, not dispatched");
+            let [total_ms, compile_ms, run_ms] = [total_ms, compile_ms, run_ms].map(|s| {
+                let ms: f64 = s.parse().expect("numeric milliseconds");
+                assert!(ms.is_finite() && ms >= 0.0, "{ctx}: invalid time {s}");
+                ms
+            });
+            assert!(
+                total_ms >= compile_ms && total_ms >= run_ms,
+                "{ctx}: {jit_err}"
+            );
+            regions.parse::<usize>().expect("planned region count");
         } else {
             // Identical stdout prefix (lines printed before the trap) and no
             // extra stdout after it — both backends stop at the same line.

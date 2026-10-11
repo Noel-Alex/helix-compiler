@@ -53,7 +53,7 @@ use helix_sema::TypedProgram;
 use helix_syntax::Span;
 
 pub use crate::error::{LineMap, RunError, RunErrorKind};
-pub use crate::interp::Interp;
+pub use crate::interp::{Interp, take_alloc_bytes};
 pub use crate::value::Value;
 
 /// Output of a successful run.
@@ -98,6 +98,8 @@ pub fn run_with_source(src: &str, program: &TypedProgram) -> Result<RunOutput, R
 }
 
 fn run_inner(program: &TypedProgram, src: Option<&str>) -> Result<RunOutput, RunError> {
+    // Fresh allocation accounting per run (read back via take_alloc_bytes).
+    crate::interp::reset_alloc_bytes();
     // Re-parse to obtain AST structure sema v1 dropped (call arguments).
     let ast = match src {
         Some(text) => match helix_syntax::parse_str(text) {

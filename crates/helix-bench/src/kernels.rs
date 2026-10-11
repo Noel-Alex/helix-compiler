@@ -226,8 +226,10 @@ fn main() {
 "#;
 
 const SIEVE_SRC: &str = r#"// Strided sieve: outer loop sequential (branch on composite), inner sweep
-// writes disjoint strided indices -> inner loop is DOALL. Expressed with an
-// affine subscript because HELIX has no step clause.
+// writes strided indices. HELIX soundly REFUSES the inner sweep: the stride
+// multiplier `i` is loop-invariant but cannot be proven non-zero, and a zero
+// stride would alias every iteration's write. Recovering it needs range
+// reasoning over the outer induction variable - deliberately not built.
 fn main() {
     let n = 10000000;
     let composite: [bool] = zeros(n);
@@ -464,11 +466,18 @@ pub fn registry() -> Vec<KernelDef> {
         },
         KernelDef {
             name: "count_primes_sieve",
-            description: "strided Eratosthenes — outer serial, inner DOALL writes",
+            description: "strided Eratosthenes — inner sweep soundly refused: stride not provably non-zero",
             perf_source: SIEVE_SRC.to_string(),
             correctness_source: resize_source(SIEVE_SRC, &[("n", 100)]),
             sizes: &[100_000, 4_000_000],
-            expected_verdict: ExpectedVerdict::SafeParallel,
+            // The sweep `composite[start + k * i]` has a symbolic multiplier
+            // (`i`, the outer induction variable). Injectivity of the sole
+            // write requires the stride to be provably non-zero, and a
+            // non-constant multiplier is not proof - so the analysis refuses.
+            // The refusal is SOUND: if `i` were ever 0 every iteration would
+            // write the same element. Known limitation, not a bug: range
+            // reasoning over the outer loop would recover this loop.
+            expected_verdict: ExpectedVerdict::Sequential,
             tolerance: Tolerance::Exact,
             expected_printed: &["25"], // pi(100)
             correctness_only: false,
@@ -584,13 +593,13 @@ mod tests {
                 "fib_recursion",
             ]
         );
-        // Exactly one deliberate negative, clearly labelled.
+        // Exactly two deliberate negatives, clearly labelled.
         assert_eq!(
             reg.iter()
                 .filter(|k| k.expected_verdict == ExpectedVerdict::Sequential)
                 .map(|k| k.name)
                 .collect::<Vec<_>>(),
-            vec!["recurrence_reject"]
+            vec!["count_primes_sieve", "recurrence_reject"]
         );
     }
 
@@ -666,6 +675,9 @@ mod tests {
             .filter(|k| !k.is_parallel_candidate())
             .map(|k| k.name)
             .collect::<Vec<_>>();
-        assert_eq!(seq, vec!["recurrence_reject", "fib_recursion"]);
+        assert_eq!(
+            seq,
+            vec!["count_primes_sieve", "recurrence_reject", "fib_recursion"]
+        );
     }
 }

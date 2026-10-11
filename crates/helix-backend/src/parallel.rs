@@ -91,9 +91,20 @@ use helix_ir::{BinOp, BlockId, FuncIr, Inst, Load, LocalId, Phi, Term, ValueId};
 
 /// Thread-count hint baked into every dispatch call.
 ///
-/// The runtime clamps hints to available parallelism and honours the
-/// `HELIX_NTHREADS` override, so a generous constant is safe.
-pub(crate) const NTHREADS_HINT: i64 = 8;
+/// Deliberately generous — it is a ceiling, never the governor. The runtime
+/// resolves the real participant count as
+/// `min(HELIX_NTHREADS, available_parallelism)`, so this constant sits far
+/// above anything a host can field and lets the two real controls decide:
+/// the CLI's `--threads N` (which sets `HELIX_NTHREADS`) and the bench's
+/// pinned sweep value `p` are both honoured exactly, up to hardware.
+///
+/// A small constant here (the historical `8`) silently capped every request
+/// above it: a sweep row labelled `p=16` on a 32-logical-CPU machine still
+/// fielded 8 participants, so the row measured the constant instead of the
+/// machine. Requesting more threads than hardware has remains safe — the
+/// runtime clamps to `available_parallelism` — so the hint never has to
+/// model the host.
+pub(crate) const NTHREADS_HINT: i64 = 1024;
 
 /// Byte offset of the shared-ctx pointer inside a participant cell.
 #[allow(dead_code)] // self-documenting counterpart of the accumulator offset
@@ -271,7 +282,7 @@ pub(crate) struct CtxLayout {
     /// `(array local, element byte size, offset of the data pointer)` — the
     /// length half sits at `offset + 8`.
     pub(crate) arrays: Vec<(LocalId, i64, i64)>,
-    /// `(SSA id, slot width, is_float, byte offset)` — one 8-byte word per
+    /// `(SSA id, native width, is_float, byte offset)` — one 8-byte word per
     /// captured scalar.
     pub(crate) scalars: Vec<(u32, u64, bool, i64)>,
 }
@@ -343,7 +354,7 @@ impl PlannedRegion {
             len_bytes: self.layout.len_bytes(),
             acc: match self.kind {
                 RKind::DoAll => None,
-                RKind::Reduction(s) => Some((s.width, s.float)),
+                RKind::Reduction(s) => Some(s),
             },
             seed: self.seed,
         }
@@ -596,11 +607,19 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
         RKind::Reduction(s) => Some(s),
     };
     let acc: Option<(ValueId, LocalId, ValueId, ValueId)> = if spec.is_none() {
-        // DoAll: no carried scalar other than the iv may survive.
+        // DoAll: no carried scalar other than the iv may survive — unless it
+        // is provably unused anywhere (dead SSA temporary left by the
+        // pre-optimization builder; matching the analysis-side relaxation).
+        let used: HashSet<u32> = ir
+            .blocks
+            .iter()
+            .flat_map(|b| b.uses())
+            .map(|v| v.0)
+            .collect();
         if header
             .phis
             .iter()
-            .any(|p| p.dst != iv_dst && p.args.len() >= 2)
+            .any(|p| p.dst != iv_dst && p.args.len() >= 2 && used.contains(&p.dst.0))
         {
             return gate((), line!());
         }
@@ -754,7 +773,7 @@ pub(crate) fn extract(ir: &FuncIr, desc: &RegionDesc, planned: &mut PlannedRegio
             helix_sema::Ty::I64 => (8u64, false),
             helix_sema::Ty::I32 => (4, false),
             helix_sema::Ty::F64 => (8, true),
-            helix_sema::Ty::F32 => (8, true), // widened; payload stays lossless
+            helix_sema::Ty::F32 => (4, true),
             _ => return None,
         };
         layout.scalars.push((v.0, w, f, next_off));
@@ -1286,8 +1305,8 @@ pub(crate) fn next_region_id() -> i64 {
 pub(crate) struct SpecMeta {
     /// Packed shared-ctx size in bytes.
     pub(crate) len_bytes: i64,
-    /// Reduction readback `(byte width, is_float)`; `None` for DoAll.
-    pub(crate) acc: Option<(u64, bool)>,
+    /// Reduction operator and accumulator type; `None` for DoAll.
+    pub(crate) acc: Option<RSpec>,
     /// Reduction seed `(scalar word position, width, is_float)`.
     pub(crate) seed: Option<(usize, u64, bool)>,
 }
@@ -1423,11 +1442,19 @@ pub extern "C" fn helix_dispatch(start: i64, end: i64, region_id: i64, nthreads:
         mem[ctx_words + p * cell_words] = shared_addr as u64;
     }
 
-    // ---- seed every private accumulator (reductions) ---------------------------
+    // ---- seed cell 0 once; other participants start at the identity ------------
     if let Some((word, width, float)) = meta.seed
+        && let Some(spec) = meta.acc
         && let Some(bits) = caps.get(&word)
     {
         for p in 0..cells {
+            let bits = match (p, spec.op, float) {
+                (0, _, _) => *bits,
+                (_, AnOp::Add, _) => 0,
+                (_, AnOp::Mul, true) => 1.0f64.to_bits(),
+                (_, AnOp::Mul, false) => 1,
+                _ => *bits, // Min/max are idempotent: keep the source seed.
+            };
             let slot = ctx_words + p * cell_words;
             // SAFETY: in-allocation byte write at cell + CELL_ACC_OFF,
             // within the `width` <= 8 bytes of the accumulator field.
@@ -1441,9 +1468,9 @@ pub extern "C" fn helix_dispatch(start: i64, end: i64, region_id: i64, nthreads:
                 let word = if float && width == 4 {
                     // Demote the widened seed back to its f32 pattern (`as`
                     // is round-to-nearest; exact f32 payloads round-trip).
-                    (f64::from_bits(*bits) as f32).to_bits() as u64
+                    (f64::from_bits(bits) as f32).to_bits() as u64
                 } else {
-                    *bits
+                    bits
                 };
                 let bytes: [u8; 8] = word.to_le_bytes();
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, width as usize);
@@ -1462,12 +1489,12 @@ pub extern "C" fn helix_dispatch(start: i64, end: i64, region_id: i64, nthreads:
     );
 
     // ---- publish the folded total into the readback slot ----------------------
-    if let Some((w, _float)) = meta.acc {
+    if let Some(spec) = meta.acc {
         let cell0 = cells_ptr as usize;
         // SAFETY: cell 0's accumulator field, written by the runtime's fold
         // (or by the lone serial participant) before the join completed.
         let total = unsafe {
-            match w {
+            match spec.width {
                 4 => u64::from(((cell0 + CELL_ACC_OFF as usize) as *const u32).read_unaligned()),
                 _ => ((cell0 + CELL_ACC_OFF as usize) as *const u64).read_unaligned(),
             }
@@ -1479,13 +1506,19 @@ pub extern "C" fn helix_dispatch(start: i64, end: i64, region_id: i64, nthreads:
     region_id
 }
 
-/// Participant-cell budget: hardware parallelism clamped to a sane ceiling
-/// (the runtime never drafts more participants than the machine has anyway).
+/// Participant-cell budget: exactly the hardware parallelism, so the area is
+/// always at least as large as the participant count the runtime can resolve.
+///
+/// `effective_nthreads` clamps participants to `available_parallelism`, which
+/// is also what this sizes, so the two agree by construction. An artificial
+/// ceiling here would be a latent out-of-bounds write the moment a request
+/// above it became reachable — which is precisely what the generous
+/// [`NTHREADS_HINT`] makes reachable on a very wide host.
 fn cell_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .clamp(1, 256)
+        .max(1)
 }
 
 /// `helix_read_i64(handle)`: the combined integer total (readback slot).

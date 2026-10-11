@@ -45,7 +45,10 @@ The web UI renders EXACTLY this; helix-observe produces it. Field names normativ
   "exec": {                                 // present after run
     "backend_used":"interp|jit_seq|jit_par",
     "printed":["0.0"], "checksum":"0x9e3779b97f4a7c15",
-    "timings_ms": null                       // filled by bench, not single run
+    "timings_ms":[2.9]  // one interactive-size interp sample; null when
+                        // execution was skipped or failed. Reference-only
+                        // (OS timer precision); use repeated benchmark
+                        // samples for performance comparisons.
   },
   "bench": {                                // optional; from bench campaign
     "kernel":"saxpy","n":33554432,
@@ -59,8 +62,43 @@ The web UI renders EXACTLY this; helix-observe produces it. Field names normativ
 }
 ```
 
+The library compile pipeline leaves `bench` absent on a normal single run.
+The HTTP observer attaches a recorded point from
+`docs/benchmarks/data/campaign.json` only when the loaded executable tokens
+match the measured source frozen in `crates/helix-artifact/src/recorded-sources.json`
+at the catalog's revision. Comments and whitespace do not affect identity;
+campaign matching permits only the campaign's declared `n`/`N`/`SIZE` size
+change, not changes to `ITER` or other executable code. The attached point's
+`n` is its measured size, which may differ from the editor's size. A teaching
+example sharing a kernel's name but not its source receives no attached data.
+Bundled language/IR examples may instead receive a dated seven-sample
+`interp-local` probe from `docs/benchmarks/data/example-probes.json` on exact
+token identity; those probes have no native, parallel, speedup, or efficiency
+claim. Refresh the frozen sources when recording a new catalog revision. `POST /api/benchmark {source}` remains
+the server-side bounded interpreter measurement for API clients, while the
+Observatory's custom-source button measures the same reference interpreter
+through the shipped WASM bridge so the result is available without a server
+round-trip.
+
+`GET /api/benchmarks` reports campaign provenance at the top level. Its
+`probe_provenance` is separate: `{schema, timestamp_utc, git_rev, machine}`,
+where `machine` contains `cpu_brand`, `logical_cores`, `physical_cores`, and
+`rustc_version`. Probe cards use this provenance, never the campaign's date
+or machine. It is `null` when unavailable; fixture indexes also return empty
+`examples` and `points` arrays. Historical measurements do not certify the
+current compiler build's performance.
+
+Browser execution uses a fresh Web Worker per call with a five-second total
+deadline (including loading). Completion, failure, and timeout terminate that
+worker; there is no UI-thread execution fallback. Browser benchmark samples
+use worker-reported `elapsedMs`, excluding worker startup, WASM loading, and
+message transport. Timer resolution remains browser-dependent.
+
 Rules:
 - Every stage degrades gracefully: UI shows stages present, greys missing ones.
+- Example loads, custom compilation, and browser measurements share latest-request-wins ordering; an older completion must not replace a newer selection.
+- The example rail groups entries by category and keeps visual and accessible selection in sync. Custom source remains editable on mobile.
+- Frontend regression checks: `node web/app.test.mjs` (Node.js standard library only).
 - `cfg` layout coordinates are FINAL — browser paints, never computes.
 - IR text blocks are plain monospace strings with \n.
 - All spans byte offsets into `source`.

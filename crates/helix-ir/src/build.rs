@@ -132,6 +132,16 @@ fn scan_expr(e: &TypedExpr, r: &mut Reservations) {
         }
         TypedExprKind::Unary(_, o) | TypedExprKind::Cast(o, _) => scan_expr(o, r),
         TypedExprKind::Index(_, i) => scan_expr(i, r),
+        // Call arguments are evaluated by the builder (eval_args), so a
+        // short-circuit nested in an argument needs its reserved $sc cell too.
+        TypedExprKind::Call(target) => {
+            let args = match target {
+                CallTarget::Builtin { args, .. } | CallTarget::User { args, .. } => args,
+            };
+            for a in args {
+                scan_expr(a, r);
+            }
+        }
         _ => {}
     }
 }
@@ -462,8 +472,11 @@ impl Builder {
     /// Emit `dst = copy(src)` for a scalar of type `ty`.
     ///
     /// HELIX has no move instruction, so copies are expressed as an identity
-    /// computation: numeric types add a zero of their own width; bool doubles
-    /// through `!` (`!!b == b`). `copy_prop` reduces both shapes afterwards.
+    /// computation: floats and ints use a same-type cast (an `x + 0.0` copy
+    /// would erase -0.0 and flush NaN payloads); bool doubles through `!`
+    /// (`!!b == b`). Identity casts are not copy-propagated — they may change
+    /// representation at the backend boundary — and the backend lowers a
+    /// same-type cast to the value itself.
     fn copy_value(&mut self, dst: ValueId, src: ValueId, ty: Ty) {
         match ty {
             Ty::Bool => {
@@ -480,19 +493,10 @@ impl Builder {
                 });
             }
             ty => {
-                let zero = self.val(ty);
-                let c = match ty {
-                    Ty::F32 => Constant::F32(0.0),
-                    Ty::F64 => Constant::F64(0.0),
-                    Ty::I32 => Constant::I32(0),
-                    _ => Constant::I64(0),
-                };
-                self.emit(Inst::Const { dst: zero, c });
-                self.emit(Inst::Bin {
-                    op: BinOp::Add,
+                self.emit(Inst::Cast {
                     dst,
-                    a: src,
-                    b: zero,
+                    val: src,
+                    to: ty,
                 });
             }
         }
@@ -792,7 +796,9 @@ impl Builder {
 
         // Preheader part (in the current block).
         self.expr_into(&fw.start, iv_cell);
-        let end = self.expr(&fw.end);
+        // Snapshot even a bare variable before the body can redefine its cell.
+        let end = self.val(fw.end.ty);
+        self.expr_into(&fw.end, end);
 
         let header = self.new_block();
         let body_b = self.new_block();

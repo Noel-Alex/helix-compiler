@@ -86,13 +86,16 @@ fn oracle_lines_hold_at_correctness_sizes() {
 
 #[test]
 #[ignore = "requires helix-backend M10; run with --ignored"]
-fn recurrence_is_rejected_and_sieve_inner_loop_approved() {
+fn recurrence_and_sieve_are_both_refused() {
     require_native().unwrap();
     let reg = kernels::registry();
     let recurrence = reg.iter().find(|k| k.name == "recurrence_reject").unwrap();
     let sieve = reg.iter().find(|k| k.name == "count_primes_sieve").unwrap();
     assert_eq!(recurrence.expected_verdict, ExpectedVerdict::Sequential);
-    assert_eq!(sieve.expected_verdict, ExpectedVerdict::SafeParallel);
+    // The sieve sweep was approved before the multiplier rule was hardened:
+    // a symbolic stride cannot be proven non-zero, so the sole write's
+    // injectivity is unprovable and the loop stays sequential. Sound refusal.
+    assert_eq!(sieve.expected_verdict, ExpectedVerdict::Sequential);
     // The actual analysis assertions happen inside run_native's planned
     // verdict check once the pipeline is wired; the registry pins here make
     // an accidental expectation change a visible diff.
@@ -107,9 +110,12 @@ fn native_beats_interpreter_on_streaming_kernels() {
     let src = saxpy.source_at_size(1 << 20);
 
     let interp = interp_variant(&src).unwrap();
-    let interp_ms = helix_bench::timing::measure_with_reps(|r| interp.time_batch(r))
-        .expect("interpreter timing cannot fail")
-        .median_ms;
+    let interp_ms = helix_bench::timing::measure_with_reps_n(
+        |r| interp.time_batch(r),
+        helix_bench::timing::K_SAMPLES,
+    )
+    .expect("interpreter timing cannot fail")
+    .median_ms;
 
     let start = std::time::Instant::now();
     run_native(&src).unwrap();

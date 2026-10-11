@@ -4,8 +4,9 @@
 
 **An automatic parallelizing compiler that shows you the proof.**
 
-Write ordinary sequential numerical code. HELIX proves which loops are safe to run
-on all your cores — and shows you the dependence analysis behind every verdict.
+Write ordinary sequential numerical code. HELIX proves which loops are safe to
+spread across the machine's cores when they are large enough to pay for
+threading — and shows you the dependence analysis behind every verdict.
 
 ![saxpy speedup](docs/benchmarks/figs/saxpy_speedup.svg)
 
@@ -36,9 +37,10 @@ Loop #1: RAW 1 / WAR 0 / WAW 0 => SEQUENTIAL (RAW a[i] <- a[i - 1] (carried by i
     WRITE a[i]
 ```
 
-A loop that *can* be proven independent is parallelized across every core.
-A loop that carries a dependence — like the recurrence above — is **refused,
-with the exact distance and direction printed as evidence**.
+A loop that *can* be proven independent is proposed for parallel execution across
+the machine's cores, and threads for real once the loop is large enough to pay
+for the fork/join. A loop that carries a dependence — like the recurrence above
+— is **refused, with the exact distance and direction printed as evidence**.
 
 ---
 
@@ -54,18 +56,23 @@ parallelization (DOALL + reduction recognition) → Cranelift → x86-64 machine
 Every stage is inspectable: `helix dump tokens|ast|ir|ssa`, or the whole pipeline
 stepped through visually in the Observatory (`helix observe`).
 
-## Measured results (laptop, 2026-08-26)
+## Measured results (laptop, 2026-10-11, post-hardening — i9-13900HX, 32 threads)
 
 | Claim | Number |
 |---|---|
-| saxpy @16.8M f64, parallel speedup | **5.66× @ 8 threads** (bandwidth-bound) |
-| dot-product reduction | **3.38× @ 8 threads** |
-| matmul 128², interpreter → native JIT | **12×** (1262 ms → 103 ms) |
-| jacobi stencil 512², interpreter → native JIT | **38×** |
+| saxpy @16M f64, parallel speedup | **5.79× @ 8 threads**, peak **7.84× @ 32T** (bandwidth-bound) |
+| dot-product reduction @4M | **3.08× @ 8 threads**, peak 5.25× @ 24T |
+| matmul 128², interpreter → native seq | **204×** (1199 ms → 5.9 ms) |
+| jacobi stencil 512², interpreter → native seq | **180×** (3097 ms → 17 ms) |
+| parallel vs optimized native seq | **wins on long streaming loops** (saxpy 2.2×, scale 1.86× @16M); honestly LOSES on mid-size multi-array kernels (per-access dispatch overhead — see results.md) |
 | recurrence loop | **refused** — carried dependence proven, runs sequential |
-| cross-backend correctness | every example bit-identical interp ≡ JIT |
+| sieve inner sweep | **refused** — stride not provably non-zero (sound, conservative) |
+| cross-backend correctness | interp ≡ JIT on the FULL state (printed lines + final arrays); FP reductions match under ε = 1e-9 (parallel reordering) |
 
 Full tables + methodology: [docs/benchmarks/results.md](docs/benchmarks/results.md).
+The pre-hardening campaign is preserved at
+[docs/benchmarks/data/pre-hardening/](docs/benchmarks/data/pre-hardening/) with
+its provenance note.
 
 ### Speedups at a glance
 
@@ -73,9 +80,11 @@ Full tables + methodology: [docs/benchmarks/results.md](docs/benchmarks/results.
 |---|---|
 | ![dot](docs/benchmarks/figs/dot_reduction_speedup.svg) | ![jacobi](docs/benchmarks/figs/jacobi_2d_speedup.svg) |
 
-*(15 measured kernels × sizes live in [`docs/benchmarks/figs/`](docs/benchmarks/figs).)*
+*(9 measured kernels × sizes live in [`docs/benchmarks/figs/`](docs/benchmarks/figs).)*
 
 ## Try it
+
+**No install needed:** once GitHub Pages is enabled for this repository, the deployed site (the URL the Pages settings page shows) runs the full compiler in-browser with no server at all. Locally the Observatory is unchanged: `cargo run --release -p helix-cli -- observe`.
 
 ```bash
 # one-time: put `helix` on your PATH (or prefix every command with cargo run --release -p helix-cli --)
@@ -91,11 +100,15 @@ Handy controls:
 
 ```bash
 helix run --backend jit --threads 4 examples/saxpy.hx   # pin the thread count
-helix bench --quick                                     # fast benchmark pass
+helix bench --quick                                     # smoke pass: smallest size per kernel, 5 samples
 HELIX_SCHEDULE=guided helix run --backend jit f.hx      # pick the schedule
 ```
 
 New to the project? The five-minute tour is in [docs/guide.md](docs/guide.md).
+
+## Run it in your browser
+
+The browser lab compiles the same optimized SSA IR the local pipeline produces to a real WebAssembly module (Cranelift cannot target wasm, so emission is its own stage) and executes that module beside the reference interpreter with printed-line and FNV checksum parity — the checksum stream is every printed line plus the arrays still visible at the end of `main`, the interpreter's definition. The native Cranelift JIT and the multicore parallel runtime remain host-only features of the local Observatory.
 
 ## Layout
 
@@ -109,7 +122,11 @@ New to the project? The five-minute tour is in [docs/guide.md](docs/guide.md).
 | crates/helix-runtime | worker pool, schedules, reductions |
 | crates/helix-engine | reference interpreter |
 | crates/helix-bench | benchmark harness + kernel suite |
-| crates/helix-observe | Observatory artifact builder + server |
+| crates/helix-observe | Observatory HTTP server + CFG layout/DOT rendering |
+| crates/helix-artifact | pure compile-artifact builder shared by server + browser |
+| crates/helix-wasm-backend | IR→WebAssembly emitter + frozen module ABI |
+| crates/helix-wasm | wasm bridge (`helix_apply`); ships `web/wasm/helix-lab.wasm` |
+| web/ | Observatory static surface + wasm browser lab |
 | docs/ | lab notebook: research digests, decisions, notes, benchmarks, report outline |
 | examples/*.hx | demo programs incl. deliberately rejected loops |
 

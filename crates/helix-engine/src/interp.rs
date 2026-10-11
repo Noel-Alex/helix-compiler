@@ -43,7 +43,7 @@
 //! * `print` appends one line per call using the canonical formatter shared
 //!   with the JIT backend.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -64,6 +64,35 @@ const MAX_DEPTH: usize = 2000;
 pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a prime.
 pub(crate) const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+thread_local! {
+    /// Bytes handed to the allocator by `zeros` during the current run.
+    ///
+    /// Measurement-only: the wasm bridge reports it beside the compiled
+    /// module's `hx_heap_bytes()` so the browser lab can show how much memory
+    /// each engine spends on the same program. Cell is enough — the
+    /// interpreter is single-threaded per run.
+    static ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Resets the per-run allocation counter.
+pub(crate) fn reset_alloc_bytes() {
+    ALLOC_BYTES.with(|cell| cell.set(0));
+}
+
+/// Accounts one `zeros` allocation of `bytes` bytes.
+fn note_alloc_bytes(bytes: u64) {
+    ALLOC_BYTES.with(|cell| cell.set(cell.get().saturating_add(bytes)));
+}
+
+/// Returns the bytes allocated by `zeros` since the run started (and resets).
+pub fn take_alloc_bytes() -> u64 {
+    ALLOC_BYTES.with(|cell| {
+        let bytes = cell.get();
+        cell.set(0);
+        bytes
+    })
+}
 
 /// Why execution stopped inside a function body.
 #[derive(Debug)]
@@ -426,12 +455,10 @@ impl<'p> Interp<'p> {
                 // (an [T]); the argument only supplies the length.
                 let elem_ty =
                     elem_ty_of(call_ty).ok_or_else(|| internal("zeros element type unresolved"))?;
-                let buf = vec![
-                    Value::zero(elem_ty);
-                    usize::try_from(n).map_err(|_| {
-                        internal("zeros length does not fit the address space")
-                    })?
-                ];
+                let len = usize::try_from(n)
+                    .map_err(|_| internal("zeros length does not fit the address space"))?;
+                let buf = vec![Value::zero(elem_ty); len];
+                note_alloc_bytes((len as u64).saturating_mul(std::mem::size_of::<Value>() as u64));
                 Ok(Value::Array(Rc::new(RefCell::new(buf))))
             }
             Builtin::Len => {
@@ -524,6 +551,7 @@ impl<'p> Interp<'p> {
 /// frames, so [`MAX_DEPTH`] must sit under a generous stack to be reachable
 /// as a clean error rather than STATUS_STACK_OVERFLOW. 64 MiB covers the
 /// bound with two orders of magnitude of headroom.
+#[cfg(not(target_arch = "wasm32"))]
 const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Runs `main()` to completion and collects the output.
@@ -535,6 +563,7 @@ const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// Runtime errors surface as `Err`; successful runs always include every
 /// printed line and the state checksum.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn execute(program: &AdaptedProgram) -> Result<RunOutcome, RunError> {
     // The borrowed tree cannot cross the thread boundary (no 'static), so a
     // clone ships instead. One deep copy of the EIR is negligible next to
@@ -560,6 +589,14 @@ pub(crate) fn execute(program: &AdaptedProgram) -> Result<RunOutcome, RunError> 
             printed_so_far: Vec::new(),
         })
     })
+}
+
+/// WebAssembly has no native worker stack to resize. The browser adapter is
+/// already a bounded, single-run surface, so execute directly on the wasm
+/// stack while retaining the same interpreter and error semantics.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn execute(program: &AdaptedProgram) -> Result<RunOutcome, RunError> {
+    execute_in_worker(program)
 }
 
 fn execute_in_worker(program: &AdaptedProgram) -> Result<RunOutcome, RunError> {

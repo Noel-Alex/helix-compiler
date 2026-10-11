@@ -1,0 +1,27 @@
+[package]
+name = "helix-wasm-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+
+[dependencies]
+helix-ir = { workspace = true }
+helix-sema = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+# Validator for emitted modules in unit tests (dev-only: the browser validates
+# at instantiation time; this keeps "did we emit legal wasm" a unit assertion).
+wasmparser = "0.207"
+# Test-only source driver: examples/*.hx go through the real front end, and the
+# parity tests compare against the reference interpreter as the oracle.
+helix-syntax = { workspace = true }
+helix-sema = { workspace = true }
+helix-engine = { workspace = true }
+# The project's own work estimate, so benchmark-sized kernels (saxpy allocates
+# 2 × 32 Mi f64 and would take minutes to interpret) are skipped here.
+helix-artifact = { workspace = true }
+# Executes the emitted module so parity is asserted, not assumed.
+wasmi = "2.0.0"

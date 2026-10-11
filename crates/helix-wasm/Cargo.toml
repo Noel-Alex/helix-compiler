@@ -1,0 +1,18 @@
+[package]
+name = "helix-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+helix-artifact = { workspace = true }
+helix-engine = { workspace = true }
+helix-ir = { workspace = true }
+helix-sema = { workspace = true }
+helix-syntax = { workspace = true }
+helix-wasm-backend = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

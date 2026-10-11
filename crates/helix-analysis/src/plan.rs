@@ -19,7 +19,9 @@
 //!    (private accumulators + associative combine) — and the loop becomes
 //!    [`Verdict::ReductionParallel`]. Any edge on real memory survives and
 //!    vetoes with its explanation as the printed reason.
-//! 5. Otherwise [`Verdict::SafeParallel`].
+//! 5. Writes must have nonzero affine coefficients, and loop-header scalar
+//!    phis must be unused, the canonical IV, or recognized reductions; otherwise
+//!    `Sequential`. With no veto, [`Verdict::SafeParallel`].
 //!
 //! ## Reports are data
 //!
@@ -156,6 +158,17 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
         for name in user_call_names(func, lp) {
             notes.push(format!("calls non-pure function '{name}' inside the loop"));
         }
+        // A per-iteration allocation returns a fresh array each iteration;
+        // its identity is unmodeled and its pointer may escape — veto up
+        // front even when dependence tests look clean.
+        if lp.blocks.iter().any(|&b| {
+            func.block(b)
+                .insts
+                .iter()
+                .any(|i| matches!(i, helix_ir::Inst::Call(c) if c.callee == "zeros"))
+        }) {
+            notes.push("allocates a fresh array (zeros) inside the loop".to_string());
+        }
 
         // Canonical shape?
         let canonical: Option<CanonicalLoop> = canon::canon(func, lp);
@@ -174,13 +187,30 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
         };
 
         // Reduction recognition — the canonical iv is excluded because its
-        // header φ has exactly the additive shape of a reduction.
+        // header φ has exactly the additive shape of a reduction, and no
+        // other header φ may carry iteration state (checked just below).
         const NO_EXCLUSIONS: &[LocalId] = &[];
         let excluded: &[LocalId] = match &canonical {
             Some(c) => std::slice::from_ref(&c.iv),
             None => NO_EXCLUSIONS,
         };
         let reductions = reduce::find_reductions(func, &lp.blocks, excluded);
+        // A header φ whose result is never used anywhere carries no state
+        // out of any iteration (SSA renaming of an overwrite-before-read
+        // temporary): it cannot carry a dependence. Anything live — read in
+        // the loop or after it — still vetoes below.
+        for phi in &func.block(lp.header).phis {
+            if !excluded.contains(&phi.var)
+                && !reductions.iter().any(|r| r.var == phi.var)
+                && phi.args.iter().any(|(pred, _)| lp.blocks.contains(pred))
+                && func.blocks.iter().any(|b| b.uses().contains(&phi.dst))
+            {
+                notes.push(format!(
+                    "unrecognized loop-carried scalar '{}'",
+                    local_name(func, phi.var)
+                ));
+            }
+        }
         let reduction_report = reductions.first().map(|r| Reduction {
             op: r.op,
             var: local_name(func, r.var),
@@ -191,15 +221,15 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
         // under which range-dependent refutations are forbidden (an invented
         // finite window containing no solution proves nothing about real i64
         // iteration spaces — see `deps::Domain`).
-        let domain = canonical.as_ref().map_or(Domain::Symbolic, |c| {
-            match (&c.start, &c.end) {
+        let domain = canonical
+            .as_ref()
+            .map_or(Domain::Symbolic, |c| match (&c.start, &c.end) {
                 (Bound::Const(lo), Bound::Const(hi)) => Domain::Bounded(IterRange {
                     lo: i128::from(*lo),
                     hi: i128::from(*hi).saturating_sub(1),
                 }),
                 _ => Domain::Symbolic,
-            }
-        });
+            });
 
         // Pair same-array accesses; classify RAW/WAR/WAW. Default is ORDERED
         // body position: earlier write → later read is RAW (flow), earlier
@@ -215,6 +245,17 @@ pub fn analyze(func: &FuncIr, loops: &LoopInfo) -> Vec<LoopReport> {
         let arr_name = |l: LocalId| local_name(func, l);
 
         for (i, src) in accesses.iter().enumerate() {
+            // Distinct-site pairing misses a store racing with itself across
+            // iterations. access::collect supplies a coefficient only after
+            // proving no wrap or an odd, same-width modular permutation.
+            // Nonzero mathematical strides alone are not injectivity proofs.
+            // Paired sites still require exact no-wrap forms below.
+            if src.is_write && src.iv_coefficient.is_none_or(|a| a == 0) {
+                notes.push(format!(
+                    "write subscript on '{}' may overlap across iterations",
+                    arr_name(src.arr)
+                ));
+            }
             for dst in accesses.iter().skip(i + 1) {
                 if src.arr != dst.arr {
                     continue;
@@ -532,7 +573,7 @@ fn user_call_names(func: &FuncIr, lp: &Loop) -> Vec<String> {
             if let helix_ir::Inst::Call(c) = inst {
                 let is_user = !matches!(
                     c.callee.as_str(),
-                    "min" | "max" | "sqrt" | "abs" | "len" | "zeros" | "print"
+                    "min" | "max" | "sqrt" | "abs" | "len" | "print"
                 );
                 if is_user && !out.iter().any(|n| n == &c.callee) {
                     out.push(c.callee.clone());
@@ -569,7 +610,6 @@ fn push_edge(
 /// Render `a*iv + b` the way the report cards show subscripts.
 fn render_affine(a: deps::Affine, iv: &str) -> String {
     match (a.a, a.b) {
-        (_, b) if a.a == 0 && b == 0 => "0".to_string(), // collapsed invariant
         (0, b) => b.to_string(),
         (1, 0) => iv.to_string(),
         (1, c) if c > 0 => format!("{iv} + {c}"),

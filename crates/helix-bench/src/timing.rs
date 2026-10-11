@@ -30,9 +30,17 @@
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-/// Timed samples taken per (kernel, variant) — Kalibera & Jones' "~30 reps"
+/// Samples per variant in a full campaign — Kalibera & Jones' "~30 reps"
 /// halved for campaign wall-clock; CV reporting covers the slack.
 pub const K_SAMPLES: usize = 15;
+
+/// Samples per variant in a quick (`--quick`) campaign.
+///
+/// A quick run exists to prove the campaign wiring still works end to end,
+/// not to publish numbers, so five samples are plenty and the whole suite
+/// finishes in seconds instead of minutes. The sampling protocol itself
+/// (pilot, warmups, CV-gated rerun) is unchanged — only the count shrinks.
+pub const K_SAMPLES_QUICK: usize = 5;
 
 /// Untimed batches run after the pilot (absorbs JIT compile + caches).
 pub const WARMUPS: usize = 3;
@@ -179,13 +187,17 @@ fn time_batch(f: &dyn Fn(), reps: u32) -> Duration {
 #[must_use]
 pub fn measure(f: impl Fn()) -> Measurement {
     // Plain closures cannot fail; fallible variants call
-    // `measure_with_reps` directly and handle the error.
-    measure_with_reps(|r| Ok(time_batch(&f, r)))
+    // `measure_with_reps_n` directly and handle the error.
+    measure_with_reps_n(|r| Ok(time_batch(&f, r)), K_SAMPLES)
         .expect("infallible closure cannot fail")
 }
 
-/// Like [`measure`] but the closure receives the rep count (lets drivers
-/// interleave multiple variants without re-running pilots per sample round).
+/// [`measure`] with an explicit sample count.
+///
+/// The closure receives the rep count, which lets drivers interleave several
+/// variants without re-running pilots per sample round. Takes [`K_SAMPLES`]
+/// samples; a quick campaign passes [`K_SAMPLES_QUICK`] and changes nothing
+/// else about the procedure.
 ///
 /// The pilot runs first (picking `R`), then [`WARMUPS`] untimed batches at
 /// `R`, then up to two sampling rounds gated by the CV threshold.
@@ -193,8 +205,9 @@ pub fn measure(f: impl Fn()) -> Measurement {
 /// # Errors
 /// Propagates the closure's first execution failure verbatim — a variant that
 /// cannot run must never contribute samples to any measurement.
-pub fn measure_with_reps(
+pub fn measure_with_reps_n(
     run: impl Fn(u32) -> Result<Duration, String>,
+    samples: usize,
 ) -> Result<Measurement, String> {
     // -- pilot ---------------------------------------------------------
     let reps = pick_reps(&run)?;
@@ -208,11 +221,10 @@ pub fn measure_with_reps(
     let mut best: Option<Measurement> = None;
     let mut reran_for_cv = false;
     for attempt in 0..2 {
-        let mut per_rep_ms = Vec::with_capacity(K_SAMPLES);
-        for _ in 0..K_SAMPLES {
-            per_rep_ms.push(
-                black_box_duration(run(reps)?).as_secs_f64() / f64::from(reps) * 1_000.0,
-            );
+        let mut per_rep_ms = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            per_rep_ms
+                .push(black_box_duration(run(reps)?).as_secs_f64() / f64::from(reps) * 1_000.0);
         }
         let m = summarize(per_rep_ms, reps, reran_for_cv || attempt > 0);
         match &best {
@@ -271,13 +283,33 @@ fn summarize(mut per_rep_ms: Vec<f64>, reps: u32, reran: bool) -> Measurement {
 /// sample per visit. This defeats thermal-drift bias: drift hits every
 /// variant proportionally instead of only whichever finished last.
 ///
-/// Returns one [`Measurement`] per variant, in input order.
+/// Returns one [`Measurement`] per variant, in input order, taking
+/// [`K_SAMPLES`] samples per variant.
 ///
 /// # Errors
 /// Propagates the first failing variant's error text (tagged with the
 /// variant's name) — a variant that fails mid-sampling aborts the round
 /// instead of silently contributing garbage or missing samples.
-pub fn run_interleaved<F>(variants: &[&str], mut sample_once: F) -> Result<Vec<Measurement>, String>
+pub fn run_interleaved<F>(variants: &[&str], sample_once: F) -> Result<Vec<Measurement>, String>
+where
+    F: FnMut(usize, u32) -> Result<Duration, String>,
+{
+    run_interleaved_n(variants, sample_once, K_SAMPLES)
+}
+
+/// [`run_interleaved`] with an explicit sample count.
+///
+/// The round-robin protocol is identical whatever the count; a quick campaign
+/// only shrinks the number of samples, never the procedure.
+///
+/// # Errors
+/// Propagates the first failing variant's error text (tagged with the
+/// variant's name).
+pub fn run_interleaved_n<F>(
+    variants: &[&str],
+    mut sample_once: F,
+    samples: usize,
+) -> Result<Vec<Measurement>, String>
 where
     F: FnMut(usize, u32) -> Result<Duration, String>,
 {
@@ -305,8 +337,8 @@ where
     }
 
     // Interleaved sampling: rounds outermost, variants innermost.
-    let mut buckets: Vec<Vec<f64>> = vec![Vec::with_capacity(K_SAMPLES); variants.len()];
-    for _ in 0..K_SAMPLES {
+    let mut buckets: Vec<Vec<f64>> = vec![Vec::with_capacity(samples); variants.len()];
+    for _ in 0..samples {
         for (vi, _) in variants.iter().enumerate() {
             let d = black_box_duration(sample_once(vi, reps[vi])?);
             buckets[vi].push(d.as_secs_f64() / f64::from(reps[vi]) * 1_000.0);
@@ -315,20 +347,18 @@ where
 
     // CV gate per variant: rerun just the offending variant's bucket once,
     // sampling that same variant's closure again.
-    Ok(buckets
+    let buckets = buckets
         .into_iter()
         .zip(reps)
         .enumerate()
         .map(|(vi, (bucket, reps))| {
             let mut m = summarize(bucket, reps, false);
             if m.cv > CV_RERUN_THRESHOLD {
-                let retry: Result<Vec<f64>, String> = (0..K_SAMPLES)
+                let retry: Result<Vec<f64>, String> = (0..samples)
                     .map(|_| -> Result<f64, String> {
-                        Ok(
-                            black_box_duration(sample_once(vi, reps)?).as_secs_f64()
-                                / f64::from(reps)
-                                * 1_000.0,
-                        )
+                        Ok(black_box_duration(sample_once(vi, reps)?).as_secs_f64()
+                            / f64::from(reps)
+                            * 1_000.0)
                     })
                     .collect();
                 let retry = retry?;
@@ -341,7 +371,8 @@ where
             }
             Ok(m)
         })
-        .collect::<Result<Vec<_>, String>>()?)
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(buckets)
 }
 
 #[cfg(test)]
@@ -470,23 +501,30 @@ mod tests {
     /// Batch alternating 80/120 ms: population stddev 20 over mean ~98.67,
     /// CV ~0.20 — comfortably above [`CV_RERUN_THRESHOLD`].
     fn noisy_80_120(n: usize) -> f64 {
-        if (n - 4) % 2 == 0 { 80.0 } else { 120.0 }
+        if (n - 4).is_multiple_of(2) {
+            80.0
+        } else {
+            120.0
+        }
     }
 
     #[test]
     fn cv_rerun_replaces_originals_when_strictly_tighter() {
         let calls = std::cell::Cell::new(0usize);
-        let m = measure_with_reps(|_| {
-            let n = calls.get();
-            calls.set(n + 1);
-            let ms = match n {
-                0 => 150.0,
-                1..=3 => 100.0,
-                4..=18 => noisy_80_120(n),
-                _ => 90.0, // rerun: perfectly flat, CV 0
-            };
-            Ok(Duration::from_millis(ms as u64))
-        })
+        let m = measure_with_reps_n(
+            |_| {
+                let n = calls.get();
+                calls.set(n + 1);
+                let ms = match n {
+                    0 => 150.0,
+                    1..=3 => 100.0,
+                    4..=18 => noisy_80_120(n),
+                    _ => 90.0, // rerun: perfectly flat, CV 0
+                };
+                Ok(Duration::from_millis(ms as u64))
+            },
+            K_SAMPLES,
+        )
         .unwrap();
         assert!(m.reran_for_cv, "gate tripped; the rerun must be recorded");
         assert!(
@@ -504,30 +542,29 @@ mod tests {
         // than the originals (CV ~0.20). The ORIGINAL batch must survive
         // untouched; only the honesty flag flips.
         let calls = std::cell::Cell::new(0usize);
-        let m = measure_with_reps(|_| {
-            let n = calls.get();
-            calls.set(n + 1);
-            let ms = match n {
-                0 => 150.0,
-                1..=3 => 100.0,
-                4..=18 => noisy_80_120(n),
-                _ => {
-                    if n % 2 == 0 {
-                        60.0
-                    } else {
-                        140.0
+        let m = measure_with_reps_n(
+            |_| {
+                let n = calls.get();
+                calls.set(n + 1);
+                let ms = match n {
+                    0 => 150.0,
+                    1..=3 => 100.0,
+                    4..=18 => noisy_80_120(n),
+                    _ => {
+                        if n.is_multiple_of(2) {
+                            60.0
+                        } else {
+                            140.0
+                        }
                     }
-                }
-            };
-            Ok(Duration::from_millis(ms as u64))
-        })
+                };
+                Ok(Duration::from_millis(ms as u64))
+            },
+            K_SAMPLES,
+        )
         .unwrap();
         assert!(m.reran_for_cv, "a rerun ran and must be recorded");
-        assert!(
-            m.cv > CV_RERUN_THRESHOLD,
-            "kept-batch honesty: cv {}",
-            m.cv
-        );
+        assert!(m.cv > CV_RERUN_THRESHOLD, "kept-batch honesty: cv {}", m.cv);
         assert_eq!(
             m.median_ms, 80.0,
             "original batch must survive a noisier rerun (its median is 80)"
@@ -575,7 +612,7 @@ mod tests {
                 1..=3 => 100.0,
                 4..=18 => noisy_80_120(n),
                 _ => {
-                    if n % 2 == 0 {
+                    if n.is_multiple_of(2) {
                         60.0
                     } else {
                         140.0

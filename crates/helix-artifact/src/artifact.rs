@@ -7,7 +7,7 @@
 //! stage is an [`Option`] and the UI greys out whatever is absent.
 //!
 //! Layout coordinates inside [`CfgFunction`] are *final*: the browser paints
-//! rectangles and polylines, it never computes geometry (see [`crate::layout`]
+//! rectangles and polylines, it never computes geometry (see [`crate::cfg_layout`]
 //! for where they come from).
 
 use serde::{Deserialize, Serialize};
@@ -440,7 +440,7 @@ pub struct BenchView {
 
 /// The whole Observatory payload: everything known about one compile.
 ///
-/// Build via [`crate::pipeline::build_artifact`]. Stages are `None` once the
+/// Build via [`crate::build_artifact`]. Stages are `None` once the
 /// pipeline stopped (lex error ⇒ only `source`/`diags_lex`; sema error ⇒
 /// through `ast` plus `diags_sem`; success ⇒ everything).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,7 +480,7 @@ pub struct CompileArtifact {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub passes: Option<Vec<PassReport>>,
 
-    /// Laid-out CFGs (coordinates final — see [`crate::layout`]).
+    /// Laid-out CFGs (coordinates final — see [`crate::cfg_layout`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cfg: Option<CfgStage>,
 

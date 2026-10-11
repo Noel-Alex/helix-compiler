@@ -6,10 +6,7 @@ license.workspace = true
 
 [dependencies]
 helix-syntax = { workspace = true }
-helix-sema = { workspace = true }
-helix-ir = { workspace = true }
-helix-analysis = { workspace = true }
-helix-engine = { workspace = true }
+helix-artifact = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

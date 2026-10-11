@@ -1,7 +1,7 @@
 //! Graphviz `.dot` emission — the escape hatch for publication-quality CFG
 //! figures without going through the browser.
 //!
-//! The output mirrors [`crate::layout::cfg_layout`] exactly (same roles, same
+//! The output mirrors [`helix_artifact::cfg_layout`] exactly (same roles, same
 //! edge classes, same labels) but lets Graphviz do its own layout, so it is
 //! also a handy cross-check: if the server-side tidy algorithm disagrees with
 //! `dot`'s idea of the graph, one of them is wrong.
@@ -15,7 +15,7 @@
 //! }
 //! ```
 
-use crate::artifact::{BlockRole, CfgFunction, EdgeKind};
+use helix_artifact::artifact::{BlockRole, CfgFunction, EdgeKind};
 
 /// Renders one laid-out function as a Graphviz digraph.
 ///
@@ -107,7 +107,7 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact::{CfgEdge, CfgNode};
+    use helix_artifact::artifact::{CfgEdge, CfgNode};
 
     fn sample() -> CfgFunction {
         CfgFunction {

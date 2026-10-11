@@ -4,3 +4,12 @@
 *.exe.tmp
 .claude/launch.local.json
 docs/benchmarks/data/*.local.json
+# staged by the Pages deploy workflow at build time
+web/data/
+# local scratch and run logs (never project artifacts)
+.tmp-ir/
+.impeccable/
+.claude/tmp/
+target-analysis-check/
+campaign-run*.log
+helix-tailscale-*.log

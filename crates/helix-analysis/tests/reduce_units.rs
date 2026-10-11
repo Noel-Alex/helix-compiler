@@ -257,6 +257,23 @@ fn both_operands_accumulator_vetoes() {
 }
 
 #[test]
+fn subtraction_with_accumulator_on_right_vetoes() {
+    for use_phi in [false, true] {
+        let mut fx = Fixture::new("reverse_sub");
+        let t = fx.konst(5);
+        let chain = fx.chain;
+        let acc = if use_phi { fx.acc_phi } else { chain };
+        fx.body().push(Inst::Bin {
+            op: BinOp::Sub,
+            dst: chain,
+            a: t,
+            b: acc,
+        });
+        assert!(recognize(&fx.build()).is_empty());
+    }
+}
+
+#[test]
 fn non_associative_division_vetoes() {
     let mut fx = Fixture::new("div_chain");
     let t = fx.konst(2);

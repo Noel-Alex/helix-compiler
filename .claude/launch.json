@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "helix-observe",
-      "runtimeExecutable": "cargo",
-      "runtimeArgs": ["run", "-p", "helix-observe", "--", "--port", "8199", "--no-open"],
+      "runtimeExecutable": "powershell",
+      "runtimeArgs": ["-NoProfile", "-Command", "cargo run -p helix-observe -- --port 8199 --no-open; exit $LASTEXITCODE"],
       "port": 8199
     }
   ]

@@ -29,13 +29,337 @@ const PHASES = [
 
 const state = {
   examples: [],
+  benchmarkCatalog: null,
   exampleName: '',
   artifact: null,
   phase: 'source',
   cfgFn: 0,
   ssaFn: 0,
   benchLog: false,
+  benchMessage: '',
+  benchPending: false,
+  requestSeq: 0,
+  browserRun: null,
+  browserRunSeq: 0,
+  // Static hosting (GitHub Pages) answers no /api/*: every request then runs
+  // through the WASM bridge, and localBench holds the two-engine measurement.
+  static: false,
+  localBench: null,
 };
+
+const EXAMPLE_GROUPS = [
+  {
+    key: 'kernels',
+    label: 'Kernels',
+    note: 'numerical loops and reductions',
+    names: new Set(['count_primes_sieve', 'dot_reduction', 'fib_recursion', 'jacobi_2d', 'matmul', 'minmax_reduction', 'saxpy', 'scale', 'small_n']),
+  },
+  {
+    key: 'language',
+    label: 'Language / IR',
+    note: 'types, control flow, and lowering',
+    names: new Set(['casts_demo', 'const_globals', 'div_guard', 'gcd_box_test', 'shortcircuit', 'ssa_demo', 'writer_call']),
+  },
+  {
+    key: 'refusal',
+    label: 'Refusal / diagnostics',
+    note: 'useful failures kept in view',
+    names: new Set(['recurrence_reject', 'stencil_2d_reject', 'type_errors']),
+  },
+];
+
+const FALLBACK_EXAMPLES = [
+  'casts_demo', 'const_globals', 'count_primes_sieve', 'div_guard', 'dot_reduction',
+  'fib_recursion', 'gcd_box_test', 'jacobi_2d', 'matmul', 'minmax_reduction',
+  'recurrence_reject', 'saxpy', 'scale', 'shortcircuit', 'small_n', 'ssa_demo',
+  'stencil_2d_reject', 'type_errors', 'writer_call',
+];
+
+function exampleGroup(name) {
+  return EXAMPLE_GROUPS.find(group => group.names.has(name)) ?? EXAMPLE_GROUPS[1];
+}
+
+function benchmarkKernel(name) {
+  return state.benchmarkCatalog?.kernels?.find(kernel => kernel.name === name) ?? null;
+}
+
+function benchmarkProbe(name) {
+  return state.benchmarkCatalog?.examples?.find(example => example.name === name) ?? null;
+}
+
+function benchmarkPoints(name) {
+  const points = state.benchmarkCatalog?.points;
+  return Array.isArray(points) ? points.filter(point => point.kernel === name) : [];
+}
+
+function benchmarkVariant(variants, name) {
+  return variants?.find(variant => variant.name === name) ?? null;
+}
+
+function benchmarkVariantLabel(variant) {
+  if (!variant) return '— not recorded';
+  const samples = variant.samples?.length ?? variant.sample_count;
+  const sampleLabel = Number.isFinite(Number(samples)) ? ` · ${samples} samples` : '';
+  return `${formatMilliseconds(variant.median_ms)} ms median${sampleLabel}`;
+}
+
+function formatMilliseconds(value) {
+  const ms = Number(value);
+  const digits = ms > 0 && ms < 1 ? 3 : ms >= 100 ? 1 : 2;
+  return fmt(ms, digits);
+}
+
+function benchmarkPair(from, to) {
+  if (!from || !to) return null;
+  const before = Number(from.median_ms);
+  const after = Number(to.median_ms);
+  if (!(before > 0) || !(after > 0)) return null;
+  const ratio = before / after;
+  if (!Number.isFinite(ratio)) return null;
+  return ratio >= 1
+    ? `${fmt(ratio, 2)}× faster`
+    : `${fmt(1 / ratio, 2)}× slower`;
+}
+
+/** Keep the WASM preview responsive: the work estimator lives in the shared
+ *  WASM bridge module so the guide's browser lab enforces the same budget.
+ *  It is passed in by callers after the bridge module loads. */
+function browserPreviewAllowed(art, estimatedBrowserWork) {
+  return !!art?.source && !art.diags_lex && !(art.diags_sem?.length) &&
+    new TextEncoder().encode(art.source).length <= 64 * 1024 &&
+    estimatedBrowserWork(art.source) <= 2_000_000;
+}
+
+function appendBenchmarkCard(parent, label, value, detail, tone = '') {
+  const card = document.createElement('article');
+  card.className = `bench-compare-card${tone ? ` ${tone}` : ''}`;
+  const title = document.createElement('p');
+  title.className = 'bench-compare-label';
+  title.textContent = label;
+  const result = document.createElement('strong');
+  result.className = 'bench-compare-value';
+  result.textContent = value;
+  const meta = document.createElement('p');
+  meta.className = 'bench-compare-meta';
+  meta.textContent = detail;
+  card.append(title, result, meta);
+  parent.appendChild(card);
+}
+
+function renderExecReadout(art) {
+  const panel = $('#exec-readout');
+  if (!panel) return;
+  panel.textContent = '';
+  panel.classList.toggle('hidden', !art);
+  if (!art) return;
+
+  const heading = document.createElement('div');
+  heading.className = 'exec-readout-heading';
+  const title = document.createElement('strong');
+  title.textContent = 'Execution readout';
+  const source = document.createElement('span');
+  source.className = 'exec-readout-source';
+  source.textContent = 'same source · observable output';
+  heading.append(title, source);
+  panel.appendChild(heading);
+
+  const run = state.browserRun;
+  if (run?.status === 'running') {
+    const pending = document.createElement('p');
+    pending.className = 'exec-readout-pending';
+    pending.textContent = 'Running the reference interpreter in this browser…';
+    panel.appendChild(pending);
+    return;
+  }
+
+  const result = run?.result ?? null;
+  const serverExec = art.exec;
+  // One evidence source paints output/checksum/status/engine: a failed or
+  // absent browser run must not dilute the observer's own execution with
+  // empty browser fields (browser failures still show their error below).
+  const browserOk = result?.ok === true;
+  const evidence = browserOk || !serverExec ? result : serverExec;
+  const values = evidence?.printed ?? [];
+  const checksum = evidence?.checksum ?? '';
+  const budgetSkipped = !result && values.some(value => String(value).startsWith('skipped:'));
+  const status = document.createElement('span');
+  status.className = `exec-status ${browserOk || (!result && checksum) ? 'is-ok' : 'is-muted'}`;
+  status.textContent = browserOk ? 'WASM RESULT' : (serverExec?.checksum ? 'OBSERVER RESULT' : (budgetSkipped ? 'BUDGET SKIP' : 'NO EXECUTION'));
+
+  const meta = document.createElement('div');
+  meta.className = 'exec-readout-meta';
+  meta.appendChild(status);
+  if (browserOk && result.engine) {
+    const engine = document.createElement('span');
+    engine.textContent = result.engine;
+    meta.appendChild(engine);
+  } else if (serverExec?.backend_used) {
+    const engine = document.createElement('span');
+    engine.textContent = serverExec.backend_used;
+    meta.appendChild(engine);
+  }
+  panel.appendChild(meta);
+
+  if (run?.status === 'skipped') {
+    const note = document.createElement('p');
+    note.className = 'exec-readout-note';
+    note.textContent = run.message;
+    panel.appendChild(note);
+  } else if (result?.ok === false) {
+    const error = document.createElement('p');
+    error.className = 'exec-readout-error';
+    error.textContent = result.message || 'The browser interpreter rejected this program.';
+    panel.appendChild(error);
+  }
+
+  const output = document.createElement('pre');
+  output.className = 'exec-output';
+  output.textContent = values.length ? values.join('\n') : '∅  program printed no lines';
+  output.setAttribute('aria-label', 'program output');
+  panel.appendChild(output);
+
+  const foot = document.createElement('div');
+  foot.className = 'exec-readout-foot';
+  if (checksum) {
+    const check = document.createElement('code');
+    check.textContent = `checksum ${checksum}`;
+    foot.appendChild(check);
+  }
+  if (result?.ok && result.checksum && serverExec?.checksum) {
+    const parity = document.createElement('span');
+    const same = result.checksum === serverExec.checksum;
+    parity.className = same ? 'exec-parity is-ok' : 'exec-parity is-error';
+    parity.textContent = same ? 'matches observer output' : 'observer/WASM output differs';
+    foot.appendChild(parity);
+  }
+  // Server-side timing sample (interactive-sized only; benchmark-sized runs
+  // skip execution). Reference-only — timer precision is OS-dependent.
+  const serverTiming = serverExec?.timings_ms?.[0];
+  if (Number.isFinite(serverTiming) && serverTiming >= 0) {
+    const t = document.createElement('code');
+    t.textContent = `interp ${serverTiming < 1 ? serverTiming.toFixed(3) : serverTiming.toFixed(1)} ms`;
+    foot.appendChild(t);
+  }
+  if (foot.childElementCount) panel.appendChild(foot);
+}
+
+/**
+ * Make the comparison basis explicit. The artifact endpoint attaches the
+ * most complete point so the chart stays useful, while the campaign index
+ * exposes every recorded size for scale-aware comparisons.
+ */
+function renderBenchComparison(bench) {
+  const wrap = $('#bench-comparison');
+  if (!wrap) return;
+  wrap.textContent = '';
+  if (!bench) return;
+
+  const intro = document.createElement('p');
+  intro.className = 'bench-comparison-intro';
+  wrap.appendChild(intro);
+
+  if (bench.kernel === '<adhoc>' || benchmarkProbe(bench.kernel)) {
+    const probe = benchmarkProbe(bench.kernel);
+    const provenance = state.benchmarkCatalog?.probe_provenance;
+    intro.textContent = probe
+      ? 'Recorded example probe · reference interpreter only · no native or parallel baseline was recorded for this source.'
+      : 'Local measurement · WASM reference interpreter only · no native or parallel baseline was recorded for this source.';
+    const variant = bench.variants?.[0];
+    appendBenchmarkCard(
+      wrap,
+      'Reference execution',
+      variant ? benchmarkVariantLabel(variant) : 'Not available',
+      probe
+        ? `Captured ${provenance?.timestamp_utc?.slice(0, 10) ?? 'date unavailable'} · revision ${provenance?.git_rev ?? 'unavailable'} · ${provenance?.machine?.cpu_brand ?? 'machine unavailable'}.`
+        : 'Custom source is measured locally in this browser; no backend timing is invented.',
+      variant ? 'bench-compare-positive' : 'bench-compare-muted',
+    );
+    return;
+  }
+
+  const variants = bench.variants ?? [];
+  const interp = benchmarkVariant(variants, 'interp');
+  const seq = benchmarkVariant(variants, 'native-seq');
+  const parallel = benchmarkVariant(variants, 'native-par');
+  intro.textContent = `Pairwise medians at n = ${Number(bench.n).toLocaleString('en-US')} · lower wall-clock time is better.`;
+
+  const grid = document.createElement('div');
+  grid.className = 'bench-compare-grid';
+  const interpSpeed = benchmarkPair(interp, seq);
+  appendBenchmarkCard(
+    grid,
+    'Interpreter → native sequential',
+    interpSpeed ?? 'Not comparable',
+    interp && seq
+      ? `${benchmarkVariantLabel(interp)} → ${benchmarkVariantLabel(seq)}`
+      : `interp ${benchmarkVariantLabel(interp)} · native-seq ${benchmarkVariantLabel(seq)}`,
+    interpSpeed ? 'bench-compare-positive' : 'bench-compare-muted',
+  );
+  const parallelSpeed = benchmarkPair(seq, parallel);
+  appendBenchmarkCard(
+    grid,
+    'Native sequential → native parallel',
+    parallelSpeed ?? 'Not comparable',
+    seq && parallel
+      ? `${benchmarkVariantLabel(seq)} → ${benchmarkVariantLabel(parallel)}`
+      : `native-seq ${benchmarkVariantLabel(seq)} · native-par ${benchmarkVariantLabel(parallel)}`,
+    parallelSpeed ? 'bench-compare-positive' : 'bench-compare-muted',
+  );
+  wrap.appendChild(grid);
+
+  if (!interp) {
+    const note = document.createElement('p');
+    note.className = 'bench-recorded-note';
+    note.textContent = 'Interpreter baseline not recorded at this size. Large campaign points omit the interpreter to keep the campaign bounded; the native sequential → parallel comparison remains valid.';
+    wrap.appendChild(note);
+  }
+  if (!parallel) {
+    const note = document.createElement('p');
+    note.className = 'bench-recorded-note';
+    note.textContent = 'No native parallel variant was recorded for this point. The compiler kept this program sequential or the campaign did not define a parallel path.';
+    wrap.appendChild(note);
+  }
+
+  const points = benchmarkPoints(bench.kernel);
+  if (points.length > 1) {
+    const heading = document.createElement('p');
+    heading.className = 'bench-recorded-heading';
+    heading.textContent = `Recorded sizes · ${points.length} points for ${bench.kernel}`;
+    wrap.appendChild(heading);
+
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'bench-size-table-wrap';
+    const table = document.createElement('table');
+    table.className = 'bench-size-table';
+    table.innerHTML = '<thead><tr><th scope="col">n</th><th scope="col">interp</th><th scope="col">native-seq</th><th scope="col">native-par</th><th scope="col">readout</th></tr></thead>';
+    const body = document.createElement('tbody');
+    for (const point of points) {
+      const tr = document.createElement('tr');
+      if (Number(point.n) === Number(bench.n)) tr.className = 'is-selected';
+      const pointVariants = point.variants ?? [];
+      const pointInterp = benchmarkVariant(pointVariants, 'interp');
+      const pointSeq = benchmarkVariant(pointVariants, 'native-seq');
+      const pointParallel = benchmarkVariant(pointVariants, 'native-par');
+      const nCell = document.createElement('th');
+      nCell.scope = 'row';
+      nCell.textContent = Number(point.n).toLocaleString('en-US');
+      tr.appendChild(nCell);
+      for (const variant of [pointInterp, pointSeq, pointParallel]) {
+        const td = document.createElement('td');
+        td.textContent = variant ? benchmarkVariantLabel(variant) : '—';
+        tr.appendChild(td);
+      }
+      const readout = document.createElement('td');
+      const pointPair = benchmarkPair(pointInterp, pointSeq) ?? benchmarkPair(pointSeq, pointParallel);
+      readout.textContent = pointPair ?? 'not comparable';
+      tr.appendChild(readout);
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    tableWrap.appendChild(table);
+    wrap.appendChild(tableWrap);
+  }
+}
 
 /* ------------------------------------------------------------- toast */
 let toastTimer = null;
@@ -75,10 +399,32 @@ function tokenClass(tk) {
 }
 
 function buildLineMap(source) {
-  // byte offset -> line index (0-based); source is ASCII so JS indices == bytes
+  // JavaScript indices are UTF-16 code-unit offsets. Rust spans are UTF-8
+  // byte offsets, but line starts are consumed after conversion to JS.
   const starts = [0];
   for (let i = 0; i < source.length; i++) if (source[i] === '\n') starts.push(i + 1);
   return starts;
+}
+
+/** Convert a Rust UTF-8 byte span offset to a JavaScript string offset. */
+function buildByteToJsMap(source) {
+  const map = [0];
+  const encoder = new TextEncoder();
+  let byteOffset = 0;
+  let jsOffset = 0;
+  for (const ch of source) {
+    const byteLength = encoder.encode(ch).length;
+    for (let i = 0; i < byteLength; i++) map[byteOffset + i] = jsOffset;
+    byteOffset += byteLength;
+    jsOffset += ch.length;
+    map[byteOffset] = jsOffset;
+  }
+  return map;
+}
+
+function jsOffsetForByte(map, byteOffset, sourceLength) {
+  const bounded = Math.min(Math.max(Number(byteOffset) || 0, 0), map.length - 1);
+  return Math.min(map[bounded] ?? sourceLength, sourceLength);
 }
 
 /** Render the SOURCE phase from artifact.tokens. Returns nothing. */
@@ -86,18 +432,37 @@ function renderSource(art) {
   const tbody = $('#source-view tbody');
   tbody.textContent = '';
   $('#src-sub').textContent =
-    art ? `${art.tokens ? art.tokens.length : 0} tokens · ${art.source.split('\n').length} lines` : '';
+    art ? (Array.isArray(art.tokens)
+      ? `${art.tokens.length} tokens · ${art.source.split('\n').length} lines`
+      : `source-only fixture · ${(art.source ?? '').split('\n').length} lines`) : '';
 
-  const diags = Array.isArray(art?.diags_sem) ? art.diags_sem : [];
+  const diags = compilerDiagnostics(art);
   const showDiag = $('#src-show-diag').checked;
 
   if (!Array.isArray(art?.tokens)) {
-    tbody.innerHTML = `<tr><td class="empty">// source not available in this artifact</td></tr>`;
+    const rawSource = typeof art?.source === 'string' ? art.source : '';
+    if (!rawSource) {
+      tbody.innerHTML = `<tr><td class="empty">// source not available in this artifact</td></tr>`;
+      return;
+    }
+    rawSource.split('\n').forEach((line, index) => {
+      const tr = document.createElement('tr');
+      tr.className = 'code-line fixture-source-line';
+      const ln = document.createElement('td');
+      ln.className = 'ln-col';
+      ln.textContent = index + 1;
+      const cell = document.createElement('td');
+      cell.className = 'code-cell';
+      cell.textContent = line;
+      tr.append(ln, cell);
+      tbody.appendChild(tr);
+    });
     return;
   }
 
   const src = art.source ?? '';
   const lineStarts = buildLineMap(src);
+  const byteToJs = buildByteToJsMap(src);
 
   // group tokens by line; fill gaps between tokens with plain text
   const perLine = new Map(); // line -> [{start,end,text,cls}]
@@ -110,8 +475,8 @@ function renderSource(art) {
     if (tk.kind === 'Eof' || (tk.start === tk.end && !tk.text)) continue;
     tk._idx ??= art.tokens.indexOf(tk);
     if (!Number.isInteger(tk.start) || !Number.isInteger(tk.end) || tk.end < tk.start) continue;
-    const s = Math.min(Math.max(tk.start, 0), src.length);
-    const e = Math.min(Math.max(tk.end, s), src.length);
+    const s = jsOffsetForByte(byteToJs, tk.start, src.length);
+    const e = Math.min(Math.max(jsOffsetForByte(byteToJs, tk.end, src.length), s), src.length);
     const text = tk.text || src.slice(s, e) || '';
     if (s > prevEnd) pushTok(null, { start: prevEnd, end: s });
     pushTok(lineAt(lineStarts, s), { start: s, end: e, text, cls: tokenClass(tk), tok: tk });
@@ -132,9 +497,11 @@ function renderSource(art) {
 
   const diagByLine = new Map();
   for (const d of diags) {
-    const ln = lineAt(lineStarts, Math.min(d.span?.start ?? 0, Math.max(0, src.length - 1)));
+    const start = jsOffsetForByte(byteToJs, d.span?.start, src.length);
+    const end = Math.max(start, jsOffsetForByte(byteToJs, d.span?.end, src.length));
+    const ln = lineAt(lineStarts, Math.min(start, Math.max(0, src.length - 1)));
     if (!diagByLine.has(ln)) diagByLine.set(ln, []);
-    diagByLine.get(ln).push(d);
+    diagByLine.get(ln).push({ ...d, _start: start, _end: end });
   }
 
   const rows = [[]];
@@ -150,9 +517,9 @@ function renderSource(art) {
     }
     let s = it.start;
     for (const ch of it.text) {
-      if (ch === '\n') { s++; rows.push([]); continue; }
-      rows[rows.length - 1].push({ text: ch, cls: it.cls || '', start: s, end: s + 1, tok: it.tok });
-      s++;
+      if (ch === '\n') { s += ch.length; rows.push([]); continue; }
+      rows[rows.length - 1].push({ text: ch, cls: it.cls || '', start: s, end: s + ch.length, tok: it.tok });
+      s += ch.length;
     }
   }
   while (rows.length < lineStarts.length) rows.push([]);
@@ -183,7 +550,7 @@ function renderSource(art) {
       span.textContent = sp.text;
       cell.appendChild(span);
       if (sp.tok) attachTokenHover(span, sp.tok);
-      const hits = diagsHere.filter(d => sp.end > d.span.start && sp.start < d.span.end);
+      const hits = diagsHere.filter(d => sp.end > d._start && sp.start < d._end);
       if (hits.length) {
         span.classList.add('diag-u');
         attachDiagHover(span, hits);
@@ -260,7 +627,7 @@ function renderTokens(art) {
     pill.textContent = tk.kind;
     kind.appendChild(pill);
     const txt = document.createElement('td');
-    txt.className = 'tt-text'; txt.textContent = tk.kind === 'Eof' ? '⏚ eof' : (tk.text === '' ? '∅' : tk.text);
+    txt.className = 'tt-text'; txt.textContent = tk.kind === 'Eof' ? 'EOF' : (tk.text === '' ? 'empty' : tk.text);
     const spanTd = document.createElement('td');
     spanTd.className = 'tt-span'; spanTd.textContent = `[${tk.start}–${tk.end})`;
 
@@ -302,6 +669,7 @@ function identName(x) {
 }
 
 function labelType(ty) {
+  if (typeof ty === 'string') return ty === 'Unit' ? '()' : ty.toLowerCase();
   if (!ty || typeof ty !== 'object') return '?';
   const keys = Object.keys(ty);
   if (keys.length === 1) {
@@ -651,6 +1019,14 @@ function renderCfg(art) {
 
     nodesL.appendChild(g);
   }
+
+  // Include routed/back edges as well as node rectangles, with room for arrows.
+  const points = (fn.nodes ?? []).flatMap(n => [[n.x, n.y], [n.x + n.w, n.y + n.h]])
+    .concat((fn.edges ?? []).flatMap(e => e.points ?? []));
+  const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+  const minX = points.length ? Math.min(...xs) : 0, minY = points.length ? Math.min(...ys) : 0;
+  const maxX = points.length ? Math.max(...xs) : 0, maxY = points.length ? Math.max(...ys) : 0;
+  $('#cfg-svg').setAttribute('viewBox', `${minX - 24} ${minY - 24} ${maxX - minX + 48} ${maxY - minY + 48}`);
 }
 
 function spotlightLoop(fn, loopId, on) {
@@ -672,13 +1048,13 @@ function spotlightLoop(fn, loopId, on) {
   });
 }
 
-/* graph tooltip (shared by CFG + AST) */
+/* CFG tooltip */
 function showGraphTip(ev, html) {
   let tip = $('.cfg-hover-tip');
   if (!tip) {
     tip = document.createElement('div');
     tip.className = 'cfg-hover-tip';
-    (document.querySelector('.panel-viewport') ?? document.body).appendChild(tip);
+    document.querySelector('[data-phase="cfg"] .panel-viewport').appendChild(tip);
     window.addEventListener('resize', hideGraphTip);
   }
   tip.innerHTML = html;
@@ -744,8 +1120,7 @@ function renderSSA(art, sideBySide = $('#ssa-side-by-side').checked) {
     ? art.ir_ssa.functions[idx]
     : (art.ir_ssa?.functions?.[idx]?.text ?? '');
 
-  body.classList.toggle('dual', sideBySide && !!preText && !!ssaText);
-  body.classList.toggle('single', !(sideBySide && !!preText && !!ssaText));
+  body.classList.toggle('side-by-side', sideBySide && !!preText && !!ssaText);
 
   renderIR(pre, preText, false);
   renderIR(post, ssaText, true);
@@ -809,8 +1184,10 @@ function renderPasses(art) {
     card.className = 'pass-card' + (p.changed ? ' changed open-first' : '');
     if (i === 0) card.classList.add('open');
 
-    const head = document.createElement('div');
+    const head = document.createElement('button');
+    head.type = 'button';
     head.className = 'pass-head';
+    head.setAttribute('aria-expanded', String(i === 0));
 
     const caret = document.createElement('span');
     caret.className = 'pass-caret'; caret.textContent = '▶';
@@ -826,14 +1203,16 @@ function renderPasses(art) {
     if (p.diff_stats) {
       stat.textContent = `${p.diff_stats.insts_before} → ${p.diff_stats.insts_after} insts`;
       const d = document.createElement('span');
-      d.className = 'pass-delta ' + (delta < 0 ? 'neg' : 'zero');
-      d.textContent = delta < 0 ? `−${delta}` : '±0';
+      d.className = 'pass-delta ' + (delta > 0 ? 'neg' : 'zero');
+      d.textContent = delta > 0 ? `−${delta}` : delta < 0 ? `+${-delta}` : '±0';
       stat.prepend(d);
       stat.insertBefore(document.createTextNode('  '), d.nextSibling);
     }
 
     head.append(caret, badge, name, stat);
-    head.addEventListener('click', () => card.classList.toggle('open'));
+    head.addEventListener('click', () => {
+      head.setAttribute('aria-expanded', String(card.classList.toggle('open')));
+    });
 
     const body = document.createElement('div');
     body.className = 'pass-body';
@@ -853,7 +1232,7 @@ const REDUCTION_GLYPHS = { '+': 'Σ+', '*': 'Π×', '-': 'Σ−', max: '⬆', mi
 const VERDICT_META = {
   SAFE:       { glyph: '✓', label: 'PARALLELIZED' },
   REDUCTION:  { glyph: null, label: 'REDUCTION' },
-  SEQUENTIAL: { glyph: '⚠', label: 'SEQUENTIAL' },
+  SEQUENTIAL: { glyph: '!', label: 'SEQUENTIAL' },
 };
 
 function renderLoops(art) {
@@ -995,8 +1374,8 @@ function renderLoops(art) {
     if (verdict === 'SAFE' && L.plan?.threads) {
       const plan = document.createElement('span');
       plan.className = 'plan-strip';
-      plan.innerHTML = `⚙ plan&nbsp;&nbsp;→ ${esc(String(L.plan.threads))} threads`;
-      plan.title = 'runtime execution plan chosen for this loop';
+      plan.innerHTML = `PLAN&nbsp;&nbsp;→ up to ${esc(String(L.plan.threads))} threads (analysis proposal)`;
+      plan.title = 'Proposed by the analysis. The backend may still demote a region it cannot lower, and the runtime keeps small loops sequential — the local Campaign (Benchmark phase) shows what actually ran.';
       body.appendChild(plan);
     }
     if (L.reduction) {
@@ -1018,22 +1397,15 @@ function renderLoops(art) {
    ============================================================ */
 const BENCH_COLORS = ['#8b949e', '#61afef', '#00c896', '#56b4e9', '#e69f00'];
 
-function renderBench(art) {
-  const chart = $('#bench-chart');
-  const effWrap = $('#bench-eff');
-  const empty = $('#bench-empty');
-  chart.textContent = ''; effWrap.textContent = '';
-  empty.classList.add('hidden');
-
-  const bench = art?.bench;
-  $('#bench-kernel').textContent = bench ? `kernel ${bench.kernel} · n = ${Number(bench.n).toLocaleString('en-US')}` : '';
-  if (!bench || !Array.isArray(bench.variants) || !bench.variants.length) {
-    empty.textContent = '// no benchmark campaign attached to this artifact (run helix bench)';
-    empty.classList.remove('hidden');
-    return;
-  }
-
-  const variants = [...bench.variants].sort((a, b) => b.median_ms - a.median_ms); // slowest at top
+/** Paint the variant bars and the efficiency table for a bench-like object.
+ *  One painter serves the recorded campaign chart and the local two-engine
+ *  chart, so both read the same way: bars sorted slowest at top, value labels
+ *  in ms, and "× vs best" chips measured against the fastest bar shown. */
+function renderBenchChart(bench, hosts) {
+  const chart = hosts.chart;
+  const effWrap = hosts.eff;
+  chart.textContent = '';
+  const variants = [...(bench.variants ?? [])].sort((a, b) => b.median_ms - a.median_ms); // slowest at top
   const fastest = Math.min(...variants.map(v => v.median_ms));
   const W = 960, barH = 34, gap = 18, padL = 170, padR = 150, padT = 26, padB = 44;
   const plotW = W - padL - padR;
@@ -1054,13 +1426,21 @@ function renderBench(art) {
   svg.appendChild(defs);
 
   const useLog = state.benchLog;
-  const scaleMax = useLog ? Math.max(...variants.map(v => v.median_ms)) : Math.max(...variants.map(v => v.median_ms)) * 1.06;
-  const toX = ms => useLog
-    ? (Math.log10(Math.max(ms, 0.001)) / Math.log10(scaleMax)) * plotW
-    : (ms / scaleMax) * plotW;
+  const positive = variants.map(v => v.median_ms).filter(ms => Number.isFinite(ms) && ms > 0);
+  const max = Math.max(...positive, 0) || 1;
+  const scaleMax = useLog ? max : Math.min(max * 1.06, Number.MAX_VALUE);
+  // Log bars start a decade below the smallest positive timing, not at 1 ms.
+  const scaleMin = Math.max(Math.min(...positive, max) / 10, Number.MIN_VALUE);
+  const logMin = Math.log10(scaleMin);
+  const logSpan = Math.log10(scaleMax) - logMin || 1;
+  const toX = ms => {
+    if (!Number.isFinite(ms) || ms <= 0) return 0;
+    const fraction = useLog ? (Math.log10(ms) - logMin) / logSpan : ms / scaleMax;
+    return Math.min(1, Math.max(0, fraction)) * plotW;
+  };
 
   // gridlines + ticks
-  const ticks = useLog ? logTicks(scaleMax) : linTicks(scaleMax);
+  const ticks = useLog ? logTicks(scaleMin, scaleMax) : linTicks(scaleMax);
   for (const tv of ticks) {
     const x = padL + toX(tv.v);
     const gl = document.createElementNS(svgNS, 'line');
@@ -1104,11 +1484,12 @@ function renderBench(art) {
     val.setAttribute('x', padL + Math.max(toX(v.median_ms), 1.5) + 10);
     val.setAttribute('y', y + barH / 2 + 4);
     val.setAttribute('class', 'val-lbl');
-    val.textContent = fmt(v.median_ms, 1) + ' ms';
+    val.textContent = formatMilliseconds(v.median_ms) + ' ms';
     svg.appendChild(val);
 
     {
-      const speedup = v.median_ms > 0 ? fastest / v.median_ms : 0;
+      // How many times slower than the fastest bar shown in this chart.
+      const speedup = fastest > 0 ? v.median_ms / fastest : 0;
       if (speedup > 1.05) {
         const chip = document.createElementNS(svgNS, 'text');
         chip.setAttribute('x', padL + Math.max(toX(v.median_ms), 1.5) + 10);
@@ -1120,7 +1501,7 @@ function renderBench(art) {
     }
 
     const title = document.createElementNS(svgNS, 'title');
-    title.textContent = `${v.name}\nmedian ${fmt(v.median_ms)} ms` +
+    title.textContent = `${v.name}\nmedian ${formatMilliseconds(v.median_ms)} ms` +
       (Array.isArray(v.samples) ? `\nsamples: ${v.samples.map(s => fmt(s)).join(', ')}` : '');
     rect.appendChild(title);
   });
@@ -1129,7 +1510,7 @@ function renderBench(art) {
 
   // efficiency table
   const eff = bench.efficiency ?? [];
-  if (eff.length) {
+  if (eff.length && effWrap) {
     const h = document.createElement('p');
     h.className = 'eff-title'; h.textContent = 'parallel efficiency';
     effWrap.appendChild(h);
@@ -1154,18 +1535,225 @@ function renderBench(art) {
   }
 }
 
+function renderBench(art) {
+  const chart = $('#bench-chart');
+  const effWrap = $('#bench-eff');
+  const empty = $('#bench-empty');
+  chart.textContent = ''; effWrap.textContent = '';
+  $('#bench-comparison').textContent = '';
+  empty.className = 'empty bench-empty hidden';
+  empty.textContent = '';
+  empty.classList.add('hidden');
+
+  const bench = art?.bench;
+  const catalog = bench ? benchmarkKernel(bench.kernel) : null;
+  if (bench?.kernel === '<adhoc>') {
+    const samples = bench.variants?.[0]?.samples?.length ?? 0;
+    $('#bench-kernel').textContent = `local WASM interpreter · ${samples} measured samples`;
+  } else if (bench && benchmarkProbe(bench.kernel)) {
+    const samples = bench.variants?.[0]?.samples?.length ?? 0;
+    $('#bench-kernel').textContent = `recorded example probe · ${samples} interpreter samples`;
+  } else {
+    $('#bench-kernel').textContent = bench
+      ? `recorded campaign · kernel ${bench.kernel} · n = ${Number(bench.n).toLocaleString('en-US')}`
+      : '';
+  }
+  renderBenchComparison(bench);
+  if (!bench || !Array.isArray(bench.variants) || !bench.variants.length) {
+    const title = document.createElement('strong');
+    title.className = 'bench-empty-title';
+    title.textContent = state.benchPending ? 'MEASUREMENT IN PROGRESS'
+      : state.benchMessage ? 'MEASUREMENT UNAVAILABLE' : 'NO RECORDED POINT FOR THIS ARTIFACT';
+    const copy = document.createElement('p');
+    copy.className = 'bench-empty-copy';
+    const isCustom = art?.example === '<adhoc>' || state.fromCustom;
+    copy.textContent = state.benchMessage || (isCustom
+      ? 'This source compiled through the pipeline, but it has not been measured by the named-kernel campaign.'
+      : 'No recorded measurement matches this source. A campaign entry with the same name may use different code. You can still measure this source’s reference-interpreter path locally, without implying native or parallel speedups.');
+    empty.append(title, copy);
+
+    if (stageAvailable(art, 'bench')) {
+      const measure = document.createElement('button');
+      measure.type = 'button';
+      measure.id = 'bench-measure';
+      measure.className = 'btn bench-measure';
+      measure.disabled = state.benchPending;
+      // A static build has no server measurement waiting behind the button, so
+      // the control measures both local engines instead of only the compiler's
+      // reference interpreter. Named examples keep their selection.
+      const bothEngines = !!state.static;
+      const onNamed = bothEngines && !state.fromCustom &&
+        !!state.exampleName && state.exampleName !== '<adhoc>';
+      measure.textContent = state.benchPending
+        ? (bothEngines ? 'measuring both engines…' : 'measuring in WASM…')
+        : (bothEngines ? 'Measure both engines in browser WASM' : 'Measure in browser WASM');
+      measure.title = bothEngines
+        ? 'Measure the reference interpreter and HELIX’s compiled WebAssembly module in this browser'
+        : 'Run seven bounded reference-interpreter samples in this browser';
+      measure.addEventListener('click',
+        onNamed ? () => measureNamedExample(state.exampleName) : measureCustom);
+      empty.appendChild(measure);
+    }
+
+    const index = document.createElement('div');
+    index.className = 'bench-index';
+    const pointCount = Number(state.benchmarkCatalog?.point_count);
+    const kernelCount = state.benchmarkCatalog?.kernels?.length ?? 0;
+    if (pointCount && kernelCount) {
+      const stamp = state.benchmarkCatalog.timestamp_utc
+        ? ` · captured ${state.benchmarkCatalog.timestamp_utc.slice(0, 10)}` : '';
+      const probeCount = state.benchmarkCatalog.examples?.length ?? 0;
+      const probeStamp = state.benchmarkCatalog.probe_provenance?.timestamp_utc?.slice(0, 10) ?? 'date unavailable';
+      index.textContent = `Recorded campaign: ${pointCount} measured points across ${kernelCount} kernels${stamp}.` +
+        (probeCount ? ` Separate interpreter probes: ${probeCount} · ${probeStamp}.` : '');
+      const names = document.createElement('div');
+      names.className = 'bench-index-names';
+      names.textContent = state.benchmarkCatalog.kernels.map(kernel => kernel.name).join(' · ');
+      index.appendChild(names);
+    } else if (!state.benchmarkCatalog) {
+      index.textContent = state.static
+        ? 'No campaign index in this static build; the local measurement below is the evidence available here.'
+        : 'Campaign index unavailable — start the Rust observer for recorded evidence.';
+    } else {
+      index.textContent = 'No campaign index is available on the fixture server.';
+    }
+    empty.appendChild(index);
+    empty.classList.remove('hidden');
+    // The empty box already holds the trigger, so the local section reports
+    // results only (it appears when a local measurement has been taken).
+    renderLocalBench($('#bench-local'), art, bench, false);
+    return;
+  }
+
+  if (catalog) {
+    const sizes = catalog.sizes?.length ?? 0;
+    $('#bench-kernel').textContent += sizes > 1 ? ` · ${sizes} sizes recorded` : '';
+  }
+
+  renderBenchChart(bench, { chart, eff: effWrap });
+  // Recorded evidence stays above; the local pair is appended below it, and in
+  // a static build this section also carries the only local trigger.
+  renderLocalBench($('#bench-local'), art, bench, true);
+}
+
+/** Local (this-browser) measurement of both engines, rendered BELOW the
+ *  recorded evidence and never mixed into it. In a static build the section
+ *  also hosts the measure control for named examples, whose recorded cards
+ *  remain untouched above. */
+function renderLocalBench(host, art, bench, withButton) {
+  if (!host) return;
+  host.textContent = '';
+  host.classList.add('hidden');
+  const local = state.localBench;
+  const hasRecorded = !!bench && Array.isArray(bench.variants) && bench.variants.length > 0;
+  // Nothing local to report and no local trigger to offer: keep it out.
+  if (!local && !(state.static && hasRecorded)) return;
+  host.classList.remove('hidden');
+
+  const heading = document.createElement('p');
+  heading.className = 'bench-local-heading';
+  heading.textContent = 'Local measurement (this browser)';
+  host.appendChild(heading);
+
+  const intro = document.createElement('p');
+  intro.className = 'bench-comparison-intro';
+  intro.textContent = 'Same source, both engines measured here just now: the interpreter is HELIX’s reference tree-walker compiled to WebAssembly; the compiled bar is the optimized SSA IR emitted as a WebAssembly module and executed in the same browser. No native code and no parallel execution took part in these numbers.';
+  host.appendChild(intro);
+
+  if (local) {
+    const variants = Array.isArray(local.variants) ? local.variants : [];
+    const interp = variants[0] ?? null;
+    const compiled = variants[1] ?? null;
+    const grid = document.createElement('div');
+    grid.className = 'bench-compare-grid';
+    const pair = benchmarkPair(interp, compiled);
+    appendBenchmarkCard(
+      grid,
+      'Reference interpreter → compiled wasm',
+      pair ?? 'Not comparable',
+      interp && compiled
+        ? `${benchmarkVariantLabel(interp)} → ${benchmarkVariantLabel(compiled)}`
+        : `interpreter ${benchmarkVariantLabel(interp)} · compiled ${benchmarkVariantLabel(compiled)}`,
+      pair ? 'bench-compare-positive' : 'bench-compare-muted',
+    );
+    const memory = local.memory ?? {};
+    const interpBytes = formatBytes(memory.interpBytes);
+    const compiledBytes = formatBytes(memory.compiledBytes);
+    const memoryDetail = 'Interpreter bytes are boxed interpreter cells; compiled bytes are raw array bytes in the module’s linear memory. Both were counted during the same program.';
+    let memoryValue = 'Memory not reported';
+    let memoryTone = 'bench-compare-muted';
+    if (interpBytes && compiledBytes) {
+      const before = Number(memory.interpBytes), after = Number(memory.compiledBytes);
+      const saved = before > 0 && after < before ? ` (${fmt((1 - after / before) * 100, 0)}% less)` : '';
+      memoryValue = `${interpBytes} → ${compiledBytes}${saved}`;
+    } else if (interpBytes || compiledBytes) {
+      memoryValue = `interpreter ${interpBytes ?? '—'} · compiled ${compiledBytes ?? '—'}`;
+    }
+    if (memoryValue !== 'Memory not reported') memoryTone = 'bench-compare-positive';
+    appendBenchmarkCard(grid, 'Memory per run', memoryValue, memoryDetail, memoryTone);
+    host.appendChild(grid);
+
+    const caption = document.createElement('p');
+    caption.className = 'bench-local-caption';
+    caption.textContent = 'Both local medians · slowest at top · “× vs best” compares this pair only';
+    host.appendChild(caption);
+    const localChart = document.createElement('div');
+    localChart.className = 'bench-chart';
+    host.appendChild(localChart);
+    renderBenchChart({ kernel: '<adhoc>', variants, efficiency: [] }, { chart: localChart });
+
+    const parity = local.parity ?? {};
+    const parityLine = document.createElement('p');
+    parityLine.className = 'bench-local-parity' + (parity.same ? '' : ' is-error');
+    parityLine.textContent = parity.same
+      ? `compiled output identical to the interpreter — checksum ${parity.checksum || 'not recorded for this run'}`
+      : `COMPILER BUG SIGNAL — compiled output differs from the interpreter (interpreter checksum ${parity.checksum || 'unknown'} vs compiled ${parity.compiledChecksum || 'unknown'}). The medians above are still the measured values.`;
+    host.appendChild(parityLine);
+  } else {
+    const waiting = document.createElement('p');
+    waiting.className = 'bench-recorded-note';
+    waiting.textContent = state.benchPending
+      ? (state.benchMessage || 'measuring both engines in this browser…')
+      : 'No local measurement yet. Measure both engines here to compare the reference interpreter with HELIX’s compiled WebAssembly module; nothing native or parallel is involved.';
+    host.appendChild(waiting);
+  }
+
+  if (withButton && stageAvailable(art, 'bench')) {
+    const measure = document.createElement('button');
+    measure.type = 'button';
+    measure.id = 'bench-local-measure';
+    measure.className = 'btn bench-measure bench-local-measure';
+    measure.disabled = state.benchPending;
+    measure.textContent = state.benchPending ? 'measuring both engines…' : 'Measure both engines in browser WASM';
+    measure.title = 'Measure the reference interpreter and HELIX’s compiled WebAssembly module in this browser';
+    measure.addEventListener('click',
+      state.fromCustom ? measureCustom : () => measureNamedExample(state.exampleName));
+    host.appendChild(measure);
+  }
+}
+
+/** Human-readable byte counts for the local memory card. */
+function formatBytes(bytes) {
+  if (bytes == null) return null;
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return null;
+  if (value < 1024) return `${Math.round(value)} B`;
+  if (value < 1024 * 1024) return `${fmt(value / 1024, 1)} KB`;
+  return `${fmt(value / (1024 * 1024), 2)} MB`;
+}
+
 function linTicks(max) {
   const out = [];
   const step = niceStep(max / 5);
   for (let v = 0; v <= max * 1.0001; v += step) out.push({ v, label: tickLabel(v) });
   return out;
 }
-function logTicks(max) {
+function logTicks(min, max) {
   const out = [];
-  const expMax = Math.ceil(Math.log10(max));
-  for (let e = 0; e <= expMax; e++) {
+  const expMax = Math.floor(Math.log10(max));
+  for (let e = Math.ceil(Math.log10(min)); e <= expMax; e++) {
     const v = Math.pow(10, e);
-    if (v <= max * 1.0001) out.push({ v, label: tickLabel(v) });
+    if (v >= min && v <= max) out.push({ v, label: tickLabel(v) });
   }
   return out;
 }
@@ -1185,12 +1773,15 @@ function niceStep(raw) {
 /* ============================================================
    Diagnostics banner + locked stages
    ============================================================ */
-function semaFailed(art) {
-  return Array.isArray(art?.diags_sem) && art.diags_sem.length > 0;
+function compilerDiagnostics(art) {
+  return [...(art?.diags_lex ?? []), ...(art?.diags_sem ?? [])];
+}
+function compileFailed(art) {
+  return compilerDiagnostics(art).length > 0;
 }
 function stageAvailable(art, phase) {
   if (!art) return false;
-  if (semaFailed(art)) return ['source', 'tokens'].includes(phase);
+  if (compileFailed(art)) return phase === 'source' || (phase === 'tokens' && Array.isArray(art.tokens));
   switch (phase) {
     case 'source': case 'tokens': return Array.isArray(art.tokens);
     case 'ast': return !!art.ast;
@@ -1198,21 +1789,26 @@ function stageAvailable(art, phase) {
     case 'ssa': return !!(art.ir_ssa?.functions?.length || art.ir_pre_ssa?.functions?.length);
     case 'opt': return Array.isArray(art.passes) && art.passes.length > 0;
     case 'loops': return Array.isArray(art.loops) && art.loops.length > 0;
-    case 'bench': return !!art.bench;
+    // A valid artifact can always enter the BENCH screen. Named kernels show
+    // recorded campaign evidence; custom/language sources show an explicit
+    // unmeasured state instead of making the pipeline look broken.
+    case 'bench': return Array.isArray(art.tokens) && !!art.ast && !art.diags_lex;
     default: return false;
   }
 }
 
 function renderDiagBanner(art) {
   const ban = $('#diag-banner');
-  const diags = Array.isArray(art?.diags_sem) ? art.diags_sem : [];
+  const diags = compilerDiagnostics(art);
   if (!diags.length) { ban.classList.add('hidden'); ban.textContent = ''; return; }
   ban.classList.remove('hidden');
   ban.innerHTML = '';
-  const g = document.createElement('span'); g.className = 'dg-glyph'; g.textContent = '⚠';
+  const g = document.createElement('span'); g.className = 'dg-glyph'; g.textContent = '!';
   const msg = document.createElement('span');
-  msg.innerHTML = `<b>${diags.length} semantic error${diags.length > 1 ? 's' : ''}</b>` +
-    ` — pipeline stopped after semantic analysis. Underlined regions in SOURCE mark each error.`;
+  const syntax = art.diags_lex?.length > 0;
+  msg.textContent = `${diags.length} ${syntax ? 'syntax' : 'semantic'} error${diags.length > 1 ? 's' : ''}` +
+    ` — pipeline stopped during ${syntax ? 'lexing/parsing' : 'semantic analysis'}. ` +
+    diags.map(d => d.msg).join('; ');
   const jump = document.createElement('button');
   jump.className = 'btn dg-jump';
   jump.textContent = 'view SOURCE ↓';
@@ -1238,6 +1834,7 @@ function buildStepper() {
     li.className = 'step';
     li.setAttribute('role', 'tab');
     li.tabIndex = 0;
+    li.setAttribute('aria-selected', 'false');
     const num = document.createElement('span');
     num.className = 'num'; num.textContent = String(i + 1);
     li.append(num, document.createTextNode(label));
@@ -1252,6 +1849,8 @@ function refreshStepper(art) {
     const li = $('#step-' + id);
     const ok = stageAvailable(art, id);
     li.classList.toggle('locked', !ok);
+    li.setAttribute('aria-disabled', String(!ok));
+    li.setAttribute('aria-selected', String(state.phase === id));
     li.querySelector('.lock')?.remove();
     if (!ok) {
       const lock = document.createElement('span');
@@ -1276,7 +1875,11 @@ function gotoPhase(id, force = false) {
     // transition is stuck at t=0 holding opacity at 0. Jump those to the end.
     ph.getAnimations().forEach(a => { try { a.finish(); } catch { /* not finishable */ } });
   });
-  $$('.step').forEach(st => st.classList.toggle('active', st.id === 'step-' + id));
+  $$('.step').forEach(st => {
+    const active = st.id === 'step-' + id;
+    st.classList.toggle('active', active);
+    st.setAttribute('aria-selected', String(active));
+  });
   if (id === 'ast') requestAnimationFrame(() => { astZoomFit?.(); });
 }
 
@@ -1305,6 +1908,94 @@ async function fetchJSON(url, opts) {
   return res.json();
 }
 
+let wasmRunnerPromise;
+function loadBrowserRunner() {
+  if (!wasmRunnerPromise) {
+    wasmRunnerPromise = import('/wasm/helix-browser.js');
+  }
+  return wasmRunnerPromise;
+}
+
+async function hydrateBrowserExecution(art) {
+  const runSeq = ++state.browserRunSeq;
+  const bridge = await loadBrowserRunner();
+  if (!browserPreviewAllowed(art, bridge.estimatedBrowserWork)) {
+    state.browserRun = art?.source && !art.diags_lex && !(art.diags_sem?.length)
+      ? {
+          status: 'skipped',
+          message: 'Browser preview skipped: this bundled source exceeds the responsive WASM preview budget. The recorded benchmark below is the authoritative measurement for its larger sizes.',
+        }
+      : null;
+    renderAll();
+    return;
+  }
+
+  state.browserRun = { status: 'running' };
+  renderExecReadout(art);
+  try {
+    const result = await bridge.runHelixInBrowser(art.source);
+    if (runSeq !== state.browserRunSeq || state.artifact !== art) return;
+    state.browserRun = { status: 'done', result };
+    renderAll();
+  } catch (error) {
+    if (runSeq !== state.browserRunSeq || state.artifact !== art) return;
+    state.browserRun = {
+      status: 'error',
+      result: {
+        ok: false,
+        printed: [],
+        checksum: null,
+        message: `WASM preview unavailable: ${error.message}`,
+        engine: 'browser interpreter',
+      },
+    };
+    renderAll();
+  }
+}
+
+/** Shared responsive-benchmark budget: refuse sources the WASM path cannot
+ *  finish inside the worker deadline rather than report a truncated run. */
+function guardBrowserWorkBudget(estimate) {
+  const work = Number(estimate);
+  if (work > 1_000_000) {
+    throw new Error(`estimated work ${work.toLocaleString('en-US')} exceeds the responsive WASM benchmark budget; use a smaller custom input`);
+  }
+}
+
+async function measureBrowserSource(source) {
+  const { runHelixInBrowser, estimatedBrowserWork } = await loadBrowserRunner();
+  const estimate = estimatedBrowserWork(source);
+  guardBrowserWorkBudget(estimate);
+  const warmup = await runHelixInBrowser(source);
+  if (!warmup.ok) throw new Error(warmup.message || 'WASM interpreter rejected this source');
+
+  // Average worker-reported execution times, never worker startup or transport.
+  // Timer precision is browser-dependent; these are reference-only samples.
+  const repetitions = estimate < 10_000 ? 32 : estimate < 100_000 ? 8 : 2;
+  const samples = [];
+  for (let i = 0; i < 7; i += 1) {
+    let elapsedMs = 0;
+    for (let rep = 0; rep < repetitions; rep += 1) {
+      const result = await runHelixInBrowser(source);
+      if (!result.ok) throw new Error(result.message || 'WASM interpreter failed during measurement');
+      if (result.checksum !== warmup.checksum || JSON.stringify(result.printed) !== JSON.stringify(warmup.printed)) {
+        throw new Error('WASM interpreter produced non-deterministic output across samples');
+      }
+      if (!Number.isFinite(result.elapsedMs) || result.elapsedMs < 0) {
+        throw new Error('WASM interpreter did not provide a valid execution time');
+      }
+      elapsedMs += result.elapsedMs;
+    }
+    samples.push(elapsedMs / repetitions);
+  }
+  const ordered = [...samples].sort((a, b) => a - b);
+  return {
+    result: warmup,
+    samples,
+    medianMs: ordered[Math.floor(ordered.length / 2)],
+  };
+}
+
 async function loadExamples() {
   const ul = $('#example-list');
   try {
@@ -1315,40 +2006,139 @@ async function loadExamples() {
   }
   if (!state.examples.length) {
     // static fallback — mirrors builtin_examples() in crates/helix-observe/src/server.rs
-    state.examples = ['saxpy', 'matmul', 'jacobi_2d', 'dot_reduction',
-                      'minmax_reduction', 'count_primes_sieve', 'fib_recursion',
-                      'gcd_box_test', 'recurrence_reject', 'stencil_2d_reject', 'type_errors'];
+    state.examples = FALLBACK_EXAMPLES;
   }
   ul.textContent = '';
-  for (const name of state.examples) {
+  const seenGroups = new Set();
+  const groupedExamples = EXAMPLE_GROUPS.flatMap(group =>
+    state.examples.filter(name => exampleGroup(name) === group));
+  for (const name of groupedExamples) {
+    const group = exampleGroup(name);
+    if (!seenGroups.has(group.key)) {
+      seenGroups.add(group.key);
+      const heading = document.createElement('li');
+      heading.className = 'example-group';
+      heading.innerHTML = `<span>${group.label}</span><small>${group.note}</small>`;
+      ul.appendChild(heading);
+    }
     const li = document.createElement('li');
-    li.className = 'ex-item';
+    li.className = `ex-item ex-${group.key}`;
     li.dataset.example = name;
-    li.textContent = name;
-    li.addEventListener('click', () => selectExample(name, li));
+    li.setAttribute('role', 'button');
+    li.tabIndex = 0;
+    li.setAttribute('aria-pressed', 'false');
+    li.setAttribute('aria-label', `Open example ${name}`);
+    const cursor = document.createElement('span');
+    cursor.className = 'ex-cursor';
+    cursor.setAttribute('aria-hidden', 'true');
+    const label = document.createElement('span');
+    label.className = 'ex-name';
+    label.textContent = name;
+    const measured = document.createElement('span');
+    measured.className = 'ex-bench';
+    const campaignKernel = benchmarkKernel(name);
+    const exampleProbe = benchmarkProbe(name);
+    const sizeCount = campaignKernel?.sizes?.length ?? 0;
+    measured.textContent = campaignKernel || exampleProbe ? 'M' : '—';
+    measured.title = campaignKernel
+      ? `measured in the recorded campaign at ${sizeCount} size${sizeCount === 1 ? '' : 's'}`
+      : exampleProbe
+        ? `precomputed reference-interpreter probe · ${exampleProbe.sample_count} samples`
+      : 'no recorded numeric campaign point for this example';
+    measured.setAttribute('aria-label', campaignKernel || exampleProbe ? 'measured data' : 'not in measured campaign');
+    li.append(cursor, label, measured);
+    const activate = () => selectExample(name);
+    li.addEventListener('click', activate);
+    li.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); activate(); }
+    });
     ul.appendChild(li);
   }
 }
 
-async function selectExample(name, li) {
-  $$('#example-list .ex-item').forEach(x => x.classList.remove('active'));
-  (li ?? $(`#example-list .ex-item[data-example="${CSS.escape(name)}"]`))?.classList.add('active');
-  $('#custom-src').value = '';
-  state.fromCustom = false;
+async function loadBenchmarkCatalog() {
   try {
-    const art = await fetchJSON(`/api/artifact?example=${encodeURIComponent(name)}`);
+    const catalog = await fetchJSON('/api/benchmarks');
+    state.benchmarkCatalog = catalog && Array.isArray(catalog.kernels) ? catalog : null;
+  } catch {
+    // Static hosting has no /api/*: the WASM bridge ships the same campaign
+    // index, so recorded kernels keep their provenance stamps.
+    state.benchmarkCatalog = state.static ? await loadStaticBenchmarkCatalog() : null;
+  }
+}
+
+async function loadStaticBenchmarkCatalog() {
+  try {
+    const { benchIndex } = await loadBrowserRunner();
+    const catalog = await benchIndex();
+    return catalog && Array.isArray(catalog.kernels) ? catalog : null;
+  } catch {
+    return null;
+  }
+}
+
+// All artifact intents supersede the compile button as well as the response.
+function beginArtifactRequest(compiling = false) {
+  const btn = $('#btn-compile');
+  btn.disabled = compiling;
+  btn.textContent = compiling ? 'compiling…' : 'Run pipeline';
+  return ++state.requestSeq;
+}
+
+/** Static hosting: the deploy ships the repository examples as plain .hx
+ *  files, and the bridge compiles them exactly like the observer would. */
+async function loadStaticExampleArtifact(name) {
+  const res = await fetch('/data/examples/' + encodeURIComponent(name) + '.hx');
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const source = await res.text();
+  const bridge = await loadBrowserRunner();
+  return bridge.buildArtifact(source, name);
+}
+
+async function selectExample(name) {
+  const requestSeq = beginArtifactRequest();
+  const editor = $('#custom-src');
+  const draft = editor.value;
+  try {
+    const art = state.static
+      ? await loadStaticExampleArtifact(name)
+      : await fetchJSON(`/api/artifact?example=${encodeURIComponent(name)}`);
+    // A quick tour can issue several requests before the first response
+    // arrives. Only the latest selection is allowed to paint the workstation;
+    // otherwise a slower, older response makes examples appear unchanged.
+    if (requestSeq !== state.requestSeq) return;
+    // Commit selection only after success; don't discard edits made in flight.
+    if (editor.value === draft) editor.value = '';
     setArtifact(art, name);
   } catch (err) {
+    if (requestSeq !== state.requestSeq) return;
+    // A failed superseding action must release a pending measurement's UI
+    // (retry button stays disabled while benchPending holds).
+    state.benchMessage = '';
+    state.benchPending = false;
+    renderBench(state.artifact);
     toast(`failed to load “${name}”: ${err.message}`);
   }
 }
 
-function setArtifact(art, name) {
+function setArtifact(art, name, { hydrate = true } = {}) {
   state.artifact = art;
   state.exampleName = name ?? art?.example ?? '';
+  state.fromCustom = state.exampleName === '<adhoc>';
+  $$('#example-list .ex-item').forEach(item => {
+    const selected = item.dataset.example === state.exampleName;
+    item.classList.toggle('active', selected);
+    item.setAttribute('aria-pressed', String(selected));
+  });
+  state.benchMessage = '';
+  state.benchPending = false;
+  state.localBench = null;
+  state.browserRunSeq += 1;
+  state.browserRun = null;
   state.cfgFn = 0;
   state.ssaFn = 0;
   renderAll();
+  if (hydrate) void hydrateBrowserExecution(art);
 }
 
 function renderAll() {
@@ -1363,7 +2153,9 @@ function renderAll() {
   crumb.textContent = state.exampleName || art.example || '';
   crumb.classList.toggle('on', !!crumb.textContent);
 
-  const backend = art.exec?.backend_used ?? art.bench?.backend_used;
+  const backend = state.browserRun?.result?.ok
+    ? 'interp-wasm'
+    : (art.exec?.backend_used ?? art.bench?.backend_used);
   const cb = $('#chip-backend');
   if (backend) {
     cb.textContent = '⚙ ' + backend;
@@ -1372,22 +2164,24 @@ function renderAll() {
     cb.title = 'execution backend: ' + backend;
   } else cb.classList.add('hidden');
 
+  const fixture = $('#chip-fixture');
+  if (fixture) fixture.classList.toggle('hidden', !art._dev_fixture);
+
   const cs = $('#chip-checksum');
-  if (art.exec?.checksum) {
-    cs.textContent = art.exec.checksum;
+  const checksum = state.browserRun?.result?.checksum || art.exec?.checksum;
+  if (checksum) {
+    cs.textContent = checksum;
     cs.title = 'output checksum';
     cs.classList.remove('hidden');
   } else cs.classList.add('hidden');
 
   $('#btn-recompile').classList.toggle('hidden', !state.fromCustom);
 
-  // standalone HTML export only makes sense for named stored examples
-  const exBtn = $('#btn-export');
-  const exported = state.examples.includes(state.exampleName);
-  exBtn.classList.toggle('hidden', !exported);
-  if (exported) exBtn.href = `/api/artifact/export?example=${encodeURIComponent(state.exampleName)}`;
+  // The mode chip, the rail note, and the export control all follow the mode.
+  renderModeChrome();
 
   renderDiagBanner(art);
+  renderExecReadout(art);
   refreshStepper(art);
   renderSource(art);
   renderTokens(art);
@@ -1400,7 +2194,7 @@ function renderAll() {
   renderBench(art);
 
   // land on the most interesting available phase for error artifacts
-  if (semaFailed(art) && state.phase !== 'source') {
+  if (compileFailed(art) && state.phase !== 'source') {
     gotoPhase('source', true);
   } else if (!stageAvailable(art, state.phase)) {
     gotoPhase('source', true);
@@ -1413,29 +2207,201 @@ function renderAll() {
    Custom compile & run
    ============================================================ */
 async function compileCustom() {
+  const requestSeq = beginArtifactRequest(true);
   const btn = $('#btn-compile');
   const src = $('#custom-src').value;
-  btn.disabled = true;
-  const old = btn.textContent;
-  btn.textContent = 'compiling…';
   try {
-    const art = await fetchJSON('/api/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: src }),
-    });
-    $$('#example-list .ex-item').forEach(x => x.classList.remove('active'));
-    state.fromCustom = true;
+    const art = state.static
+      ? await (await loadBrowserRunner()).buildArtifact(src, '<adhoc>')
+      : await fetchJSON('/api/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source: src }),
+        });
+    if (requestSeq !== state.requestSeq) return;
     setArtifact(art, '<adhoc>');
-    toast(art.diags_sem?.length
-      ? `compiled with ${art.diags_sem.length} semantic error(s)`
+    toast(compileFailed(art)
+      ? `compiled with ${compilerDiagnostics(art).length} ${art.diags_lex?.length ? 'syntax' : 'semantic'} error(s)`
       : 'compile complete');
   } catch (err) {
+    if (requestSeq !== state.requestSeq) return;
+    // Same release rule as selectExample: a failed superseding action must
+    // not leave a pending measurement's retry button disabled.
+    state.benchMessage = '';
+    state.benchPending = false;
+    renderBench(state.artifact);
     toast('compile failed: ' + err.message);
   } finally {
-    btn.disabled = false;
-    btn.textContent = old;
+    if (requestSeq === state.requestSeq) {
+      btn.disabled = false;
+      btn.textContent = 'Run pipeline';
+    }
   }
+}
+
+/** Measure the currently compiled custom source in the browser's real WASM
+ * reference interpreter, and — when the app runs without a Rust observer —
+ * also against the compiled WebAssembly module. Native and parallel figures
+ * are never synthesized for arbitrary input; the resulting cards are local. */
+async function measureCustom() {
+  const editor = $('#custom-src');
+  const draft = editor.value;
+  const source = state.fromCustom
+    ? (draft.trim() || state.artifact?.source || '')
+    : (state.artifact?.source || draft);
+  if (!source.trim()) {
+    toast('enter HELIX source before measuring');
+    return;
+  }
+
+  const requestSeq = beginArtifactRequest();
+  state.benchPending = true;
+  state.benchMessage = state.static
+    ? 'measuring both engines: WASM interpreter and compiled wasm…'
+    : 'measuring seven bounded WASM interpreter samples…';
+  renderBench(state.artifact);
+  try {
+    let art = state.artifact;
+    if (!art || art.example !== '<adhoc>' || art.source !== source) {
+      art = state.static
+        ? await (await loadBrowserRunner()).buildArtifact(source, '<adhoc>')
+        : await fetchJSON('/api/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source }),
+          });
+    }
+    if (requestSeq !== state.requestSeq) return;
+    if (art.diags_lex || art.diags_sem?.length) {
+      setArtifact(art, '<adhoc>');
+      toast('fix the source diagnostics before measuring');
+      return;
+    }
+    // Refuse oversized input before either engine starts, then measure the
+    // reference interpreter first and the compiled module second.
+    let localBench = null;
+    const bridge = state.static ? await loadBrowserRunner() : null;
+    if (bridge) guardBrowserWorkBudget(bridge.estimatedBrowserWork(source));
+    const measured = await measureBrowserSource(source);
+    if (requestSeq !== state.requestSeq) return;
+    if (bridge) {
+      const compiled = await measureCompiledSource(bridge, source, '<adhoc>');
+      if (requestSeq !== state.requestSeq) return;
+      localBench = localBenchFromMeasurements(measured, compiled);
+    }
+    // art.exec is independent observer evidence; browser results live in state.browserRun.
+    art.bench = {
+      kernel: '<adhoc>',
+      n: 0,
+      variants: [{
+        name: 'interp-wasm-local',
+        median_ms: measured.medianMs,
+        samples: measured.samples,
+      }],
+      efficiency: [],
+    };
+    setArtifact(art, '<adhoc>', { hydrate: false });
+    // setArtifact resets local state; the pair measured above belongs to this
+    // artifact, so attach it again below.
+    state.localBench = localBench;
+    // The editor must hold what was measured, or Recompile would post ''.
+    // Edits typed while the measurement ran are newer intent: keep them,
+    // matching selectExample's draft-preservation rule.
+    if (editor.value === draft) editor.value = source;
+    state.browserRun = { status: 'done', result: measured.result };
+    renderAll();
+    gotoPhase('bench', true);
+    toast(state.static
+      ? 'measured both engines in this browser'
+      : 'custom WASM interpreter measurement complete');
+  } catch (err) {
+    if (requestSeq !== state.requestSeq) return;
+    state.benchPending = false;
+    state.benchMessage = `measurement unavailable: ${err.message}`;
+    renderBench(state.artifact);
+    toast('WASM benchmark failed: ' + err.message);
+  }
+}
+
+/** Measure a named example's source with both engines in this browser. Static
+ *  builds use this as their only local evidence besides the recorded cards,
+ *  so the selection (and every recorded provenance stamp above) is kept. */
+async function measureNamedExample(name) {
+  if (!state.static) return;
+  const art = state.artifact;
+  const source = art && art.example === name && typeof art.source === 'string' ? art.source : '';
+  if (!source.trim()) {
+    toast(`open “${name}” before measuring it`);
+    return;
+  }
+
+  const requestSeq = beginArtifactRequest();
+  state.benchPending = true;
+  state.benchMessage = 'measuring both engines: WASM interpreter and compiled wasm…';
+  renderBench(art);
+  try {
+    const bridge = await loadBrowserRunner();
+    guardBrowserWorkBudget(bridge.estimatedBrowserWork(source));
+    const measured = await measureBrowserSource(source);
+    if (requestSeq !== state.requestSeq) return;
+    const compiled = await measureCompiledSource(bridge, source, name);
+    if (requestSeq !== state.requestSeq) return;
+    state.localBench = localBenchFromMeasurements(measured, compiled);
+    state.benchPending = false;
+    state.benchMessage = '';
+    state.browserRun = { status: 'done', result: measured.result };
+    renderAll();
+    gotoPhase('bench', true);
+    toast(`measured ${name} with both engines in this browser`);
+  } catch (err) {
+    if (requestSeq !== state.requestSeq) return;
+    state.benchPending = false;
+    state.benchMessage = `measurement unavailable: ${err.message}`;
+    renderBench(state.artifact);
+    toast('WASM benchmark failed: ' + err.message);
+  }
+}
+
+/** The compiled path: HELIX's optimized SSA IR emitted as a WebAssembly
+ *  module and executed in the worker. No native or parallel execution is
+ *  involved; parity with the interpreter is asserted by the caller. */
+async function measureCompiledSource(bridge, source, exampleName) {
+  const measured = await bridge.measureCompiled(source, exampleName);
+  if (!measured?.result?.ok) {
+    throw new Error(measured?.result?.message || 'the compiled WebAssembly path rejected this source');
+  }
+  if (!Number.isFinite(measured.medianMs) || measured.medianMs < 0) {
+    throw new Error('the compiled WebAssembly path did not provide a valid execution time');
+  }
+  if (!Array.isArray(measured.samples) ||
+      measured.samples.some(ms => !Number.isFinite(Number(ms)) || Number(ms) < 0)) {
+    throw new Error('the compiled WebAssembly path returned invalid samples');
+  }
+  return measured;
+}
+
+/** Both engines measured on the same source in this browser. Parity compares
+ *  the compiled checksum with the interpreter's: a mismatch is a compiler bug
+ *  signal, so the UI reports it loudly while still showing the medians. */
+function localBenchFromMeasurements(measured, compiled) {
+  const interpChecksum = measured.result?.checksum ?? null;
+  const compiledChecksum = compiled.checksum ?? compiled.result?.checksum ?? null;
+  // null means the engine reported nothing; 0 is a real measurement.
+  const num = value => {
+    const bytes = Number(value);
+    return value != null && Number.isFinite(bytes) && bytes >= 0 ? bytes : null;
+  };
+  return {
+    variants: [
+      { name: 'interp-wasm-local', median_ms: measured.medianMs, samples: measured.samples },
+      { name: 'compiled-wasm-local', median_ms: compiled.medianMs, samples: compiled.samples },
+    ],
+    memory: {
+      interpBytes: num(measured.result?.alloc_bytes),
+      compiledBytes: num(compiled.heapBytes),
+    },
+    parity: { same: interpChecksum === compiledChecksum, checksum: interpChecksum, compiledChecksum },
+  };
 }
 
 /* ============================================================
@@ -1484,16 +2450,68 @@ function stepPhase(dir) {
   }
 }
 
+/** A failed probe (a 404 on GitHub Pages, or an unreachable origin) means no
+ *  Rust observer serves this site, so every request runs through the WASM
+ *  bridge instead. Plain fetch is deliberate: a non-ok status is the signal,
+ *  and fetchJSON would turn it into an exception either way. */
+async function detectStaticMode() {
+  try {
+    const res = await fetch('/api/examples');
+    state.static = !res.ok;
+  } catch {
+    state.static = true;
+  }
+}
+
+/** Mode chrome: which engine compiles this site's artifacts, and which
+ *  controls that mode keeps. */
+function renderModeChrome() {
+  const mode = $('#chip-mode');
+  if (mode) {
+    mode.textContent = state.static ? 'WASM LAB' : 'OBSERVER';
+    mode.title = state.static
+      ? 'Compiled and executed in this browser via WebAssembly — no Rust observer serves this site.'
+      : 'Compiled and executed by the Rust observer serving this site.';
+    mode.classList.toggle('chip-mode-static', state.static);
+    mode.classList.remove('hidden');
+  }
+  const note = $('#rail-mode-note');
+  if (note) {
+    note.innerHTML = state.static
+      ? 'Compiles in this browser via WebAssembly. After it compiles, open BENCH to measure both engines locally.'
+      : 'POSTs the buffer to <code>/api/run</code>. After it compiles, open BENCH to measure a bounded interpreter run.';
+  }
+  // Standalone HTML export is rendered by the observer's artifact endpoint, so
+  // a static build keeps the control hidden with an explanatory title.
+  const exBtn = $('#btn-export');
+  if (exBtn) {
+    const exported = !state.static && state.examples.includes(state.exampleName);
+    exBtn.classList.toggle('hidden', !exported);
+    exBtn.title = state.static
+      ? 'Standalone export needs the Rust observer — unavailable in this static WASM build.'
+      : "open this example's artifact as a standalone offline HTML page";
+    if (exported) exBtn.href = `/api/artifact/export?example=${encodeURIComponent(state.exampleName)}`;
+  }
+}
+
 async function boot() {
   buildStepper();
   wireEvents();
+  // Decide the mode before any catalog or artifact load: static hosting
+  // answers no /api/*, and the WASM bridge then carries every request.
+  await detectStaticMode();
+  renderModeChrome();
+  // The example rail uses the catalog to mark measured kernels, so load its
+  // provenance before painting the list. A partial catalog must never make a
+  // measured example look unmeasured merely because two requests raced.
+  await loadBenchmarkCatalog();
   await loadExamples();
   // open on the strongest showcase that actually loaded, else the first entry
   const preferred = ['scale', 'recurrence_reject', 'dot_reduction']
     .map(name => $(`#example-list .ex-item[data-example="${CSS.escape(name)}"]`))
     .find(Boolean);
   const first = preferred ?? $('#example-list .ex-item');
-  if (first) selectExample(first.dataset.example, first);
+  if (first) selectExample(first.dataset.example);
   else {
     // fully offline: no API, no fixtures — leave a graceful shell
     setArtifact({

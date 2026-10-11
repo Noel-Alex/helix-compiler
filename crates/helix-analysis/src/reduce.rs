@@ -142,7 +142,7 @@ fn match_chain(func: &FuncIr, phi_dst: ValueId, back: ValueId) -> Option<(Reduct
             }
             let red_op = match op {
                 BinOp::Add => ReductionOp::Add,
-                BinOp::Sub => ReductionOp::Add, // x -= t ≡ sum of negated terms
+                BinOp::Sub if acc_a => ReductionOp::Add, // x -= t ≡ sum of negated terms
                 BinOp::Mul => ReductionOp::Mul,
                 _ => return None,
             };

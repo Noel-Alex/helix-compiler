@@ -248,10 +248,48 @@ extern "C" fn helix_print_bool(v: i64) {
 /// Allocates a zero-initialized buffer of `n` elements of `elem_size` bytes.
 ///
 /// Live allocations from `helix_zeros`, tracked so [`reset_host_heap`] can
-/// reclaim them. The bench harness runs hundreds of programs per process;
-/// without this table each run's arrays would accumulate (measured: 18 GB
-/// during a full campaign).
-static LIVE_BUFS: std::sync::Mutex<Vec<(i64, usize)>> = std::sync::Mutex::new(Vec::new());
+/// reclaim them and so [`live_array_images`] can read the finished program's
+/// state. The bench harness runs hundreds of programs per process; without
+/// this table each run's arrays would accumulate (measured: 18 GB during a
+/// full campaign).
+///
+/// Each entry is `(pointer, byte length, element count)`: the element count
+/// rides along because a `zeros(0)` allocation still occupies its one-byte
+/// floor while the interpreter folds nothing for a zero-length array.
+static LIVE_BUFS: std::sync::Mutex<Vec<(i64, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Owned image of every live JIT-host array, in allocation order, paired with
+/// its element count.
+///
+/// `helix_zeros` hands out `Vec`-backed buffers that stay alive until
+/// [`reset_host_heap`], so a snapshot taken between those two points sees
+/// exactly the arrays a finished program left behind. Reading them is the only
+/// way a cross-backend parity gate can fold the *array* half of the
+/// interpreter's state checksum: printed lines alone would let a parallel
+/// kernel that computes right answers and corrupts memory pass.
+///
+/// The returned bytes are copies, so the caller decides when the cost is
+/// worth paying — correctness gates do, timed batches must not (they skip the
+/// checksum entirely rather than measure it).
+///
+/// Zero-length arrays are omitted, matching the interpreter's fold.
+pub fn live_array_images() -> Vec<(usize, Vec<u8>)> {
+    let bufs = match LIVE_BUFS.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    bufs.iter()
+        .filter(|&&(_, _, elems)| elems > 0)
+        .map(|&(ptr, len, elems)| {
+            // SAFETY: `ptr`/`len` describe the boxed slice `helix_zeros`
+            // handed out; it stays alive (and unaliased for writes) until
+            // `reset_host_heap` drains this table, and the snapshot runs
+            // between executions so no JITed code is in flight.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+            (elems, bytes.to_vec())
+        })
+        .collect()
+}
 
 /// Frees every array allocation made by JITed code since the last call, and
 /// clears print/panic/trap state.
@@ -263,7 +301,7 @@ static LIVE_BUFS: std::sync::Mutex<Vec<(i64, usize)>> = std::sync::Mutex::new(Ve
 /// never need to call it (buffers die with the process).
 pub fn reset_host_heap() {
     if let Ok(mut bufs) = LIVE_BUFS.lock() {
-        for (ptr, len) in bufs.drain(..) {
+        for (ptr, len, _) in bufs.drain(..) {
             // SAFETY: `ptr` came from `Vec::into_raw_parts_style` allocation
             // below with this exact length/capacity and is freed exactly once
             // (entries are drained under the lock).
@@ -285,9 +323,10 @@ extern "C" fn helix_zeros(n: i64, elem_size: i64) -> i64 {
         usize::try_from(n.checked_mul(elem_size).unwrap_or(i64::MAX)).unwrap_or(usize::MAX - 1);
     let vec = vec![0u8; bytes.max(1)]; // ≥1 byte keeps dangling-pointer rules happy at n=0
     let len = vec.len();
+    let elems = usize::try_from(n).unwrap_or(0);
     let ptr = Box::into_raw(vec.into_boxed_slice());
     if let Ok(mut bufs) = LIVE_BUFS.lock() {
-        bufs.push((ptr as *const u8 as i64, len));
+        bufs.push((ptr as *const u8 as i64, len, elems));
     }
     ptr as *mut u8 as i64
 }
@@ -310,6 +349,7 @@ impl std::fmt::Debug for JitEngine {
         f.debug_struct("JitEngine")
             .field("functions", &self.funcs.keys().collect::<Vec<_>>())
             .field("main", &"FuncId(main)")
+            .field("regions", &self.regions)
             .finish_non_exhaustive()
     }
 }
@@ -319,6 +359,8 @@ pub struct JitEngine {
     module: Option<JITModule>,
     funcs: HashMap<String, FuncId>,
     main_fid: FuncId,
+    /// Parallel regions that survived plan preparation (0 ⇒ fully sequential).
+    regions: usize,
 }
 
 impl JitEngine {
@@ -543,7 +585,21 @@ impl JitEngine {
             module: Some(module),
             funcs,
             main_fid,
+            regions: regions.len(),
         })
+    }
+
+    /// Parallel regions this engine can dispatch.
+    ///
+    /// A region exists only when the plan approved a loop AND the transform
+    /// could extract it, so `0` means the compiled program is fully
+    /// sequential whatever its source loops look like. Read-only diagnostics:
+    /// callers (notably the benchmark campaign) use it to prove a
+    /// "sequential baseline" variant really was compiled without regions
+    /// instead of trusting its own label.
+    #[must_use]
+    pub fn region_count(&self) -> usize {
+        self.regions
     }
 
     /// Calls the JIT-compiled `main()` (no params, unit return).

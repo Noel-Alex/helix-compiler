@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>How HELIX works — compiler notes</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2358f4ef'/%3E%3Cpath d='M7 26V8h18v18M7 12h18M11 17h10M16 26V17' fill='none' stroke='%2313232a' stroke-width='3' stroke-linecap='square'/%3E%3Cpath d='m10 24 12-16m-3 0 5-4m-2 7-4-1' fill='none' stroke='%23ffe35b' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/about.css">
+<script type="module" src="/about.js"></script>
+</head>
+<body>
+<header class="about-nav">
+  <a class="about-brand" href="/" aria-label="Return to the HELIX Observatory">
+    <svg viewBox="0 0 32 32" aria-hidden="true">
+      <path class="about-mark-temple" d="M6 27V8h20v19M6 12h20M11 17h10M16 27V17" />
+      <path class="about-mark-sword" d="m9 24 13-16m-4 0 5-4m-2 7-4-1" />
+    </svg>
+    <span>HELIX</span>
+  </a>
+  <p>compiler notes / project guide</p>
+  <a class="nav-return" href="/">Open the Observatory</a>
+</header>
+
+<main>
+  <section class="about-hero" aria-labelledby="about-title">
+    <div class="hero-copy">
+      <p class="eyebrow">HELIX LITE · AUTOMATIC PARALLELIZING COMPILER</p>
+      <h1 id="about-title">
+        <span class="hero-line">See why a</span>
+        <span class="hero-line"><span class="hero-emphasis">loop</span> is</span>
+        <span class="hero-line">allowed to</span>
+        <span class="hero-line">run</span>
+        <span class="hero-line">together.</span>
+      </h1>
+      <p class="hero-lede">HELIX turns a small program into a sequence of inspectable compiler artifacts. The Observatory lets you move through that sequence, from source text to the evidence behind a parallelization decision.</p>
+      <div class="hero-actions">
+        <a class="cta" href="/">Try an example</a>
+        <a class="text-link" href="#pipeline">Read the pipeline</a>
+      </div>
+    </div>
+    <figure class="hero-figure">
+      <div class="figure-label"><span>OBSERVATORY PLATE</span><span>LOOP / 01</span></div>
+      <img class="hero-illustration" src="/assets/helix-loop-observatory.png" alt="Pixel-art compiler observatory with three dependency nodes and a yellow loop arrow around them.">
+      <figcaption>A loop earns the right to run together when its accesses do not form a carried dependency.</figcaption>
+    </figure>
+  </section>
+
+  <section id="browser-lab" class="browser-lab" aria-labelledby="browser-lab-title">
+    <div class="lab-heading">
+      <p class="eyebrow">A SMALL LIVE EXPERIMENT</p>
+      <h2 id="browser-lab-title">Run the reference interpreter in this tab.</h2>
+      <p>This is the real HELIX syntax, semantic checker, and tree-walking interpreter compiled to WebAssembly. It is intentionally not the native Cranelift/JIT path: sources above the browser work budget are refused up front. Execution runs in a separate worker with a five-second deadline, keeping the page responsive.</p>
+    </div>
+    <div class="lab-shell">
+      <div class="lab-toolbar">
+        <div class="lab-presets" aria-label="Browser lab examples">
+          <button type="button" class="lab-preset is-active" data-lab-preset="safe">Safe sum</button>
+          <button type="button" class="lab-preset" data-lab-preset="reduction">Reduction</button>
+          <button type="button" class="lab-preset" data-lab-preset="trap">Runtime trap</button>
+        </div>
+        <button type="button" id="browser-run" class="lab-run">Run in WebAssembly</button>
+      </div>
+      <div class="lab-grid">
+        <label class="lab-editor">
+          <span>HELIX source <small>editable · 64 KiB cap</small></span>
+          <textarea id="browser-source" spellcheck="false" autocapitalize="off" autocomplete="off">fn main() {
+    let total = 0;
+    for i in 0..6 {
+        total = total + i;
+    }
+    print(total);
+}</textarea>
+        </label>
+        <section class="lab-output" aria-labelledby="lab-output-title">
+          <div class="output-heading"><span id="lab-output-title">Interpreter output</span><span id="browser-status" role="status">ready</span></div>
+          <pre id="browser-output" tabindex="0">Run the program to see printed lines and the deterministic checksum.</pre>
+          <p id="browser-diagnostics" class="lab-diagnostics" role="status">The browser result will identify its engine and failure phase.</p>
+        </section>
+      </div>
+      <p class="lab-footnote"><span>WASM / REFERENCE INTERPRETER</span><span>native parallel execution remains in the Observatory</span></p>
+    </div>
+  </section>
+
+  <section id="pipeline" class="about-section" aria-labelledby="pipeline-title">
+    <div class="section-heading">
+      <p class="eyebrow">THE OBSERVATORY</p>
+      <h2 id="pipeline-title">One program. Eight views.</h2>
+      <p>Each screen is a different question about the same compilation. Nothing is a decorative dashboard tile: the artifacts are the explanation.</p>
+    </div>
+    <ol class="pipeline-list">
+      <li><span class="stage-no">01</span><div><h3>Source</h3><p>The HELIX language file, with line numbers and any compiler diagnostics attached to the original span.</p></div></li>
+      <li><span class="stage-no">02</span><div><h3>Tokens</h3><p>The lexer’s stream of keywords, identifiers, literals, and operators—the first machine-readable form.</p></div></li>
+      <li><span class="stage-no">03</span><div><h3>AST</h3><p>The parsed structure of the program, shown as a tree so nesting and expression shape stay visible.</p></div></li>
+      <li><span class="stage-no">04</span><div><h3>CFG</h3><p>Basic blocks and control-flow edges show where a function can branch, join, loop, and exit.</p></div></li>
+      <li><span class="stage-no">05</span><div><h3>SSA</h3><p>Static single assignment makes value flow explicit; φ-nodes mark where control-flow paths reunite.</p></div></li>
+      <li><span class="stage-no">06</span><div><h3>Optimization</h3><p>Pass snapshots show which transformations changed the intermediate representation and by how much.</p></div></li>
+      <li><span class="stage-no">07</span><div><h3>Loop analysis</h3><p>The dependence battery checks RAW, WAR, and WAW relationships before classifying a loop as safe, a reduction, or sequential.</p></div></li>
+      <li><span class="stage-no">08</span><div><h3>Benchmark</h3><p>Named kernels attach their matching point from the recorded campaign, including raw samples and parallel efficiency. Custom source can request a bounded interpreter-only measurement; native speedups are never invented.</p></div></li>
+    </ol>
+  </section>
+
+  <section class="about-section split-section" aria-labelledby="decision-title">
+    <div class="section-heading">
+      <p class="eyebrow">THE IMPORTANT PART</p>
+      <h2 id="decision-title">Parallelism is a proof obligation.</h2>
+    </div>
+    <div class="explain-copy">
+      <p>A loop is not parallelized because it looks repetitive. HELIX looks for loop-carried memory relationships. If iterations are independent, the result is <strong>SAFE</strong>. If an associative accumulator can be privatized and combined, the result is <strong>REDUCTION</strong>. If a dependence crosses iterations, HELIX keeps the loop <strong>SEQUENTIAL</strong> and names the reason.</p>
+      <div class="decision-strip"><span class="decision-safe">SAFE</span><span>iterations may run concurrently</span><span class="decision-reduction">REDUCTION</span><span>private partials combine at exit</span><span class="decision-sequential">SEQUENTIAL</span><span>the evidence is not safe to ignore</span></div>
+    </div>
+  </section>
+
+  <section class="about-section examples-section" aria-labelledby="examples-title">
+    <div class="section-heading">
+      <p class="eyebrow">REPOSITORY COVERAGE</p>
+      <h2 id="examples-title">Nineteen examples, three jobs.</h2>
+      <p>The Observatory derives its live list from <code>/api/examples</code>. These are the current repository examples shown in the workstation.</p>
+    </div>
+    <div class="example-columns">
+      <div><h3>Kernels</h3><p>Numerical programs that make loop analysis tangible.</p><ul><li>count_primes_sieve</li><li>dot_reduction</li><li>fib_recursion</li><li>jacobi_2d</li><li>matmul</li><li>minmax_reduction</li><li>saxpy</li><li>scale</li><li>small_n</li></ul></div>
+      <div><h3>Language / IR</h3><p>Small programs for language rules and intermediate forms.</p><ul><li>casts_demo</li><li>const_globals</li><li>div_guard</li><li>gcd_box_test</li><li>shortcircuit</li><li>ssa_demo</li><li>writer_call</li></ul></div>
+      <div><h3>Refusal / diagnostics</h3><p>Cases where the correct result is a warning, a refusal, or a stopped pipeline.</p><ul><li>recurrence_reject</li><li>stencil_2d_reject</li><li>type_errors</li></ul></div>
+    </div>
+  </section>
+
+  <section class="about-section how-section" aria-labelledby="how-title">
+    <div class="section-heading">
+      <p class="eyebrow">USING THE PROJECT</p>
+      <h2 id="how-title">A short tour for a reviewer.</h2>
+    </div>
+    <div class="how-grid">
+      <div><span>1</span><p>Choose an example from the source index. Start with <code>saxpy</code> for a clear safe loop, or <code>recurrence_reject</code> to see refusal evidence.</p></div>
+      <div><span>2</span><p>Move through the pipeline keyboard. Graph views can be dragged, zoomed, and reset; SSA and optimization panes can be compared.</p></div>
+      <div><span>3</span><p>Use Custom source to submit a small program through <code>/api/run</code>. Diagnostics remain attached to the source when later stages are unavailable; a valid custom program can then request seven bounded interpreter samples from the BENCH screen.</p></div>
+      <div><span>4</span><p>Export a named artifact for an offline, self-contained report. The Rust observer is the canonical runtime; the Node server labels fixture-only responses.</p></div>
+    </div>
+  </section>
+
+  <section class="closing-note" aria-label="Project boundary">
+    <div>
+      <p class="eyebrow">A NOTE ON EVIDENCE</p>
+      <h2>Beautiful output should make the compiler easier to question.</h2>
+    </div>
+    <p>HELIX does not invent speedups, hide diagnostics, or turn an unavailable stage into a success. Its job is to make the compiler’s reasoning inspectable enough that a student, reviewer, or future maintainer can follow the path from code to decision.</p>
+  </section>
+</main>
+
+<footer class="about-footer"><span>HELIX LITE / COMPILER NOTES</span><a href="/">Return to the Observatory</a></footer>
+</body>
+</html>

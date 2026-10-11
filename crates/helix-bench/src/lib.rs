@@ -31,9 +31,18 @@
 //!
 //! Parallel candidates sweep p ∈ {1,2,4,8,16,24,32} (methodology rec. 9) by
 //! setting `HELIX_NTHREADS` around each measurement — the same override
-//! helix-runtime honours — clamped to available hardware. Efficiency
+//! helix-runtime honours. The engine's baked-in region hint is deliberately
+//! far above any real host, so the override is what governs and a row labelled
+//! `p` really runs `p` participants (clamped only by hardware). Efficiency
 //! E_p = S_p / p is tabulated next to raw speedup so inefficiency cannot
 //! hide (pitfall 12).
+//!
+//! ## Quick mode (`--quick`)
+//!
+//! [`BenchConfig::quick`] shrinks a campaign to a smoke test that exercises
+//! the same [`run_campaign`] path: the smallest declared size per kernel, a
+//! participant sweep of only {1, hardware}, and [`timing::K_SAMPLES_QUICK`]
+//! samples per variant. It publishes no numbers — it proves the wiring runs.
 
 pub mod kernels;
 pub mod meta;
@@ -41,6 +50,8 @@ pub mod rust_twins;
 pub mod timing;
 pub mod triad;
 
+use helix_engine::Value;
+use helix_sema::ElemTy;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -62,6 +73,11 @@ pub struct BenchConfig {
     pub triad_n: usize,
     /// Kernels to run; empty = all non-correctness-only entries.
     pub only_kernels: Vec<String>,
+    /// Smoke-test mode: smallest size per kernel, a {1, hardware} thread
+    /// sweep, and [`timing::K_SAMPLES_QUICK`] samples per variant. Same
+    /// [`run_campaign`] path, no parallel code path — see the module docs.
+    #[serde(default)]
+    pub quick: bool,
 }
 
 impl Default for BenchConfig {
@@ -72,8 +88,95 @@ impl Default for BenchConfig {
             skip_triad: false,
             triad_n: triad::DEFAULT_TRIAD_N,
             only_kernels: Vec::new(),
+            quick: false,
         }
     }
+}
+
+impl BenchConfig {
+    /// Samples per variant this configuration asks the sampler for.
+    #[must_use]
+    pub fn samples(&self) -> usize {
+        if self.quick {
+            timing::K_SAMPLES_QUICK
+        } else {
+            timing::K_SAMPLES
+        }
+    }
+
+    /// Participant counts swept for this configuration.
+    ///
+    /// A quick campaign measures 1 and the hardware width and nothing else:
+    /// the scaling curve is what a full campaign is for, and a smoke test
+    /// that takes twenty minutes is not a smoke test.
+    #[must_use]
+    pub fn effective_thread_sweep(&self) -> Vec<usize> {
+        if !self.quick {
+            return self.thread_sweep.clone();
+        }
+        let wide = available_parallelism().min(self.max_threads).max(1);
+        if wide > 1 { vec![1, wide] } else { vec![1] }
+    }
+}
+
+/// Logical CPUs visible to this process (1 when the OS will not say).
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// Problem sizes [`run_campaign`] measures for one kernel.
+///
+/// Quick mode keeps only the SMALLEST declared size, so the campaign's point
+/// count collapses to one per kernel without changing what is measured.
+///
+/// # Errors
+/// In quick mode, a kernel that declares no size at all has no smaller size
+/// to reduce to. Measuring nothing for it would look like "no data" when it
+/// is really a registry mistake, so it is an error instead.
+pub fn selected_sizes(kernel: &KernelDef, config: &BenchConfig) -> Result<Vec<i64>, String> {
+    if !config.quick {
+        return Ok(kernel.sizes.to_vec());
+    }
+    kernel.sizes.iter().min().copied().map_or_else(
+        || {
+            Err(format!(
+                "kernel '{}' declares no sizes, so --quick has no smaller size to select",
+                kernel.name
+            ))
+        },
+        |smallest| Ok(vec![smallest]),
+    )
+}
+
+/// Converts an analysis plan to the backend's seam type (M10: the fields map
+/// 1:1 and reduction operators pass through so min/max regions combine with
+/// the right monoid).
+///
+/// The CLI's JIT path shares this conversion rather than keeping a second
+/// copy: a plan converted two different ways is a plan that can drift.
+#[must_use]
+pub fn to_backend_plan(p: &helix_analysis::ParallelPlan) -> helix_backend::ParallelPlan {
+    use helix_backend::engine::helix_analysis_stub::ReductionOp as BOp;
+    let mut out = helix_backend::ParallelPlan::default();
+    for r in &p.regions {
+        out.regions.push(helix_backend::RegionDesc {
+            func_idx: r.func_idx,
+            header: r.header,
+            kind: match r.kind {
+                helix_analysis::RegionKind::DoAll => helix_backend::RegionKind::DoAll,
+                helix_analysis::RegionKind::Reduction(op) => {
+                    helix_backend::RegionKind::Reduction(match op {
+                        helix_analysis::ReductionOp::Add => BOp::Add,
+                        helix_analysis::ReductionOp::Mul => BOp::Mul,
+                        helix_analysis::ReductionOp::Min => BOp::Min,
+                        helix_analysis::ReductionOp::Max => BOp::Max,
+                    })
+                }
+            },
+            body_fn_name: r.body_fn_name.clone(),
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -96,9 +199,21 @@ pub trait ExecVariant {
     /// text. Must be deterministic for identical inputs (the harness compares
     /// outputs across variants under the kernel's [`Tolerance`]).
     ///
+    /// The checksum is the interpreter's FULL state witness — every printed
+    /// line followed by the arrays `main` leaves bound — so a variant that
+    /// prints the right values and corrupts memory cannot pass a comparison.
+    ///
     /// # Errors
     /// Backend-specific failure text (parse/sema/runtime), rendered readably.
     fn run_once(&self) -> Result<RunOutputLike, String>;
+
+    /// Milliseconds spent compiling this variant, measured once when it was
+    /// built and reported as its own column so compile cost never contaminates
+    /// steady-state execution numbers. `0.0` for variants with no compile
+    /// step to report (the interpreter).
+    fn compile_ms(&self) -> f64 {
+        0.0
+    }
 
     /// Time `reps` consecutive executions as one batch (sampler hook).
     ///
@@ -199,9 +314,11 @@ pub fn native_availability() -> NativeAvailability {
 
 /// Builds the sequential-native variant for one program, if possible.
 ///
-/// Full pipeline: parse → check → IR build → SSA → loop analysis → parallel
-/// plan → Cranelift compile. Each `run_once` executes the machine code once
-/// (prints captured host-side).
+/// Shared compile pipeline: parse → check → IR build → SSA → optimizer →
+/// loop analysis → parallel plan, then a Cranelift compile with an EMPTY
+/// backend plan — no regions — so the variant is genuinely sequential
+/// whatever the analyzer approved. Each `run_once` executes the machine code
+/// once (prints captured host-side).
 ///
 /// # Errors
 /// Backend unavailability or any pipeline-stage failure, as readable text.
@@ -212,7 +329,8 @@ pub fn native_variant(src: &str) -> Result<Box<dyn ExecVariant>, String> {
     }
 }
 
-/// JIT-backed [`ExecVariant`] — sequential or parallel per the analysis plan.
+/// JIT-backed [`ExecVariant`] — sequential or parallel per the plan it was
+/// compiled with.
 pub struct NativeVariant {
     engine: helix_backend::JitEngine,
     /// "native-seq" or "native-par<P>" — par variants pin HELIX_NTHREADS
@@ -220,96 +338,190 @@ pub struct NativeVariant {
     label: &'static str,
     /// When Some(p), HELIX_NTHREADS is set to p for each run/batch.
     threads: Option<usize>,
+    /// Cranelift compile time of this variant, measured once at construction.
+    compile_ms: f64,
+    /// Element types of the arrays `main` leaves bound, in the interpreter's
+    /// fold order — the array half of the full-state checksum.
+    final_arrays: Vec<ElemTy>,
 }
 
 impl NativeVariant {
-    /// Compile once up front (JIT compilation is measured separately from
-    /// steady-state execution by the sampler's warmup discipline).
+    /// Compiles `src` sequentially: the shared pipeline runs, and the engine
+    /// is built from an **empty** backend plan.
+    ///
+    /// The analysis still runs (the verdict gate needs its verdicts), but its
+    /// approved regions are deliberately NOT handed to the backend. Without
+    /// that separation a "sequential baseline" would silently run parallel on
+    /// any parallelizable kernel, which makes every speedup measured against
+    /// it wrong.
+    ///
+    /// `unchecked` strips array bounds checks (`--unchecked`); division guards
+    /// always remain.
     ///
     /// # Errors
     /// Any pipeline stage or backend compile failure, as text.
     pub fn new(src: &str, unchecked: bool) -> Result<Self, String> {
-        let ast = helix_syntax::parse_str(src).map_err(|e| format!("syntax error: {e}"))?;
-        let typed = helix_sema::check(&ast).map_err(|ds| format!("{ds:#?}"))?;
-        let mut funcs = helix_ir::build(&typed);
-        for f in &mut funcs {
-            helix_ir::to_ssa(f);
-        }
-        let loops: Vec<_> = funcs.iter().map(helix_analysis::find_loops).collect();
-        let reports: Vec<_> = funcs
+        let units = helix_artifact::prepare_pipeline(src)?;
+        Self::from_units(&units, None, unchecked, "native-seq", None)
+    }
+
+    /// Same compilation, but the engine is built from the REAL analysis plan
+    /// and executions pin `HELIX_NTHREADS=p` (the parallel variant). The plan
+    /// is baked at compile time; the runtime honours the env override per
+    /// dispatch, so ONE engine serves the whole sweep.
+    ///
+    /// # Errors
+    /// Any pipeline stage or backend compile failure, as text.
+    pub fn new_parallel(src: &str, p: usize) -> Result<Self, String> {
+        let units = helix_artifact::prepare_pipeline(src)?;
+        Self::from_units(&units, Some(&units.plan), false, "native-par", Some(p))
+    }
+
+    /// Builds the variant from an already-compiled [`CompiledUnits`].
+    ///
+    /// `plan = None` is the empty-plan (truly sequential) build; `plan = Some`
+    /// hands the analyzer's approved regions to the backend. Taking the units
+    /// as a parameter rather than the source keeps one pipeline run per
+    /// variant instead of one per plan decision.
+    fn from_units(
+        units: &helix_artifact::CompiledUnits,
+        plan: Option<&helix_analysis::ParallelPlan>,
+        unchecked: bool,
+        label: &'static str,
+        threads: Option<usize>,
+    ) -> Result<Self, String> {
+        let final_arrays = units
+            .funcs
             .iter()
-            .zip(&loops)
-            .map(|(f, l)| helix_analysis::analyze(f, l))
-            .collect();
-        let plan = helix_analysis::build_plan(&funcs, &loops, &reports);
-        // Convert to the backend seam type.
-        let mut bplan = helix_backend::ParallelPlan::default();
-        for r in &plan.regions {
-            bplan.regions.push(helix_backend::RegionDesc {
-                func_idx: r.func_idx,
-                header: r.header,
-                kind: match r.kind {
-                    helix_analysis::RegionKind::DoAll => helix_backend::RegionKind::DoAll,
-                    helix_analysis::RegionKind::Reduction(op) => {
-                        helix_backend::RegionKind::Reduction(match op {
-                            helix_analysis::ReductionOp::Add => {
-                                helix_backend::engine::helix_analysis_stub::ReductionOp::Add
-                            }
-                            helix_analysis::ReductionOp::Mul => {
-                                helix_backend::engine::helix_analysis_stub::ReductionOp::Mul
-                            }
-                            helix_analysis::ReductionOp::Min => {
-                                helix_backend::engine::helix_analysis_stub::ReductionOp::Min
-                            }
-                            helix_analysis::ReductionOp::Max => {
-                                helix_backend::engine::helix_analysis_stub::ReductionOp::Max
-                            }
-                        })
-                    }
-                },
-                body_fn_name: r.body_fn_name.clone(),
-            });
-        }
-        let engine = helix_backend::JitEngine::compile(&funcs, &bplan, unchecked)?;
+            .find(|f| f.name == "main")
+            .map(folded_array_elem_tys)
+            .unwrap_or_default();
+        let bplan = plan.map_or_else(helix_backend::ParallelPlan::default, to_backend_plan);
+        // Compile time is its own cost, reported as its own column; folding it
+        // into steady-state execution would corrupt every small-N number.
+        let compile_start = std::time::Instant::now();
+        let engine = helix_backend::JitEngine::compile(&units.funcs, &bplan, unchecked)?;
+        let compile_ms = compile_start.elapsed().as_secs_f64() * 1_000.0;
         Ok(Self {
             engine,
-            label: "native-seq",
-            threads: None,
+            label,
+            threads,
+            compile_ms,
+            final_arrays,
         })
     }
 
-    /// Same compilation, but executions pin HELIX_NTHREADS=p (the parallel
-    /// variant). The plan is baked at compile time; the runtime honours the
-    /// env override per dispatch, so ONE engine serves the whole sweep.
-    pub fn new_parallel(src: &str, p: usize) -> Result<Self, String> {
-        let mut v = Self::new(src, false)?;
-        v.label = "native-par";
-        v.threads = Some(p);
-        Ok(v)
+    /// Parallel regions the compiled engine can dispatch.
+    ///
+    /// `0` proves the variant is sequential no matter what its plan said:
+    /// the sequential baseline is supposed to read `0` here, and a parallel
+    /// variant is supposed to read at least `1`.
+    #[must_use]
+    pub fn region_count(&self) -> usize {
+        self.engine.region_count()
+    }
+
+    /// Milliseconds this variant's Cranelift compile took, measured once.
+    #[must_use]
+    pub fn compile_ms(&self) -> f64 {
+        self.compile_ms
+    }
+
+    /// Executes the machine code once with the print sink captured, leaving
+    /// the JIT host heap intact so the caller can still snapshot final array
+    /// state before [`helix_backend::reset_host_heap`] reclaims it.
+    fn run_captured(&self) -> (Vec<String>, Result<(), String>) {
+        helix_backend::engine::arm_trap_recorder();
+        helix_backend::engine::capture_prints(|| self.engine.run_main())
     }
 
     /// One full native execution.
     ///
+    /// The checksum is the interpreter's FULL state witness: every printed
+    /// line (folded with the shared [`rust_twins::printed_checksum`]) followed
+    /// by the arrays `main` leaves bound, encoded with the interpreter's own
+    /// canonical byte encoder. A parallel kernel that prints the right values
+    /// and corrupts memory therefore fails a parity comparison instead of
+    /// passing it.
+    ///
     /// # Errors
-    /// Runtime trap or execution failure, as text.
+    /// Runtime trap, execution failure, or a program whose final-array shape
+    /// the JIT host heap cannot witness — the last is reported rather than
+    /// silently falling back to a printed-lines-only checksum.
     pub fn execute(&self) -> Result<RunOutputLike, String> {
-        helix_backend::engine::arm_trap_recorder();
-        let (printed, result) = helix_backend::engine::capture_prints(|| self.engine.run_main());
+        let (printed, result) = self.run_captured();
+        let images = helix_backend::engine::live_array_images();
         helix_backend::reset_host_heap(); // reclaim this run's arrays
         result?;
         if let Some((code, a, b)) = helix_backend::engine::take_last_trap() {
             return Err(format!("runtime trap code={code} at ({a},{b})"));
         }
-        // Match the interpreter's checksum definition loosely: bench parity is
-        // asserted on printed lines; checksums recomputed FNV-1a style here.
-        let mut checksum = 0xcbf29ce484222325u64;
-        for line in &printed {
-            for byte in line.bytes().chain(std::iter::once(b'\n')) {
-                checksum ^= u64::from(byte);
-                checksum = checksum.wrapping_mul(0x100000001b3);
+        let checksum = self.full_state_checksum(&printed, &images)?;
+        Ok(RunOutputLike { printed, checksum })
+    }
+
+    /// Folds printed lines plus final arrays into the interpreter's FNV-1a
+    /// stream.
+    ///
+    /// The pairing of host allocations to array bindings is by position: the
+    /// JIT allocates `main`'s root-scope arrays in declaration order, and the
+    /// interpreter folds them in ascending symbol order — the same order. A
+    /// count or width mismatch means some other allocation (a callee's, one
+    /// made inside a loop) is in the heap, so the stream could not be the
+    /// interpreter's and the run reports that instead of guessing.
+    ///
+    /// # Errors
+    /// A host allocation count or size that does not match what the IR says
+    /// `main` leaves bound, which makes the interpreter's stream unreachable.
+    fn full_state_checksum(
+        &self,
+        printed: &[String],
+        images: &[(usize, Vec<u8>)],
+    ) -> Result<u64, String> {
+        if images.len() != self.final_arrays.len() {
+            return Err(format!(
+                "cannot witness final array state: main leaves {} array binding(s) bound but \
+                 the JIT host heap holds {} live allocation(s) — the full-state checksum would \
+                 not be the interpreter's, so no checksum is reported",
+                self.final_arrays.len(),
+                images.len()
+            ));
+        }
+        let mut checksum = rust_twins::printed_checksum(printed);
+        for (elem, (elements, bytes)) in self.final_arrays.iter().zip(images) {
+            let width = elem_byte_width(*elem);
+            if bytes.len() != width * *elements {
+                return Err(format!(
+                    "cannot witness final array state: an array of {elements} element(s) \
+                     should occupy {} bytes but the JIT host heap holds {}",
+                    width * *elements,
+                    bytes.len()
+                ));
+            }
+            for chunk in bytes.chunks_exact(width) {
+                let value = match elem {
+                    ElemTy::I32 => {
+                        Value::I32(i32::from_le_bytes(chunk.try_into().unwrap_or([0; 4])))
+                    }
+                    ElemTy::I64 => {
+                        Value::I64(i64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])))
+                    }
+                    ElemTy::F32 => {
+                        Value::F32(f32::from_le_bytes(chunk.try_into().unwrap_or([0; 4])))
+                    }
+                    ElemTy::F64 => {
+                        Value::F64(f64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])))
+                    }
+                    // The JIT stores a bool as a single byte, which is already
+                    // the interpreter's canonical 0/1 encoding.
+                    ElemTy::Bool => Value::Bool(chunk.first().is_some_and(|&b| b != 0)),
+                };
+                // The interpreter's own canonical encoder, so the byte stream
+                // is identical by construction rather than by coincidence.
+                value.hash_bits_into(&mut checksum);
             }
         }
-        Ok(RunOutputLike { printed, checksum })
+        Ok(checksum)
     }
 }
 
@@ -318,12 +530,100 @@ impl ExecVariant for NativeVariant {
         self.label
     }
 
+    fn compile_ms(&self) -> f64 {
+        self.compile_ms
+    }
+
     fn run_once(&self) -> Result<RunOutputLike, String> {
         let _guard = self
             .threads
             .map(|p| env_guard("HELIX_NTHREADS", &p.to_string()));
         self.execute()
     }
+
+    /// Timed batches skip the state checksum.
+    ///
+    /// Folding every final array into an FNV-1a stream costs as much as the
+    /// kernel itself at campaign sizes, and it is a correctness obligation,
+    /// not part of steady-state execution. The trait's default would call
+    /// [`run_once`] and therefore measure the checksum; overriding it keeps
+    /// the numbers honest. Correctness is enforced separately, once per kernel,
+    /// by the campaign's parity gate.
+    fn time_batch(&self, reps: u32) -> Result<std::time::Duration, String> {
+        let _guard = self
+            .threads
+            .map(|p| env_guard("HELIX_NTHREADS", &p.to_string()));
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            let (printed, result) = self.run_captured();
+            std::hint::black_box(&printed);
+            helix_backend::reset_host_heap();
+            result?;
+            if let Some((code, a, b)) = helix_backend::engine::take_last_trap() {
+                return Err(format!("runtime trap code={code} at ({a},{b})"));
+            }
+        }
+        Ok(start.elapsed())
+    }
+}
+
+/// Byte width the JIT host stores one element of `elem` in.
+///
+/// Mirrors `helix_backend::lower::elem_size`, the value the lowering passes to
+/// `helix_zeros` when it allocates the buffer. Every width agrees with what
+/// the interpreter folds for that type, so the raw bytes can be re-read as
+/// values and re-encoded with the interpreter's own encoder.
+fn elem_byte_width(elem: ElemTy) -> usize {
+    match elem {
+        ElemTy::I32 | ElemTy::F32 => 4,
+        ElemTy::I64 | ElemTy::F64 => 8,
+        ElemTy::Bool => 1,
+    }
+}
+
+/// Element types of the arrays `main` leaves bound in its root scope, in
+/// ascending symbol order — exactly the set, and the order, the interpreter
+/// folds into the array half of its state checksum.
+///
+/// A `zeros` call qualifies when its block dominates `main`'s exit: that is
+/// the static shape of "still bound when the run ends". Nested scopes are
+/// popped by the interpreter before the checksum is taken, and a call inside
+/// a loop body or an `if` arm does not dominate the exit, so both are excluded
+/// — mirroring the rule the wasm emitter documents for the same stream.
+fn folded_array_elem_tys(main: &helix_ir::FuncIr) -> Vec<ElemTy> {
+    let Some(exit) = main
+        .blocks
+        .iter()
+        .position(|b| matches!(b.term, helix_ir::Term::Return(_)))
+    else {
+        return Vec::new();
+    };
+    let doms = helix_ir::dominators(main);
+    let exit = helix_ir::BlockId(exit as u32);
+    let mut locals: Vec<helix_ir::LocalId> = main
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| doms.dominates(helix_ir::BlockId(*index as u32), exit))
+        .flat_map(|(_, block)| {
+            block
+                .insts
+                .iter()
+                .filter_map(|inst| match inst {
+                    helix_ir::Inst::Call(call) if call.callee == "zeros" => {
+                        call.arr_refs.first().copied()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    locals.sort_unstable_by_key(|local| local.0);
+    locals.dedup();
+    locals
+        .iter()
+        .filter_map(|local| main.types.elem_ty(*local))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +647,12 @@ pub struct VariantResult {
     pub reps_per_sample: u32,
     /// True when CV > 5% forced one rerun.
     pub reran_for_cv: bool,
+    /// Cranelift compile time of this variant, milliseconds, measured once at
+    /// construction. `0.0` for the interpreter, which has no compile step.
+    /// Reported separately from `median_ms` so a one-off compile cost never
+    /// contaminates steady-state execution numbers.
+    #[serde(default)]
+    pub compile_ms: f64,
 }
 
 /// One speedup/efficiency row of a thread sweep.
@@ -525,40 +831,34 @@ struct PlanView {
     loops_analyzed: usize,
 }
 
-/// Runs the analysis pipeline on `src` and collects [`PlanView`].
+/// Runs the shared compile pipeline on `src` and collects [`PlanView`].
+///
+/// The plan comes from the OPTIMIZED IR — the same IR `native-par` executes —
+/// so the gate judges what actually runs rather than a pre-optimizer snapshot.
 fn analyze_plan(src: &str) -> PlanView {
     let empty = PlanView {
         approved: Vec::new(),
         loops_analyzed: 0,
     };
-    let prog = match helix_syntax::parse_str(src) {
-        Ok(p) => p,
-        Err(_) => return empty,
+    let Ok(units) = helix_artifact::prepare_pipeline(src) else {
+        return empty;
     };
-    let typed = match helix_sema::check(&prog) {
-        Ok(t) => t,
-        Err(_) => return empty,
-    };
-    let mut funcs = helix_ir::build(&typed);
-    for f in &mut funcs {
-        helix_ir::to_ssa(f);
-    }
-    let loops: Vec<_> = funcs.iter().map(helix_analysis::find_loops).collect();
-    let total: usize = loops.iter().map(|l| l.loops.len()).sum();
-    let reports: Vec<_> = funcs
-        .iter()
-        .zip(&loops)
-        .map(|(f, l)| helix_analysis::analyze(f, l))
-        .collect();
-    let plan = helix_analysis::build_plan(&funcs, &loops, &reports);
-    let approved = plan
+    let total: usize = units.loops.iter().map(|l| l.loops.len()).sum();
+    let approved = units
+        .plan
         .regions
         .iter()
         .filter_map(|r| {
             // RegionDesc carries the loop's HEADER BLOCK; LoopReport is keyed
             // by the loop FOREST id, so resolve header -> loop -> report.
-            let lp = loops.get(r.func_idx)?.loops.iter().find(|l| l.header == r.header)?;
-            reports
+            let lp = units
+                .loops
+                .get(r.func_idx)?
+                .loops
+                .iter()
+                .find(|l| l.header == r.header)?;
+            units
+                .reports
                 .get(r.func_idx)?
                 .iter()
                 .find(|rep| rep.loop_id == lp.id)
@@ -594,9 +894,10 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
                 .approved
                 .iter()
                 .any(|v| matches!(v, helix_analysis::Verdict::SafeParallel)),
-            ExpectedVerdict::ReductionParallel => view.approved.iter().any(|v| {
-                matches!(v, helix_analysis::Verdict::ReductionParallel(_))
-            }),
+            ExpectedVerdict::ReductionParallel => view
+                .approved
+                .iter()
+                .any(|v| matches!(v, helix_analysis::Verdict::ReductionParallel(_))),
             _ => view.approved.is_empty(),
         };
         assert!(
@@ -622,14 +923,19 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
     assert_parity_all_variants(kernel, config);
 
     let mut out = Vec::new();
-    for size in kernel.sizes {
-        let src = kernel.source_at_size(*size);
+    let sizes = selected_sizes(kernel, config).unwrap_or_else(|e| {
+        panic!("{}: {e}", kernel.name);
+    });
+    let samples = config.samples();
+    let sweep = config.effective_thread_sweep();
+    for size in sizes {
+        let src = kernel.source_at_size(size);
         let mut variants: Vec<Box<dyn ExecVariant>> = Vec::new();
 
         // Interpreter only up to `interp_max_size`: interpreting millions of
         // iterations costs minutes per sample and adds no information (the
         // interp/native ratio is read from the largest shared size).
-        if *size <= kernel.interp_max_size {
+        if size <= kernel.interp_max_size {
             match interp_variant(&src) {
                 Ok(v) => variants.push(Box::new(v)),
                 Err(e) => panic!(
@@ -654,10 +960,9 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
         }
         // Parallel variant: same compiled plan, executions pin HELIX_NTHREADS
         // to a mid-range count (the efficiency table carries the full sweep).
-        if has_regions && config.thread_sweep.len() > 1 {
-            let hw = std::thread::available_parallelism().map_or(1, |n| n.get());
-            let p = config
-                .thread_sweep
+        if has_regions && sweep.len() > 1 {
+            let hw = available_parallelism();
+            let p = sweep
                 .iter()
                 .copied()
                 .filter(|&x| x > 1)
@@ -681,15 +986,14 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
         // Round-robin sampling across all present variants. Any execution
         // error during pilot/warmup/sampling aborts: never sample failing code.
         let names: Vec<&str> = variants.iter().map(|v| v.name()).collect();
-        let measurements = timing::run_interleaved(&names, |vi, reps| {
-            variants[vi].time_batch(reps)
-        })
-        .unwrap_or_else(|e| {
-            panic!(
-                "kernel {} size {} failed during timing: {e}",
-                kernel.name, size
-            )
-        });
+        let measurements =
+            timing::run_interleaved_n(&names, |vi, reps| variants[vi].time_batch(reps), samples)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "kernel {} size {} failed during timing: {e}",
+                        kernel.name, size
+                    )
+                });
 
         let baseline = measurements
             .first()
@@ -698,7 +1002,8 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
         let vrs: Vec<VariantResult> = measurements
             .iter()
             .zip(&names)
-            .map(|(m, name)| VariantResult {
+            .zip(&variants)
+            .map(|((m, name), variant)| VariantResult {
                 name: (*name).to_string(),
                 median_ms: m.median_ms,
                 min_ms: m.min_ms,
@@ -706,19 +1011,20 @@ fn measure_kernel(kernel: &KernelDef, config: &BenchConfig) -> Vec<KernelPoint> 
                 samples_ms: m.samples_ms.clone(),
                 reps_per_sample: m.reps_per_sample,
                 reran_for_cv: m.reran_for_cv,
+                compile_ms: variant.compile_ms(),
             })
             .collect();
 
         // Thread sweep for parallel candidates: p=1 vs p via HELIX_NTHREADS.
         let efficiency = if kernel.is_parallel_candidate() {
-            sweep_efficiency(kernel, &src, *size, config)
+            sweep_efficiency(kernel, &src, size, config)
         } else {
             Vec::new()
         };
 
         out.push(KernelPoint {
             kernel: kernel.name.to_string(),
-            n: *size,
+            n: size,
             variants: vrs,
             speedups: measurements
                 .iter()
@@ -749,6 +1055,21 @@ fn verdict_labels(verdicts: &[helix_analysis::Verdict]) -> String {
 /// the kernel's tolerance: the interpreter, native-seq, and every pinned
 /// native-par<P> the thread sweep / mid-range point construct. The first
 /// failing variant aborts with its name.
+///
+/// Two comparisons are made per variant, and the second is the stronger one:
+///
+/// * **printed lines** must match the oracle lines under the kernel's
+///   tolerance (epsilon for FP reductions, exact otherwise);
+/// * **full-state checksum** (printed lines + the arrays `main` leaves bound)
+///   must match the interpreter's checksum exactly for `interp` and
+///   `native-seq`. A parallel variant is checksum-compared only when the
+///   kernel declares no tolerance: a nonzero documented tolerance means
+///   parallel partial sums legitimately reassociate FP addition, so its array
+///   and printed values may differ in the last bits. The printed-line check
+///   still guards every parallel variant's visible output in that case.
+///
+/// Without the checksum comparison a kernel that computes the right printed
+/// values and corrupts memory would pass the gate on printed lines alone.
 fn assert_parity_all_variants(kernel: &KernelDef, config: &BenchConfig) {
     let src = &kernel.correctness_source;
     let oracle: Vec<String> = kernel
@@ -761,7 +1082,10 @@ fn assert_parity_all_variants(kernel: &KernelDef, config: &BenchConfig) {
     let mut shapes: Vec<(String, Box<dyn ExecVariant>)> = Vec::new();
     match interp_variant(src) {
         Ok(v) => shapes.push(("interp".to_string(), Box::new(v))),
-        Err(e) => panic!("{}: interp parity variant failed to compile: {e}", kernel.name),
+        Err(e) => panic!(
+            "{}: interp parity variant failed to compile: {e}",
+            kernel.name
+        ),
     }
     // native-seq: required whenever the verdict implies parallel capability;
     // otherwise optional but still parity-checked WHEN PRESENT — the campaign
@@ -778,13 +1102,13 @@ fn assert_parity_all_variants(kernel: &KernelDef, config: &BenchConfig) {
     // Every pinned parallel variant the campaign constructs: the mid-range P
     // of the timed point plus EACH p of the efficiency sweep (including p=1,
     // which sweep_efficiency builds as its pinned baseline).
+    let sweep = config.effective_thread_sweep();
     let mut pins: Vec<usize> = Vec::new();
     if has_regions {
-        let hw = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let hw = available_parallelism();
         let cap = config.max_threads.min(hw.max(1));
-        if config.thread_sweep.len() > 1 {
-            let mid = config
-                .thread_sweep
+        if sweep.len() > 1 {
+            let mid = sweep
                 .iter()
                 .copied()
                 .filter(|&x| x > 1)
@@ -792,7 +1116,7 @@ fn assert_parity_all_variants(kernel: &KernelDef, config: &BenchConfig) {
                 .unwrap_or(hw.min(config.max_threads).max(2));
             pins.push(mid);
         }
-        for p in &config.thread_sweep {
+        for p in &sweep {
             if *p >= 1 && *p <= cap && !pins.contains(p) {
                 pins.push(*p);
             }
@@ -807,6 +1131,20 @@ fn assert_parity_all_variants(kernel: &KernelDef, config: &BenchConfig) {
             ),
         }
     }
+
+    // The interpreter IS the oracle for the checksum comparison: its run
+    // already produced the full-state stream this gate compares against.
+    let interp = shapes
+        .iter()
+        .find(|(label, _)| label == "interp")
+        .map(|(_, v)| v.run_once())
+        .expect("interp shape is always present")
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: parity ABORT — variant [interp] failed at correctness size: {e}",
+                kernel.name
+            )
+        });
 
     for (label, variant) in &shapes {
         let out = variant.run_once().unwrap_or_else(|e| {
@@ -825,6 +1163,21 @@ fn assert_parity_all_variants(kernel: &KernelDef, config: &BenchConfig) {
             oracle,
             kernel.tolerance.name()
         );
+        // Full-state parity: mandatory for the interpreter (it is the oracle)
+        // and for the truly-sequential native build. A parallel variant only
+        // has to agree when the kernel documents no reassociation slack.
+        let is_oracle = label == "interp";
+        let is_sequential = label == "native-seq";
+        let exact_kernel = kernel.tolerance == Tolerance::Exact;
+        if is_oracle || is_sequential || (label.starts_with("native-par") && exact_kernel) {
+            assert_eq!(
+                out.checksum, interp.checksum,
+                "{}: parity ABORT — variant [{label}] full-state checksum \
+                 {:016x} differs from the interpreter's {:016x} (printed lines \
+                 matched, so the divergence is in main's final arrays)",
+                kernel.name, out.checksum, interp.checksum
+            );
+        }
     }
 }
 
@@ -864,11 +1217,9 @@ fn sweep_efficiency(
     size: i64,
     config: &BenchConfig,
 ) -> Vec<EfficiencyRow> {
-    let hw = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let hw = available_parallelism();
     let ps: Vec<usize> = config
-        .thread_sweep
+        .effective_thread_sweep()
         .iter()
         .copied()
         .filter(|p| *p >= 1 && *p <= config.max_threads.min(hw.max(1)))
@@ -879,9 +1230,10 @@ fn sweep_efficiency(
 
     // Every row (INCLUDING p=1) gets its own variant whose executions pin
     // HELIX_NTHREADS=p. Pinning the baseline matters: without it the engine's
-    // baked-in hint (8) would run, and since the env override CAPS the hint,
-    // every p >= 8 would tie the baseline at ~1.0x — exactly the flat-sweep
-    // bug this replaces.
+    // baked-in hint would run, and any env override that merely caps the hint
+    // would tie every row above it at ~1.0x — exactly the flat-sweep bug this
+    // replaces. The region hint is now deliberately unreachable, so the pin
+    // is what a row measures.
     let make_variant = |p: usize| -> Box<dyn ExecVariant> {
         NativeVariant::new_parallel(src, p)
             .map(|v| Box::new(v) as Box<dyn ExecVariant>)
@@ -893,11 +1245,12 @@ fn sweep_efficiency(
                 )
             })
     };
+    let samples = config.samples();
     let mut rows = Vec::with_capacity(ps.len());
     let mut base = f64::NAN;
     for &p in &ps {
         let variant = make_variant(p);
-        let med = timing::measure_with_reps(|r| variant.time_batch(r))
+        let med = timing::measure_with_reps_n(|r| variant.time_batch(r), samples)
             .unwrap_or_else(|e| {
                 panic!(
                     "kernel {} size {} failed during timing \
@@ -962,8 +1315,24 @@ impl Drop for EnvGuard {
 /// # Errors
 /// Returns write failures; measurement itself never fails hard.
 pub fn campaign_main(out_dir: &Path) -> Result<(), String> {
-    let config = BenchConfig::default();
-    println!("HELIX benchmark campaign starting");
+    campaign_main_with(out_dir, false)
+}
+
+/// [`campaign_main`] with an explicit quick-mode flag.
+///
+/// Quick mode runs the SAME [`run_campaign`] path with
+/// [`BenchConfig::quick`](crate::BenchConfig::quick) set, so the only
+/// difference is how much is measured — never how it is measured.
+///
+/// # Errors
+/// Returns write failures; measurement itself never fails hard.
+pub fn campaign_main_with(out_dir: &Path, quick: bool) -> Result<(), String> {
+    let config = BenchConfig {
+        quick,
+        ..BenchConfig::default()
+    };
+    let kind = if quick { "quick " } else { "" };
+    println!("HELIX {kind}benchmark campaign starting");
     let report = run_campaign(&config);
     println!("{}", report.meta.banner());
 
@@ -981,17 +1350,18 @@ pub fn campaign_main(out_dir: &Path) -> Result<(), String> {
 
     // Console summary table: absolute numbers first (methodology rec. 9).
     println!(
-        "{:<22}{:>12}{:>12}{:>10}",
-        "kernel/N", "variant", "median ms", "CV %"
+        "{:<22}{:>12}{:>12}{:>10}{:>11}",
+        "kernel/N", "variant", "median ms", "CV %", "compile ms"
     );
     for p in &report.points {
         for v in &p.variants {
             println!(
-                "{:<22}{:>12}{:>12.3}{:>10.2}",
+                "{:<22}{:>12}{:>12.3}{:>10.2}{:>11.3}",
                 format!("{}/{}", p.kernel, p.n),
                 v.name,
                 v.median_ms,
-                v.cv * 100.0
+                v.cv * 100.0,
+                v.compile_ms
             );
         }
     }
