@@ -166,6 +166,11 @@ fn optimized_i32_arithmetic_preserves_width() {
         expected,
         vec!["-2147483648", "2147483647", "-2", "-1073741823", "-1"]
     );
+    // The JIT host heap, trap recorder and dispatch record are process-global
+    // and cargo runs this binary's tests on parallel threads: hold the lock
+    // for every direct engine compile+run (the jit_lines helpers hold it too,
+    // so never acquire it around a call into them — that deadlocks).
+    let _guard = helix_backend::testutil::serial_lock();
     let mut irs = compile_ir(src);
     for f in &mut irs {
         helix_ir::run_passes_to_fixpoint(f);
@@ -1074,6 +1079,10 @@ fn array_only_parallel_region_writes_correctly() {
     let expected = vec!["0".to_string(), "100".to_string(), "198".to_string()];
     assert_eq!(jit_lines(src), expected);
 
+    // The plan path below runs its own engine: hold the process-global lock
+    // (jit_lines above already released it — acquiring it now cannot re-enter).
+    let _guard = helix_backend::testutil::serial_lock();
+
     // And through the actual plan (this loop is canonical + safe => region).
     let irs = compile_ir(src);
     let plan = analyze_plan(&irs);
@@ -1118,6 +1127,8 @@ fn zeros_inside_parallel_loop_still_correct() {
         plan.regions.is_empty(),
         "per-iteration allocation must be conservatively vetoed"
     );
+    // Direct engine run: hold the process-global JIT lock (see above).
+    let _guard = helix_backend::testutil::serial_lock();
 
     // The program must still COMPILE and match the interpreter byte-for-byte
     // on the sequential path the veto selects.
@@ -1163,6 +1174,8 @@ fn dead_header_temporary_still_parallelizes() {
         1,
         "dead header temp must not veto DOALL"
     );
+    // Direct engine run: hold the process-global JIT lock (see above).
+    let _guard = helix_backend::testutil::serial_lock();
     let ast = helix_syntax::parse_str(src).expect("parse");
     let typed = helix_sema::check(&ast).expect("sema");
     let interp = helix_engine::run_with_source(src, &typed)
@@ -1201,6 +1214,8 @@ fn invariant_offset_sole_write_still_parallelizes() {
         1,
         "invariant-offset sole write must not veto DOALL"
     );
+    // Direct engine run: hold the process-global JIT lock (see above).
+    let _guard = helix_backend::testutil::serial_lock();
     let ast = helix_syntax::parse_str(src).expect("parse");
     let typed = helix_sema::check(&ast).expect("sema");
     let interp = helix_engine::run_with_source(src, &typed)
