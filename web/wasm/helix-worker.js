@@ -56,7 +56,7 @@ const ieeeBits = (value, width) => {
   const view = new DataView(new ArrayBuffer(width));
   if (width === 4) view.setFloat32(0, value, true);
   else view.setFloat64(0, value, true);
-  return view.getBigUint64(0, true);
+  return width === 4 ? BigInt(view.getUint32(0, true)) : view.getBigUint64(0, true);
 };
 
 /** The spec wording of every trap payload code, operand-interpolated where the

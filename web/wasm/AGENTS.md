@@ -40,7 +40,7 @@ cannot claim.
   threaded. Recorded campaign evidence keeps its provenance stamps and stays
   visibly separate from local measurements.
 - Static mode (`web/app.js`): when `/api/*` is unreachable the app fetches
-  `/data/examples/<name>.hx` and compiles through `buildArtifact`; the Pages
+  `data/examples/<name>.hx` relative to the site directory and compiles through `buildArtifact`; the Pages
   deploy ships that directory from the repo's `examples/`.
 
 ## Work Guidance
@@ -52,6 +52,7 @@ cannot claim.
   samples exclude instantiation.
 - The editor draft is newer intent than any in-flight request: preserve it
   across superseded compiles and measurements.
+- The browser work filter resolves literal scalar sizes, charges allocations and loops, and refuses unknown allocation lengths. It is a UX estimate; the worker deadline remains the execution bound.
 
 ## Verification
 

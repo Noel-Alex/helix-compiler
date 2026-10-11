@@ -1,4 +1,4 @@
-import { runHelixInBrowser, estimatedBrowserWork } from '/wasm/helix-browser.js';
+import { runHelixInBrowser, estimatedBrowserWork } from './wasm/helix-browser.js';
 
 const PRESETS = {
   safe: `fn main() {

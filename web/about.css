@@ -1,5 +1,5 @@
-@font-face { font-family: "Helix Pixel"; src: url("/fonts/silkscreen-400.ttf") format("truetype"); font-weight: 400; font-display: swap; }
-@font-face { font-family: "Helix Pixel"; src: url("/fonts/silkscreen-700.ttf") format("truetype"); font-weight: 700; font-display: swap; }
+@font-face { font-family: "Helix Pixel"; src: url("./fonts/silkscreen-400.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Helix Pixel"; src: url("./fonts/silkscreen-700.ttf") format("truetype"); font-weight: 700; font-display: swap; }
 
 :root { color-scheme: light; --aqua: #58f4ef; --aqua-deep: #16b9b5; --aqua-dark: #087d80; --ink: #13242b; --ink-soft: #3e555a; --yellow: #ffe45b; --yellow-deep: #e3ae22; --paper: #fff9df; --paper-shadow: #f2e9c6; --coral: #c94f3d; --green: #16815e; --lilac: #6247a6; --pixel: "Helix Pixel", monospace; --body: "Trebuchet MS", "Segoe UI", sans-serif; }
 * { box-sizing: border-box; }

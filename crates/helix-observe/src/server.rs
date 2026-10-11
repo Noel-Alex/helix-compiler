@@ -505,11 +505,11 @@ fn standalone_export(name: &str, art: &CompileArtifact) -> String {
     let css = std::str::from_utf8(STYLE_CSS)
         .unwrap_or("")
         .replace(
-            "/fonts/silkscreen-400.ttf",
+            "./fonts/silkscreen-400.ttf",
             &format!("data:font/ttf;base64,{}", base64(FONT_400)),
         )
         .replace(
-            "/fonts/silkscreen-700.ttf",
+            "./fonts/silkscreen-700.ttf",
             &format!("data:font/ttf;base64,{}", base64(FONT_700)),
         );
 
@@ -551,11 +551,11 @@ window.__INLINE_ARTIFACT_JSON__ = {safe_json};
     // Inline the style sheet, then swap the two script tags for
     // shim + d3 + app.js, all inline, app.js last.
     let shell = shell.replace(
-        r#"<link rel="stylesheet" href="/style.css">"#,
+        r#"<link rel="stylesheet" href="./style.css">"#,
         &format!("<style>\n{css}\n</style>"),
     );
     let mut out = String::with_capacity(shell.len() + shim.len() + D3_JS.len() + APP_JS.len() + 64);
-    match shell.find(r#"<script src="/vendor/d3.v7.min.js"></script>"#) {
+    match shell.find(r#"<script src="./vendor/d3.v7.min.js"></script>"#) {
         Some(pos) => {
             out.push_str(&shell[..pos]);
             out.push_str(&shim);
@@ -564,7 +564,7 @@ window.__INLINE_ARTIFACT_JSON__ = {safe_json};
             out.push_str("\n</script>\n<script>\n");
             out.push_str(&script_safe(&String::from_utf8_lossy(APP_JS)));
             out.push_str("\n</script>");
-            let tail = pos + r#"<script src="/vendor/d3.v7.min.js"></script>"#.len();
+            let tail = pos + r#"<script src="./vendor/d3.v7.min.js"></script>"#.len();
             // Skip the original /app.js tag (now inlined above).
             let tail = shell[tail..]
                 .find("</script>")

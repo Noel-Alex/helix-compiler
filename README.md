@@ -84,7 +84,7 @@ its provenance note.
 
 ## Try it
 
-**No install needed:** once GitHub Pages is enabled for this repository, the deployed site (the URL the Pages settings page shows) runs the full compiler in-browser with no server at all. Locally the Observatory is unchanged: `cargo run --release -p helix-cli -- observe`.
+**No install needed:** [Open the HELIX Observatory](https://noel-alex.github.io/helix-compiler/) to run the compiler in your browser. Start with **small_n**, inspect the pipeline, then open **BENCH → Measure both engines in browser WASM**. Locally: `cargo run --release -p helix-cli -- observe`.
 
 ```bash
 # one-time: put `helix` on your PATH (or prefix every command with cargo run --release -p helix-cli --)
@@ -109,6 +109,8 @@ New to the project? The five-minute tour is in [docs/guide.md](docs/guide.md).
 ## Run it in your browser
 
 The browser lab compiles the same optimized SSA IR the local pipeline produces to a real WebAssembly module (Cranelift cannot target wasm, so emission is its own stage) and executes that module beside the reference interpreter with printed-line and FNV checksum parity — the checksum stream is every printed line plus the arrays still visible at the end of `main`, the interpreter's definition. The native Cranelift JIT and the multicore parallel runtime remain host-only features of the local Observatory.
+
+Large bundled inputs skip browser execution to keep the page responsive; their recorded native campaign remains inspectable. Browser measurement labels state their timing scopes: interpreter samples include parsing/checking and checksum, while compiled samples time execution after compilation and exclude the final-array checksum.
 
 ## Layout
 

@@ -1,7 +1,7 @@
 /* ============================================================
    HELIX Observatory — app.js
    Vanilla-JS renderer for the CompileArtifact JSON (schema v1).
-   No network calls except /api/*. d3 (vendored) is used only for
+   Uses the observer API or the browser WASM bridge on static hosting. d3 (vendored) is used only for
    the AST tidy tree and pan/zoom.
    ============================================================ */
 'use strict';
@@ -167,7 +167,7 @@ function renderExecReadout(art) {
   if (run?.status === 'running') {
     const pending = document.createElement('p');
     pending.className = 'exec-readout-pending';
-    pending.textContent = 'Running the reference interpreter in this browser…';
+    pending.textContent = 'Running the interpreter and compiled WebAssembly in this browser…';
     panel.appendChild(pending);
     return;
   }
@@ -225,19 +225,17 @@ function renderExecReadout(art) {
     check.textContent = `checksum ${checksum}`;
     foot.appendChild(check);
   }
-  if (result?.ok && result.checksum && serverExec?.checksum) {
+  if (!state.static && result?.ok && result.checksum && serverExec?.checksum) {
     const parity = document.createElement('span');
     const same = result.checksum === serverExec.checksum;
     parity.className = same ? 'exec-parity is-ok' : 'exec-parity is-error';
     parity.textContent = same ? 'matches observer output' : 'observer/WASM output differs';
     foot.appendChild(parity);
   }
-  // Server-side timing sample (interactive-sized only; benchmark-sized runs
-  // skip execution). Reference-only — timer precision is OS-dependent.
-  const serverTiming = serverExec?.timings_ms?.[0];
-  if (Number.isFinite(serverTiming) && serverTiming >= 0) {
+  const timing = browserOk ? result.elapsedMs : (!state.static ? serverExec?.timings_ms?.[0] : null);
+  if (Number.isFinite(timing) && timing >= 0) {
     const t = document.createElement('code');
-    t.textContent = `interp ${serverTiming < 1 ? serverTiming.toFixed(3) : serverTiming.toFixed(1)} ms`;
+    t.textContent = `${browserOk ? 'WASM' : 'interp'} ${timing < 1 ? timing.toFixed(3) : timing.toFixed(1)} ms`;
     foot.appendChild(t);
   }
   if (foot.childElementCount) panel.appendChild(foot);
@@ -1400,7 +1398,7 @@ const BENCH_COLORS = ['#8b949e', '#61afef', '#00c896', '#56b4e9', '#e69f00'];
 /** Paint the variant bars and the efficiency table for a bench-like object.
  *  One painter serves the recorded campaign chart and the local two-engine
  *  chart, so both read the same way: bars sorted slowest at top, value labels
- *  in ms, and "× vs best" chips measured against the fastest bar shown. */
+ *  in ms, and "× slower than fastest" chips measured against the fastest bar shown. */
 function renderBenchChart(bench, hosts) {
   const chart = hosts.chart;
   const effWrap = hosts.eff;
@@ -1495,7 +1493,7 @@ function renderBenchChart(bench, hosts) {
         chip.setAttribute('x', padL + Math.max(toX(v.median_ms), 1.5) + 10);
         chip.setAttribute('y', y + barH / 2 - 8);
         chip.setAttribute('class', 'speedup-chip');
-        chip.textContent = `${fmt(speedup, 2)}× vs best`;
+        chip.textContent = `${fmt(speedup, 2)}× slower than fastest`;
         svg.appendChild(chip);
       }
     }
@@ -1578,18 +1576,13 @@ function renderBench(art) {
       measure.id = 'bench-measure';
       measure.className = 'btn bench-measure';
       measure.disabled = state.benchPending;
-      // A static build has no server measurement waiting behind the button, so
-      // the control measures both local engines instead of only the compiler's
-      // reference interpreter. Named examples keep their selection.
-      const bothEngines = !!state.static;
-      const onNamed = bothEngines && !state.fromCustom &&
+      // Static examples keep their selection and recorded evidence.
+      const onNamed = state.static && !state.fromCustom &&
         !!state.exampleName && state.exampleName !== '<adhoc>';
       measure.textContent = state.benchPending
-        ? (bothEngines ? 'measuring both engines…' : 'measuring in WASM…')
-        : (bothEngines ? 'Measure both engines in browser WASM' : 'Measure in browser WASM');
-      measure.title = bothEngines
-        ? 'Measure the reference interpreter and HELIX’s compiled WebAssembly module in this browser'
-        : 'Run seven bounded reference-interpreter samples in this browser';
+        ? 'measuring both engines…'
+        : 'Measure both engines in browser WASM';
+      measure.title = 'Measure the reference interpreter and HELIX’s compiled WebAssembly module in this browser';
       measure.addEventListener('click',
         onNamed ? () => measureNamedExample(state.exampleName) : measureCustom);
       empty.appendChild(measure);
@@ -1647,7 +1640,7 @@ function renderLocalBench(host, art, bench, withButton) {
   const local = state.localBench;
   const hasRecorded = !!bench && Array.isArray(bench.variants) && bench.variants.length > 0;
   // Nothing local to report and no local trigger to offer: keep it out.
-  if (!local && !(state.static && hasRecorded)) return;
+  if (!local && !hasRecorded) return;
   host.classList.remove('hidden');
 
   const heading = document.createElement('p');
@@ -1657,7 +1650,7 @@ function renderLocalBench(host, art, bench, withButton) {
 
   const intro = document.createElement('p');
   intro.className = 'bench-comparison-intro';
-  intro.textContent = 'Same source, both engines measured here just now: the interpreter is HELIX’s reference tree-walker compiled to WebAssembly; the compiled bar is the optimized SSA IR emitted as a WebAssembly module and executed in the same browser. No native code and no parallel execution took part in these numbers.';
+  intro.textContent = 'Same source, both engines measured here just now: the interpreter is HELIX’s reference tree-walker compiled to WebAssembly; the compiled bar is the optimized SSA IR emitted as a WebAssembly module and executed in the same browser. Interpreter timing includes parsing, checking, execution and checksum; compiled timing covers execution after compilation and excludes the final-array checksum. Native parallel results are in the recorded campaign above.';
   host.appendChild(intro);
 
   if (local) {
@@ -1695,7 +1688,7 @@ function renderLocalBench(host, art, bench, withButton) {
 
     const caption = document.createElement('p');
     caption.className = 'bench-local-caption';
-    caption.textContent = 'Both local medians · slowest at top · “× vs best” compares this pair only';
+    caption.textContent = 'Both local medians · slowest at top · “× slower than fastest” compares this pair only';
     host.appendChild(caption);
     const localChart = document.createElement('div');
     localChart.className = 'bench-chart';
@@ -1911,29 +1904,38 @@ async function fetchJSON(url, opts) {
 let wasmRunnerPromise;
 function loadBrowserRunner() {
   if (!wasmRunnerPromise) {
-    wasmRunnerPromise = import('/wasm/helix-browser.js');
+    wasmRunnerPromise = import('./wasm/helix-browser.js');
   }
   return wasmRunnerPromise;
 }
 
 async function hydrateBrowserExecution(art) {
   const runSeq = ++state.browserRunSeq;
-  const bridge = await loadBrowserRunner();
-  if (!browserPreviewAllowed(art, bridge.estimatedBrowserWork)) {
-    state.browserRun = art?.source && !art.diags_lex && !(art.diags_sem?.length)
-      ? {
-          status: 'skipped',
-          message: 'Browser preview skipped: this bundled source exceeds the responsive WASM preview budget. The recorded benchmark below is the authoritative measurement for its larger sizes.',
-        }
-      : null;
-    renderAll();
-    return;
-  }
-
-  state.browserRun = { status: 'running' };
-  renderExecReadout(art);
   try {
-    const result = await bridge.runHelixInBrowser(art.source);
+    const bridge = await loadBrowserRunner();
+    if (runSeq !== state.browserRunSeq || state.artifact !== art) return;
+    if (!browserPreviewAllowed(art, bridge.estimatedBrowserWork)) {
+      state.browserRun = art?.source && !art.diags_lex && !(art.diags_sem?.length)
+        ? {
+            status: 'skipped',
+            message: 'Browser preview skipped: this bundled source exceeds the responsive WASM preview budget. The recorded benchmark below is the authoritative measurement for its larger sizes.',
+          }
+        : null;
+      renderAll();
+      return;
+    }
+
+    state.browserRun = { status: 'running' };
+    renderExecReadout(art);
+    let result = await bridge.runHelixInBrowser(art.source);
+    if (result.ok) {
+      const compiled = await bridge.runCompiled(art.source, art.example);
+      if (!compiled.ok) throw new Error(compiled.message || 'compiled WebAssembly execution failed');
+      if (compiled.checksum !== result.checksum || JSON.stringify(compiled.printed) !== JSON.stringify(result.printed)) {
+        throw new Error('compiled WebAssembly output differs from the reference interpreter');
+      }
+      result = { ...result, engine: 'HELIX compiled WebAssembly · interpreter parity verified', elapsedMs: compiled.elapsed_ms };
+    }
     if (runSeq !== state.browserRunSeq || state.artifact !== art) return;
     state.browserRun = { status: 'done', result };
     renderAll();
@@ -1946,7 +1948,7 @@ async function hydrateBrowserExecution(art) {
         printed: [],
         checksum: null,
         message: `WASM preview unavailable: ${error.message}`,
-        engine: 'browser interpreter',
+        engine: 'browser WebAssembly',
       },
     };
     renderAll();
@@ -2088,7 +2090,7 @@ function beginArtifactRequest(compiling = false) {
 /** Static hosting: the deploy ships the repository examples as plain .hx
  *  files, and the bridge compiles them exactly like the observer would. */
 async function loadStaticExampleArtifact(name) {
-  const res = await fetch('/data/examples/' + encodeURIComponent(name) + '.hx');
+  const res = await fetch('./data/examples/' + encodeURIComponent(name) + '.hx');
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const source = await res.text();
   const bridge = await loadBrowserRunner();
@@ -2138,7 +2140,7 @@ function setArtifact(art, name, { hydrate = true } = {}) {
   state.cfgFn = 0;
   state.ssaFn = 0;
   renderAll();
-  if (hydrate) void hydrateBrowserExecution(art);
+  if (hydrate && !globalThis.__INLINE_ARTIFACT_JSON__) void hydrateBrowserExecution(art);
 }
 
 function renderAll() {
@@ -2154,7 +2156,7 @@ function renderAll() {
   crumb.classList.toggle('on', !!crumb.textContent);
 
   const backend = state.browserRun?.result?.ok
-    ? 'interp-wasm'
+    ? (/compiled WebAssembly/.test(state.browserRun.result.engine) ? 'compiled-wasm' : 'interp-wasm')
     : (art.exec?.backend_used ?? art.bench?.backend_used);
   const cb = $('#chip-backend');
   if (backend) {
@@ -2256,9 +2258,7 @@ async function measureCustom() {
 
   const requestSeq = beginArtifactRequest();
   state.benchPending = true;
-  state.benchMessage = state.static
-    ? 'measuring both engines: WASM interpreter and compiled wasm…'
-    : 'measuring seven bounded WASM interpreter samples…';
+  state.benchMessage = 'measuring both engines: WASM interpreter and compiled wasm…';
   renderBench(state.artifact);
   try {
     let art = state.artifact;
@@ -2279,16 +2279,12 @@ async function measureCustom() {
     }
     // Refuse oversized input before either engine starts, then measure the
     // reference interpreter first and the compiled module second.
-    let localBench = null;
-    const bridge = state.static ? await loadBrowserRunner() : null;
-    if (bridge) guardBrowserWorkBudget(bridge.estimatedBrowserWork(source));
     const measured = await measureBrowserSource(source);
     if (requestSeq !== state.requestSeq) return;
-    if (bridge) {
-      const compiled = await measureCompiledSource(bridge, source, '<adhoc>');
-      if (requestSeq !== state.requestSeq) return;
-      localBench = localBenchFromMeasurements(measured, compiled);
-    }
+    const bridge = await loadBrowserRunner();
+    const compiled = await measureCompiledSource(bridge, source, '<adhoc>');
+    if (requestSeq !== state.requestSeq) return;
+    const localBench = localBenchFromMeasurements(measured, compiled);
     // art.exec is independent observer evidence; browser results live in state.browserRun.
     art.bench = {
       kernel: '<adhoc>',
@@ -2311,9 +2307,7 @@ async function measureCustom() {
     state.browserRun = { status: 'done', result: measured.result };
     renderAll();
     gotoPhase('bench', true);
-    toast(state.static
-      ? 'measured both engines in this browser'
-      : 'custom WASM interpreter measurement complete');
+    toast('measured both engines in this browser');
   } catch (err) {
     if (requestSeq !== state.requestSeq) return;
     state.benchPending = false;
@@ -2327,7 +2321,6 @@ async function measureCustom() {
  *  builds use this as their only local evidence besides the recorded cards,
  *  so the selection (and every recorded provenance stamp above) is kept. */
 async function measureNamedExample(name) {
-  if (!state.static) return;
   const art = state.artifact;
   const source = art && art.example === name && typeof art.source === 'string' ? art.source : '';
   if (!source.trim()) {
@@ -2400,7 +2393,12 @@ function localBenchFromMeasurements(measured, compiled) {
       interpBytes: num(measured.result?.alloc_bytes),
       compiledBytes: num(compiled.heapBytes),
     },
-    parity: { same: interpChecksum === compiledChecksum, checksum: interpChecksum, compiledChecksum },
+    parity: {
+      same: interpChecksum != null && interpChecksum === compiledChecksum &&
+        JSON.stringify(measured.result?.printed) === JSON.stringify(compiled.result?.printed),
+      checksum: interpChecksum,
+      compiledChecksum,
+    },
   };
 }
 
@@ -2479,7 +2477,7 @@ function renderModeChrome() {
   if (note) {
     note.innerHTML = state.static
       ? 'Compiles in this browser via WebAssembly. After it compiles, open BENCH to measure both engines locally.'
-      : 'POSTs the buffer to <code>/api/run</code>. After it compiles, open BENCH to measure a bounded interpreter run.';
+      : 'Compiles through the local observer. Open BENCH to compare the interpreter and compiled WebAssembly in this browser.';
   }
   // Standalone HTML export is rendered by the observer's artifact endpoint, so
   // a static build keeps the control hidden with an explanatory title.
@@ -2507,7 +2505,7 @@ async function boot() {
   await loadBenchmarkCatalog();
   await loadExamples();
   // open on the strongest showcase that actually loaded, else the first entry
-  const preferred = ['scale', 'recurrence_reject', 'dot_reduction']
+  const preferred = ['small_n', 'recurrence_reject', 'dot_reduction']
     .map(name => $(`#example-list .ex-item[data-example="${CSS.escape(name)}"]`))
     .find(Boolean);
   const first = preferred ?? $('#example-list .ex-item');

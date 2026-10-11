@@ -2,6 +2,11 @@
 
 ## Setup (before audience)
 
+For a laptop-free presentation, open [the GitHub Pages Observatory](https://noel-alex.github.io/helix-compiler/).
+Use **small_n** for a live compiled WebAssembly run and **BENCH → Measure both engines in browser WASM** for a local comparison with checksum parity. Use **scale**, **recurrence_reject**, and **dot_reduction** to explain the proofs and recorded native campaign. Their large source inputs may skip browser execution; recorded native parallel results remain labelled with their original provenance.
+
+The local CLI setup below is optional for the Pages presentation.
+
 ```bash
 cargo build --release -p helix-cli
 ```
@@ -72,7 +77,7 @@ columns and the honest small-N case where threading loses.
 - `docs/research/` — verified Aug-2026 research digests (Cranelift APIs, dependence theory)
 - `docs/decisions/` — every design decision recorded
 - `docs/notes/` — course notes per topic (SSA, dependence theory, passes, runtime)
-- 425+ workspace tests across 10 crates
+- Workspace regression suite, including dependence soundness fuzzing and seeded reductions across worker counts
 
 ## Anticipated questions
 

@@ -12,6 +12,9 @@ export function estimatedBrowserWork(source) {
     .replace(/"[^"\r\n]*"/g, '""')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/\/\/[^\r\n]*/g, '');
+  const constants = new Map(Array.from(body.matchAll(/\blet\s+(\w+)\s*(?::\s*i(?:32|64))?\s*=\s*(-?\d+)\s*;/g),
+    match => [match[1], Number(match[2])]));
+  const bound = token => /^-?\d+$/.test(token) ? Number(token) : constants.get(token);
   const open = []; // loops with unclosed bodies: { trips, child, bodyDepth }
   let depth = 0;
   let total = 0;
@@ -22,25 +25,23 @@ export function estimatedBrowserWork(source) {
     if (open.length) open[open.length - 1].child += cost;
     else total += cost;
   };
-  for (const line of body.split('\n')) {
+  for (const line of body.split(/\n|(?<=[;{}])/)) {
     const trimmed = line.trimStart();
     const forCount = (trimmed.match(/\bfor\b/g) || []).length;
     for (let n = 0; n < forCount; n += 1) {
-      // Literal `in A..B` bounds give real trips; anything else stays
+      // Literal or literal-bound scalar ranges give trips; anything else stays
       // conservative at the 1000-trip default.
-      const range = trimmed.match(/\bin\s+(-?\d+)\s*\.\.\s*(-?\d+)/);
-      const trips = range
-        ? Math.max(Math.abs(Number(range[2]) - Number(range[1])), 1)
+      const range = trimmed.match(/\bin\s+(-?\d+|\w+)\s*\.\.\s*(-?\d+|\w+)/);
+      const trips = range && bound(range[1]) != null && bound(range[2]) != null
+        ? Math.max(Math.abs(bound(range[2]) - bound(range[1])), 1)
         : 1000;
       open.push({ trips, child: 0, bodyDepth: 0 });
     }
-    if (trimmed.includes('zeros(')) {
-      let size = 0;
-      for (const token of trimmed.split(/[^0-9]+/)) {
-        if (token) size = Math.max(size, Number(token) || 0);
-      }
+    for (const allocation of trimmed.matchAll(/\bzeros\s*\(\s*([^)]*)\)/g)) {
+      const length = bound(allocation[1].trim());
+      const size = length == null ? Infinity : Math.max(0, length);
       if (open.length) open[open.length - 1].child += size;
-      else alloc = Math.max(alloc, size);
+      else alloc += size;
     }
     const opens = (line.match(/\{/g) || []).length;
     const closes = (line.match(/\}/g) || []).length;
@@ -59,7 +60,7 @@ export function estimatedBrowserWork(source) {
     while (open.length && depth < open[open.length - 1].bodyDepth) closeLoop();
   }
   while (open.length) closeLoop();
-  return Math.max(total, alloc, 1000);
+  return Math.max(total + alloc, 1000);
 }
 
 /** Repetitions per timed sample, from the same work bands the Observatory

@@ -4,6 +4,19 @@ import vm from 'node:vm';
 
 // Exercise the shipped script without booting a browser or adding a DOM dependency.
 const source = await readFile(new URL('./app.js', import.meta.url), 'utf8');
+// A project Pages site mounts below /helix-compiler/, so assets must stay there.
+const pagesBase = new URL('https://noel-alex.github.io/helix-compiler/');
+for (const name of ['index.html', 'about.html', 'style.css', 'about.css']) {
+  const asset = await readFile(new URL(name, import.meta.url), 'utf8');
+  const references = name.endsWith('.html')
+    ? [...asset.matchAll(/(?:href|src)="([^"]+)"/g)].map(match => match[1])
+    : [...asset.matchAll(/url\("([^"]+)"\)/g)].map(match => match[1]);
+  for (const reference of references.filter(value => !/^(data:|https?:|#)/.test(value))) {
+    assert.ok(new URL(reference, pagesBase).pathname.startsWith(pagesBase.pathname),
+      `${name}: ${reference} escapes the project Pages mount`);
+  }
+}
+console.log('Project Pages asset and navigation paths stay under their mount.');
 const element = (tagName = 'div') => ({
   tagName, children: [], dataset: {}, attributes: {}, classes: new Set(), value: '',
   disabled: false, style: {}, listeners: {},
@@ -91,6 +104,7 @@ context.measureBrowserSource = () => {
   return pending.promise;
 };
 const renderBench = run('renderBench');
+const hydrateBrowserExecution = run('hydrateBrowserExecution');
 for (const name of ['renderAll', 'renderBench', 'hydrateBrowserExecution', 'gotoPhase', 'toast']) {
   context[name] = (...args) => effects.push([name, ...args]);
 }
@@ -194,6 +208,8 @@ for (const previous of ['scale', '<adhoc>']) {
 console.log('Failed selection and in-flight editor preservation checks passed.');
 
 const measured = { result: { ok: true, engine: 'interp-wasm', printed: ['42'], checksum: '42' }, samples: [1, 2], medianMs: 1.5 };
+context.loadBrowserRunner = async () => ({ estimatedBrowserWork: () => 1000 });
+context.measureCompiledSource = async () => ({ result: measured.result, samples: [0.25], medianMs: 0.25 });
 // A delayed WASM result must not even mutate its old, shared artifact object.
 for (const fails of [false, true]) {
   const oldArtifact = reset('<adhoc>');
@@ -578,7 +594,7 @@ console.log('CFG viewBox covers nodes and routed edges and resets per function c
       const parity = texts.filter(t => /matches observer output|observer\/WASM output differs/.test(t));
       assert.deepEqual(parity, observerChecksum === null ? [] : [observerChecksum === '42'
         ? 'matches observer output' : 'observer/WASM output differs']);
-      assert.equal(texts.includes('interp 0.421 ms'), observer !== null, 'only observer timing gets the interp label');
+      assert.equal(texts.includes('interp 0.421 ms'), false, 'browser output must not carry observer timing');
       assert.match(controls['#bench-kernel'].textContent, /local WASM interpreter · 2 measured samples/);
       assert.match(controls['#bench-comparison'].children[0].textContent, /Local measurement · WASM reference interpreter only/);
     }
@@ -698,3 +714,22 @@ console.log('CFG viewBox covers nodes and routed edges and resets per function c
   state.browserRun = null;
   console.log('Browser-failure evidence separation checks passed.');
 }
+
+// The preview executes compiled WASM and refuses either form of parity failure.
+for (const failure of [null, 'checksum', 'printed', 'load']) {
+  const artifact = { example: '<adhoc>', source: 'fn main() { print(42); }' };
+  state.artifact = artifact;
+  context.loadBrowserRunner = async () => {
+    if (failure === 'load') throw new Error('asset unavailable');
+    return {
+      estimatedBrowserWork: () => 1000,
+      runHelixInBrowser: async () => measured.result,
+      runCompiled: async () => ({ ok: true, checksum: failure === 'checksum' ? 'different' : '42',
+        printed: failure === 'printed' ? ['wrong'] : ['42'], elapsed_ms: 0.25 }),
+    };
+  };
+  await hydrateBrowserExecution(artifact);
+  assert.equal(state.browserRun.result.ok, !failure);
+  assert.match(state.browserRun.result.engine, failure ? /WebAssembly/ : /compiled WebAssembly/);
+}
+console.log('Compiled preview parity and asset-load failure checks passed.');

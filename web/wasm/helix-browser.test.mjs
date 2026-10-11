@@ -75,6 +75,8 @@ assert.equal(estimate(`// for i in 0..999999999\r\n${smallProgram}`), estimate(s
 assert.equal(estimate(`/* 3000000 */\n${smallProgram}`), estimate(smallProgram));
 assert.ok(estimate('fn main() { print(3000000); }') < 2_000_000);
 assert.equal(estimate('fn main() { let a: [i64] = zeros(3000000); print(a[0]); }'), 3_000_000);
+assert.equal(estimate('fn main() { let n = 50000000; let a: [f64] = zeros(n); for i in 0..n { a[i] = 1.0; } }'), 100_000_000);
+assert.equal(estimate('fn main() { let a: [i64] = zeros(length()); }'), Infinity);
 // Sequential sibling loops add trips instead of compounding per for-line.
 const siblings = 'fn main() {\nfor i in 0..2 { print(i); }\nfor j in 0..2 { print(j); }\nfor k in 0..2 { print(k); }\n}';
 assert.ok(estimate(siblings) < 2_000_000, `sibling loops must stay runnable, got ${estimate(siblings)}`);
@@ -229,6 +231,8 @@ fn main() { print(fib(18)); }
 `;
 // Casts, short-circuit logic, bools, math builtins, and an [i32] array.
 const mixedLab = `fn main() {
+    print(0.1 as f32);
+    print(-0.0 as f32);
     print(300.7 as i32);
     print(3.9 as i64);
     print(true);

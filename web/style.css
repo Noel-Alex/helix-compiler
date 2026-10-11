@@ -2,8 +2,8 @@
    A professional TempleOS-era homage: a finite palette, fixed machine
    regions, and compiler evidence as the primary visual material. */
 
-@font-face { font-family: "Helix Pixel"; src: url("/fonts/silkscreen-400.ttf") format("truetype"); font-weight: 400; font-display: swap; }
-@font-face { font-family: "Helix Pixel"; src: url("/fonts/silkscreen-700.ttf") format("truetype"); font-weight: 700; font-display: swap; }
+@font-face { font-family: "Helix Pixel"; src: url("./fonts/silkscreen-400.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Helix Pixel"; src: url("./fonts/silkscreen-700.ttf") format("truetype"); font-weight: 700; font-display: swap; }
 
 :root {
   color-scheme: dark;
@@ -262,7 +262,7 @@ button, input, textarea { font-family: var(--body); }
   .topbar { min-height: 64px; gap: 8px; padding: 8px 10px; }
   .wordmark .mark { width: 30px; height: 30px; flex-basis: 30px; }
   .wm-helix { font-size: 18px; }
-  .crumb { font-size: 11px; }
+  .crumb { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
   .topbar .chip, .topbar #btn-recompile, .topbar #btn-export { display: none; }
   .topbar .btn-about { display: inline-flex; flex: 0 0 58px; width: 58px; min-height: 30px; padding: 5px 4px; overflow: hidden; font-size: 0; white-space: nowrap; }
   .topbar .btn-about::after { content: "GUIDE"; font: 700 8px var(--pixel); }

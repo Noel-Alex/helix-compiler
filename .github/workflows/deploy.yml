@@ -33,6 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: configure Pages
+        uses: actions/configure-pages@v5
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -72,7 +75,7 @@ jobs:
       - name: node web/wasm/helix-browser.test.mjs
         run: node web/wasm/helix-browser.test.mjs
 
-      # Static mode fetches /data/examples/<name>.hx, so the examples travel
+      # Static mode fetches site-relative data/examples/<name>.hx, so examples travel
       # with the site.
       - name: stage examples for static mode
         shell: pwsh
